@@ -149,18 +149,19 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
     slide = prs.slides.add_slide(layout)
     du.fix_degenerate_placeholders(prs, slide)
 
-    title = spec.get("title", "")
+    title = du.strip_md(str(spec.get("title", "")))
     tph = du.slide_title_ph(slide)
     if title:
         if tph is not None:
-            tph.text_frame.text = str(title)
+            tph.text_frame.text = title
             shrink_title(prs, slide, tph, min_pt=t_min_pt, is_cover=(role in ("title", "section", "qa")))
         else:
             SW = int(prs.slide_width)
             du.fit_textbox(slide, (int(SW * 0.065), int(prs.slide_height * 0.05),
                                    int(SW * 0.87), int(prs.slide_height * 0.12)),
                            title, size_pt=du.DEFAULT_TITLE_PT, bold=True)
-    du.fill_subtitle(slide, spec.get("subtitle", ""), prs)
+    subtitle_txt = du.strip_md(str(spec.get("subtitle", "")))
+    du.fill_subtitle(slide, subtitle_txt, prs)
 
     if role not in ("title", "qa") and accent:
         du.accent_bar(slide, prs, accent)
@@ -190,7 +191,28 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
         resolved_imgs.append((im, p if (p and p.is_file()) else None))
 
     body_phs = du.body_placeholders(slide)
+    if subtitle_txt.strip():
+        # Never overwrite a filled SUBTITLE placeholder with bullets on title/qa slides
+        body_phs = [ph for ph in body_phs if ph.placeholder_format.type not in du.SUBTITLE_TYPES]
     rl, rt, rw, rh = du.content_region(prs, slide)
+    if subtitle_txt.strip() and role in ("title", "qa"):
+        # Push extra bullets below the filled title/subtitle area so they never overlap
+        sub_bot = None
+        for ph in slide.placeholders:
+            if ph.placeholder_format.type in (du.SUBTITLE_TYPES | du.TITLE_TYPES):
+                _, st, _, sh = du.ph_geom(prs, slide, ph)
+                if st is not None and sh is not None:
+                    cand_bot = int(st) + int(sh) + int(Inches(0.14))
+                    sub_bot = max(sub_bot, cand_bot) if sub_bot is not None else cand_bot
+        slide_bot = int(prs.slide_height) - int(Inches(0.32))
+        if sub_bot is not None and sub_bot > rt:
+            avail_below = slide_bot - sub_bot
+            if avail_below >= int(Inches(0.48)):
+                rt = sub_bot
+                rh = avail_below
+            else:
+                rt = max(sub_bot, slide_bot - int(Inches(0.55)))
+                rh = max(int(Inches(0.45)), slide_bot - rt)
     src_strip = int(Inches(0.34 if tighten else 0.36)) if (sources and role not in ("title", "qa")) else 0
     tk_strip = int(Inches(0.44 if tighten else 0.50)) if (takeaway and role not in ("title", "qa")) else 0
     bot_strip = src_strip + tk_strip
@@ -220,7 +242,8 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
             top_off += st_h + int(Inches(0.12 if tighten else 0.16))
 
     ct = rt + top_off
-    ch_avail = max(int(Inches(1.2)), rh - top_off - bot_strip)
+    min_ch = int(Inches(0.45)) if role in ("title", "qa") else int(Inches(1.2))
+    ch_avail = max(min_ch, rh - top_off - bot_strip)
     # If both two_col and a visual appear, fold two_col cleanly into left-column bullets to prevent overlap
     if two_col and has_visual:
         merged = []
@@ -247,40 +270,76 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
     right_w = rl + rw - right_l
 
     # --- bullets (placeholder first for native list styles; textbox fallback)
+    from pptx.dml.color import RGBColor as _RGBColor
+    col_hdr_rgb = _RGBColor(*(du._safe_accent_for_dark_bg(accent) if du.slide_is_dark(slide) else du._safe_accent_for_light_bg(accent)))
     if two_col:
         left_b = list(two_col.get("left_bullets") or [])
         right_b = list(two_col.get("right_bullets") or [])
         if two_col.get("left_title"):
-            left_b = [{"t": str(two_col["left_title"]), "lvl": 0, "bold": True}] + left_b
+            left_b = [{"t": str(two_col["left_title"]), "lvl": 0, "bold": True, "_col_header": True}] + left_b
         if two_col.get("right_title"):
-            right_b = [{"t": str(two_col["right_title"]), "lvl": 0, "bold": True}] + right_b
-        tc_cap = 13.0 if tighten >= 2 else (14.5 if tighten == 1 else 17.5)
+            right_b = [{"t": str(two_col["right_title"]), "lvl": 0, "bold": True, "_col_header": True}] + right_b
+        is_sparse_tc = (not has_visual and not highlights and not steps and not tighten
+                        and max(len(left_b), len(right_b)) <= 5)
+        tc_cap = 13.0 if tighten >= 2 else (14.5 if tighten == 1 else (20.0 if is_sparse_tc else 17.5))
+
+        def _style_sparse_tc(tf_obj):
+            if not is_sparse_tc:
+                return
+            for pi, p in enumerate(tf_obj.paragraphs):
+                try:
+                    lvl = getattr(p, "level", 0) or 0
+                    p.space_after = Pt(10 if pi == 0 else (12 if lvl == 0 else 6))
+                    p.line_spacing = 1.18
+                except Exception:
+                    pass
+
         if len(body_phs) >= 2 and not has_visual:
-            col_gap = int(Inches(0.30))
+            col_gap = int(Inches(0.36))
             col_w = (rw - col_gap) // 2
             du.set_ph_rect(prs, slide, body_phs[0], left=rl, top=ct, width=col_w, height=ch_avail)
             du.set_ph_rect(prs, slide, body_phs[1], left=rl + col_w + col_gap, top=ct, width=col_w, height=ch_avail)
-            du.fill_bullets_tf(body_phs[0].text_frame, left_b)
-            du.fill_bullets_tf(body_phs[1].text_frame, right_b)
+            du.fill_bullets_tf(body_phs[0].text_frame, left_b, accent_rgb=col_hdr_rgb)
+            du.fill_bullets_tf(body_phs[1].text_frame, right_b, accent_rgb=col_hdr_rgb)
             _cap_body_pt(prs, body_phs[0], left_b, tc_cap)
             _cap_body_pt(prs, body_phs[1], right_b, tc_cap)
             for ph in body_phs[:2]:
+                _style_sparse_tc(ph.text_frame)
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
+            # Subtle vertical center divider hairline (<0.08" wide -> pure decorative shape)
+            if not highlights and not steps:
+                try:
+                    from pptx.enum.shapes import MSO_SHAPE
+                    div_x = rl + col_w + (col_gap // 2)
+                    div_h = max(int(Inches(1.6)), ch_avail - int(Inches(0.35)))
+                    vdiv = slide.shapes.add_shape(
+                        MSO_SHAPE.RECTANGLE, Emu(div_x), Emu(ct + int(Inches(0.06))),
+                        Emu(int(Inches(0.014))), Emu(div_h),
+                    )
+                    vdiv.fill.solid()
+                    vdiv.fill.fore_color.rgb = _RGBColor(0x33, 0x4E, 0x73) if du.slide_is_dark(slide) else _RGBColor(0xD8, 0xE1, 0xEC)
+                    vdiv.line.fill.background()
+                    du._flat_shape(vdiv)
+                except Exception:
+                    pass
         else:
             ph = body_phs[0] if body_phs else None
             if ph is not None:
                 _clamp_ph_to_region(prs, slide, ph, rl, ct, int(rw * 0.46), ch_avail)
-                du.fill_bullets_tf(ph.text_frame, left_b)
-                _cap_body_pt(prs, ph, left_b, min(17.0, tc_cap))
+                du.fill_bullets_tf(ph.text_frame, left_b, accent_rgb=col_hdr_rgb)
+                _cap_body_pt(prs, ph, left_b, min(tc_cap, 20.0 if is_sparse_tc else 17.0))
+                _style_sparse_tc(ph.text_frame)
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
             colw = int(rw * 0.50)
             tx = du.fit_textbox(slide, (rl + rw - colw, ct, colw, ch_avail), "")
-            du.fill_bullets_tf(tx.text_frame, right_b)
-            pt_left = min(min(17.0, tc_cap), du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT, getattr(prs, "_master_styles", None))) if ph is not None else min(17.0, tc_cap)
+            du.fill_bullets_tf(tx.text_frame, right_b, accent_rgb=col_hdr_rgb)
+            cap_r = 20.0 if is_sparse_tc else min(17.0, tc_cap)
+            pt_left = min(cap_r, du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT, getattr(prs, "_master_styles", None))) if ph is not None else cap_r
             for para in tx.text_frame.paragraphs:
                 para.font.size = Pt(pt_left)
                 for r in para.runs:
                     r.font.size = Pt(pt_left)
+            _style_sparse_tc(tx.text_frame)
             shrink_shape(tx, pt_left, min_pt=b_min_pt, compact_spacing_pt=c_space)
     elif bullets:
         rendered_cards = False
@@ -313,19 +372,22 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                     rendered_cards = True
         if not rendered_cards:
             is_sparse_pure_text = (not has_split and not highlights and not steps and not tighten and len(bullets) <= 5)
-            b_cap = (13.0 if tighten >= 2 else (14.5 if tighten == 1 else (17.5 if has_split else (22.0 if is_sparse_pure_text else 20.0))))
+            is_sparse_with_steps = (bool(steps) and not has_split and not highlights and not tighten and len(bullets) <= 4)
+            b_cap = (13.0 if tighten >= 2 else (14.5 if tighten == 1 else (
+                17.5 if has_split else (22.0 if is_sparse_pure_text else (19.5 if is_sparse_with_steps else 20.0))
+            )))
             if body_phs:
                 ph = body_phs[0]
                 target_w = int(rw * left_frac) if has_split else None
                 _clamp_ph_to_region(prs, slide, ph, rl, ct, target_w, ch_avail)
                 du.fill_bullets_tf(ph.text_frame, bullets)
                 _cap_body_pt(prs, ph, bullets, b_cap)
-                if is_sparse_pure_text:
+                if is_sparse_pure_text or is_sparse_with_steps:
                     for p in ph.text_frame.paragraphs:
                         try:
                             lvl = getattr(p, "level", 0) or 0
-                            p.space_after = Pt(14 if lvl == 0 else 7)
-                            p.line_spacing = 1.18
+                            p.space_after = Pt((14 if is_sparse_pure_text else 11) if lvl == 0 else 7)
+                            p.line_spacing = 1.18 if is_sparse_pure_text else 1.15
                         except Exception:
                             pass
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
@@ -333,12 +395,12 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                 colw = int(rw * left_frac) if has_split else rw
                 tx = du.fit_textbox(slide, (rl, ct, colw, ch_avail), "")
                 du.fill_bullets_tf(tx.text_frame, bullets)
-                if is_sparse_pure_text:
+                if is_sparse_pure_text or is_sparse_with_steps:
                     for p in tx.text_frame.paragraphs:
                         try:
                             lvl = getattr(p, "level", 0) or 0
-                            p.space_after = Pt(14 if lvl == 0 else 7)
-                            p.line_spacing = 1.18
+                            p.space_after = Pt((14 if is_sparse_pure_text else 11) if lvl == 0 else 7)
+                            p.line_spacing = 1.18 if is_sparse_pure_text else 1.15
                         except Exception:
                             pass
                 shrink_shape(tx, min(b_cap, du.DEFAULT_BODY_PT), min_pt=b_min_pt, compact_spacing_pt=c_space)
@@ -548,6 +610,7 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
     specs_by_eid = {}
     sources_by_eid = {}
     replaced_meta = {}  # new_eid -> {orig_slide, title_before}
+    zero_hit_edits = []
 
     def _rec_src(eid, srcs):
         if srcs:
@@ -561,7 +624,7 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
         if op == "set_title" and 0 <= sidx < len(prs.slides):
             slide = prs.slides[sidx]
             du.fix_degenerate_placeholders(prs, slide)
-            new_title = str(e.get("text") if e.get("text") is not None else (e.get("title") or ""))
+            new_title = du.strip_md(str(e.get("text") if e.get("text") is not None else (e.get("title") or "")))
             tsh = du.find_slide_title_shape(slide, prs)
             if tsh is not None and tsh.has_text_frame:
                 du.set_text_preserving_style(tsh.text_frame, new_title)
@@ -603,23 +666,41 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
             slide = prs.slides[sidx]
             du.fix_degenerate_placeholders(prs, slide)
             bshs = du.find_slide_body_shapes(slide, prs)
+            from pptx.dml.color import RGBColor as _RGBColor
+            col_hdr_rgb = _RGBColor(*(du._safe_accent_for_dark_bg(accent) if du.slide_is_dark(slide) else du._safe_accent_for_light_bg(accent)))
             left_b = list(e.get("left_bullets") or [])
             right_b = list(e.get("right_bullets") or [])
             if e.get("left_title"):
-                left_b = [{"t": str(e["left_title"]), "lvl": 0, "bold": True}] + left_b
+                left_b = [{"t": str(e["left_title"]), "lvl": 0, "bold": True, "_col_header": True}] + left_b
             if e.get("right_title"):
-                right_b = [{"t": str(e["right_title"]), "lvl": 0, "bold": True}] + right_b
+                right_b = [{"t": str(e["right_title"]), "lvl": 0, "bold": True, "_col_header": True}] + right_b
+            is_sparse_et = max(len(left_b), len(right_b)) <= 5
+            et_cap = 20.0 if is_sparse_et else 17.5
+
+            def _style_et(tf_obj):
+                if not is_sparse_et:
+                    return
+                for pi, p in enumerate(tf_obj.paragraphs):
+                    try:
+                        lvl = getattr(p, "level", 0) or 0
+                        p.space_after = Pt(10 if pi == 0 else (12 if lvl == 0 else 6))
+                        p.line_spacing = 1.18
+                    except Exception:
+                        pass
+
             if len(bshs) >= 2:
-                du.fill_bullets_tf(bshs[0].text_frame, left_b)
-                du.fill_bullets_tf(bshs[1].text_frame, right_b)
+                du.fill_bullets_tf(bshs[0].text_frame, left_b, accent_rgb=col_hdr_rgb)
+                du.fill_bullets_tf(bshs[1].text_frame, right_b, accent_rgb=col_hdr_rgb)
                 for sh, bl in ((bshs[0], left_b), (bshs[1], right_b)):
+                    _style_et(sh.text_frame)
                     if sh.is_placeholder:
-                        _cap_body_pt(prs, sh, bl, 17.5)
+                        _cap_body_pt(prs, sh, bl, et_cap)
                         shrink_ph(prs, slide, sh)
                     else:
-                        shrink_shape(sh, du.DEFAULT_BODY_PT)
+                        shrink_shape(sh, et_cap)
             elif len(bshs) == 1:
-                du.fill_bullets_tf(bshs[0].text_frame, left_b + right_b)
+                du.fill_bullets_tf(bshs[0].text_frame, left_b + right_b, accent_rgb=col_hdr_rgb)
+                _style_et(bshs[0].text_frame)
                 if bshs[0].is_placeholder:
                     _cap_body_pt(prs, bshs[0], left_b + right_b, 20.0)
                     shrink_ph(prs, slide, bshs[0])
@@ -627,15 +708,21 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                     shrink_shape(bshs[0], du.DEFAULT_BODY_PT)
             elif left_b or right_b:
                 rl, rt, rw, rh = du.content_region(prs, slide)
-                gap = int(Inches(0.30))
+                gap = int(Inches(0.36))
                 cw = (rw - gap) // 2
                 ch_h = rh - int(Inches(0.36))
                 tx1 = du.fit_textbox(slide, (rl, rt, cw, ch_h), "")
                 tx2 = du.fit_textbox(slide, (rl + cw + gap, rt, cw, ch_h), "")
-                du.fill_bullets_tf(tx1.text_frame, left_b)
-                du.fill_bullets_tf(tx2.text_frame, right_b)
-                shrink_shape(tx1, 17.5)
-                shrink_shape(tx2, 17.5)
+                du.fill_bullets_tf(tx1.text_frame, left_b, accent_rgb=col_hdr_rgb)
+                du.fill_bullets_tf(tx2.text_frame, right_b, accent_rgb=col_hdr_rgb)
+                for tx_e in (tx1, tx2):
+                    for para in tx_e.text_frame.paragraphs:
+                        para.font.size = Pt(et_cap)
+                        for r in para.runs:
+                            r.font.size = Pt(et_cap)
+                    _style_et(tx_e.text_frame)
+                shrink_shape(tx1, et_cap)
+                shrink_shape(tx2, et_cap)
             _rec_src(id(slide._element), e.get("sources"))
             cm_changes.append({"op": "set_two_col", "slide": sidx + 1,
                                "sources": e.get("sources") or []})
@@ -661,6 +748,8 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                                     cur_pt = du.effective_pt(sh_r, du.DEFAULT_BODY_PT)
                                     if du.tf_text_height_pt(sh_r.text_frame, sw_r.pt, cur_pt) > sh_h.pt * 1.04:
                                         du.shrink_body_to_fit(sh_r.text_frame, sw_r.pt, sh_h.pt, cur_pt, min_pt=10.5)
+            if total_hits == 0 and old_t:
+                zero_hit_edits.append({"op": "replace_text", "slide": sraw, "old": old_t, "new": new_t})
             cm_changes.append({"op": "replace_text", "slide": sraw, "old": old_t, "new": new_t,
                                "hits": total_hits, "sources": e.get("sources") or []})
 
@@ -736,28 +825,77 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
             if cats and sers:
                 existing_ch = next((sh for sh in slide.shapes if getattr(sh, "has_chart", False)), None)
                 if existing_ch is not None:
-                    try:
-                        from pptx.chart.data import CategoryChartData
-                        cd = CategoryChartData()
-                        cd.categories = cats
-                        for sr in sers:
-                            raw_v = list(sr.get("values") or [])[:len(cats)]
-                            pvals = [du.parse_chart_num(v)[0] for v in raw_v]
-                            while len(pvals) < len(cats):
-                                pvals.append(0.0)
-                            cd.add_series(str(sr.get("name", "series")), tuple(pvals))
-                        existing_ch.chart.replace_data(cd)
-                        if ch_spec.get("title"):
-                            existing_ch.chart.has_title = True
-                            existing_ch.chart.chart_title.text_frame.text = str(ch_spec["title"])
-                    except Exception:
+                    req_type = str(ch_spec.get("type") or "").strip().lower()
+                    type_mismatch = False
+                    if req_type:
+                        from pptx.enum.chart import XL_CHART_TYPE
+                        wanted_ct = {
+                            "bar": XL_CHART_TYPE.COLUMN_CLUSTERED, "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+                            "stacked_bar": XL_CHART_TYPE.COLUMN_STACKED, "hbar": XL_CHART_TYPE.BAR_CLUSTERED,
+                            "stacked_hbar": XL_CHART_TYPE.BAR_STACKED, "line": XL_CHART_TYPE.LINE_MARKERS,
+                            "pie": XL_CHART_TYPE.PIE,
+                        }.get(req_type)
+                        try:
+                            if wanted_ct is not None and existing_ch.chart.chart_type != wanted_ct:
+                                type_mismatch = True
+                        except Exception:
+                            pass
+                    if type_mismatch:
                         slot = (int(existing_ch.left), int(existing_ch.top),
                                 int(existing_ch.width), int(existing_ch.height))
+                        merged_ch = dict(ch_spec)
+                        try:
+                            och = existing_ch.chart
+                            if not merged_ch.get("title") and och.has_title:
+                                merged_ch["title"] = och.chart_title.text_frame.text.strip()
+                            for ax_attr, tkey in (("category_axis", "x_title"), ("value_axis", "y_title")):
+                                if not merged_ch.get(tkey):
+                                    ax = getattr(och, ax_attr, None)
+                                    if ax is not None and getattr(ax, "has_title", False):
+                                        merged_ch[tkey] = ax.axis_title.text_frame.text.strip()
+                        except Exception:
+                            pass
                         try:
                             existing_ch._element.getparent().remove(existing_ch._element)
                         except Exception:
                             pass
-                        du.add_native_chart(slide, slot, ch_spec, palette=palette)
+                        du.add_native_chart(slide, slot, merged_ch, palette=palette)
+                        ch_spec = merged_ch
+                    else:
+                        try:
+                            from pptx.chart.data import CategoryChartData
+                            cd = CategoryChartData()
+                            cd.categories = [du.strip_md(c) for c in cats]
+                            any_pct = str(ch_spec.get("unit") or "").strip() == "%"
+                            for sr in sers:
+                                raw_v = list(sr.get("values") or [])[:len(cats)]
+                                pvals = []
+                                for v in raw_v:
+                                    fv, isp = du.parse_chart_num(v)
+                                    if isp:
+                                        any_pct = True
+                                    pvals.append(fv)
+                                while len(pvals) < len(cats):
+                                    pvals.append(0.0)
+                                cd.add_series(du.strip_md(str(sr.get("name", "series"))), tuple(pvals))
+                            existing_ch.chart.replace_data(cd)
+                            if ch_spec.get("title"):
+                                existing_ch.chart.has_title = True
+                                existing_ch.chart.chart_title.text_frame.text = du.strip_md(str(ch_spec["title"]))
+                            if any_pct and existing_ch.chart.plots:
+                                try:
+                                    dl = existing_ch.chart.plots[0].data_labels
+                                    dl.number_format = '0.0"%"'
+                                except Exception:
+                                    pass
+                        except Exception:
+                            slot = (int(existing_ch.left), int(existing_ch.top),
+                                    int(existing_ch.width), int(existing_ch.height))
+                            try:
+                                existing_ch._element.getparent().remove(existing_ch._element)
+                            except Exception:
+                                pass
+                            du.add_native_chart(slide, slot, ch_spec, palette=palette)
                 else:
                     rl, rt, rw, rh = du.content_region(prs, slide)
                     du.add_native_chart(slide, (rl, rt, rw, rh - int(Inches(0.36))), ch_spec, palette=palette)
@@ -782,8 +920,27 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                 None,
             )
             if existing_pic is not None and existing_pic.width and existing_pic.height:
-                slot = (int(existing_pic.left), int(existing_pic.top),
-                        int(existing_pic.width), int(existing_pic.height))
+                pl, pt_y, pw, ph = (int(existing_pic.left), int(existing_pic.top),
+                                    int(existing_pic.width), int(existing_pic.height))
+                slot = (pl, pt_y, pw, ph)
+                # Remove old caption textbox immediately below replaced picture when adding a new caption
+                if cap_text:
+                    pic_bot = pt_y + ph
+                    for sh_c in list(slide.shapes):
+                        try:
+                            if sh_c is existing_pic or sh_c.is_placeholder or not sh_c.has_text_frame:
+                                continue
+                            cl, ct_y, cw, ch = int(sh_c.left), int(sh_c.top), int(sh_c.width), int(sh_c.height)
+                            ctext = (sh_c.text_frame.text or "").strip()
+                            if (ctext and len(ctext) <= 180 and ch <= int(Inches(0.75))
+                                    and pic_bot - int(Inches(0.15)) <= ct_y <= pic_bot + int(Inches(0.55))
+                                    and cl < pl + pw and cl + cw > pl
+                                    and not ctext.startswith(("来源", "Source"))):
+                                sh_c._element.getparent().remove(sh_c._element)
+                                slot = (pl, pt_y, pw, max(ph, (ct_y + ch) - pt_y))
+                                break
+                        except Exception:
+                            pass
                 try:
                     existing_pic._element.getparent().remove(existing_pic._element)
                 except Exception:
@@ -913,7 +1070,8 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                 "title_before": before_snaps[eid]["title"]}
                for eid in before_order if eid not in after_eids and eid not in replaced_old_eids]
     slide_diff = {"before_count": len(before_order), "after_count": len(prs.slides),
-                  "slides": diff_rows, "deleted": deleted, "ops_applied": cm_changes}
+                  "slides": diff_rows, "deleted": deleted, "ops_applied": cm_changes,
+                  "zero_hit_edits": zero_hit_edits}
     (work / "slide_diff.json").write_text(
         json.dumps(slide_diff, ensure_ascii=False, indent=1), encoding="utf-8")
 
@@ -930,7 +1088,7 @@ def main() -> int:
     args = ap.parse_args()
 
     work = Path(args.work)
-    plan = json.loads(Path(args.plan).read_text(encoding="utf-8"))
+    plan = du.normalize_plan(json.loads(Path(args.plan).read_text(encoding="utf-8")))
     inv = du.load_inventory(work)
     images_base = Path(inv.get("case_dir") or Path(args.plan).resolve().parent)
 

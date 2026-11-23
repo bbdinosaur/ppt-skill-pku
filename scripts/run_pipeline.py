@@ -25,6 +25,7 @@ from pathlib import Path
 
 SCRIPTS = Path(__file__).resolve().parent
 sys.path.insert(0, str(SCRIPTS))
+import deckutil as du  # noqa: E402
 PY = sys.executable
 
 
@@ -236,7 +237,7 @@ def _auto_repair_plan(plan: dict, fails: list[dict], work: Path, pass_idx: int) 
     """Honest, deterministic in-process auto-repair before LibreOffice export.
     Fixes mechanical layout/overflow, verbatim quote alignment, and missing sources.
     NEVER fabricates or alters slide numbers/claims."""
-    repaired = copy.deepcopy(plan)
+    repaired = du.normalize_plan(copy.deepcopy(plan))
     actions: list[str] = []
     fail_map = {f["id"]: f.get("detail", "") for f in fails}
     slides = repaired.get("slides") or []
@@ -305,16 +306,21 @@ def _auto_repair_plan(plan: dict, fails: list[dict], work: Path, pass_idx: int) 
             c_norm, c_nc = cd._build_corpus(mt_file, fb_corpus)
             c_low = c_norm.lower()
             c_nocite = cd._CITE_BRACKET_RE.sub("", c_low)
+            c_nohy = c_nocite.replace("-", "")
             src_lines = _collect_source_lines(work)
 
             def _quote_ok(q_raw: str) -> bool:
                 q = cd.norm(q_raw)
                 if len(q) < 6:
                     return True
+                q_low = q.lower()
+                q_nocite = cd._CITE_BRACKET_RE.sub("", q_low)
+                q_nohy = q_nocite.replace("-", "")
                 return bool(
                     q in c_norm or q.replace(",", "") in c_nc
-                    or q.lower() in c_low
-                    or cd._CITE_BRACKET_RE.sub("", q.lower()) in c_nocite
+                    or q_low in c_low
+                    or q_nocite in c_nocite
+                    or (len(q_nohy) >= 12 and q_nohy in c_nohy)
                 )
 
             def _fix_sources_list(srcs: list, label: str):
@@ -708,6 +714,7 @@ def cmd_deliver(args) -> int:
     hard_ids = {
         "bounds", "aspect", "slide_count", "slide_limit", "claim_sources",
         "overlap", "quote_verification", "number_fidelity",
+        "placeholder_hygiene", "edit_application",
     }
     heur_ids = {"text_fit", "table_fit"}
     fail_ids = {f.get("id") for f in fails}

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -591,9 +592,252 @@ def fit_textbox(slide, rect, text, size_pt=None, bold=False, italic=False, align
     return tb
 
 
-def fill_bullets_tf(tf, bullets, default_pt=None):
+_MD_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MD_CODE_RE = re.compile(r"`([^`\n]+)`")
+_SUP_CH = str.maketrans("0123456789+-()nijk", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁽⁾ⁿⁱʲᵏ")
+_SUB_CH = str.maketrans("0123456789+-()aehklmnopstx", "₀₁₂₃₄₅₆₇₈₉₊₋₍₎ₐₑₕₖₗₘₙₒₚₛₜₓ")
+_LATEX_SYMS = (
+    ("\\times", "×"), ("\\pm", "±"), ("\\mp", "∓"), ("\\leq", "≤"), ("\\le", "≤"),
+    ("\\geq", "≥"), ("\\ge", "≥"), ("\\approx", "≈"), ("\\neq", "≠"), ("\\ne", "≠"),
+    ("\\cdot", "·"), ("\\rightarrow", "→"), ("\\to", "→"), ("\\leftarrow", "←"),
+    ("\\leftrightarrow", "↔"), ("\\infty", "∞"), ("\\sim", "~"), ("\\equiv", "≡"),
+    ("\\Delta", "Δ"), ("\\Sigma", "Σ"), ("\\Omega", "Ω"), ("\\Lambda", "Λ"),
+    ("\\alpha", "α"), ("\\beta", "β"), ("\\gamma", "γ"), ("\\delta", "δ"),
+    ("\\varepsilon", "ε"), ("\\epsilon", "ε"), ("\\zeta", "ζ"), ("\\eta", "η"),
+    ("\\theta", "θ"), ("\\lambda", "λ"), ("\\mu", "μ"), ("\\nu", "ν"),
+    ("\\pi", "π"), ("\\rho", "ρ"), ("\\sigma", "σ"), ("\\tau", "τ"),
+    ("\\phi", "φ"), ("\\psi", "ψ"), ("\\omega", "ω"),
+)
+_LATEX_CMD_RE = re.compile(r"\\(?:times|pm|mp|leq|le|geq|ge|approx|neq|ne|cdot|rightarrow|to|leftarrow|leftrightarrow|infty|sim|equiv|Delta|Sigma|Omega|Lambda|alpha|beta|gamma|delta|varepsilon|epsilon|zeta|eta|theta|lambda|mu|nu|pi|rho|sigma|tau|phi|psi|omega)\b")
+_INLINE_MATH_RE = re.compile(r"\$([^$\n]{1,64})\$")
+_SUP_BRACE_RE = re.compile(r"(?<=[A-Za-z0-9\)\]])\^\{([0-9+\-()nijk]{1,6})\}")
+_SUP_BARE_RE = re.compile(r"(?<=[A-Za-z0-9\)\]])\^([+-]?\d{1,3})(?![A-Za-z0-9])")
+_SUB_BRACE_RE = re.compile(r"(?<=[A-Za-z])_\{([0-9]{1,3}|[aehklmnopstx]{1,2})\}")
+_SUB_BARE_RE = re.compile(r"\b(CO|H|O|N|L|F|R|T|P|S|C)_([0-9]{1,2})\b")
+
+
+def clean_academic_math(text: str) -> str:
+    """Convert raw LaTeX inline math ($...$, \\times, \\alpha, 10^{-6}, R^2, CO_2) into
+    clean publication Unicode typography while preserving currency ($100) and plain underscores."""
+    s = str(text or "")
+    if not any(ch in s for ch in ("$", "\\", "^", "_")):
+        return s
+
+    def _unwrap_math(m):
+        inner = m.group(1)
+        # Keep currency intact (e.g., '$5 to $10') — only unwrap if inner has LaTeX/math cues
+        if re.match(r"^\s*\d[\d,.]*(?:\s*[kKMB])?\s*$", inner):
+            return m.group(0)
+        if any(c in inner for c in ("\\", "^", "_", "=", "<", ">", "×", "±")) or re.fullmatch(r"[A-Za-z](?:_[A-Za-z0-9]+)?", inner.strip()):
+            return inner.strip()
+        return m.group(0)
+
+    s = _INLINE_MATH_RE.sub(_unwrap_math, s)
+    if "\\" in s:
+        sym_map = dict(_LATEX_SYMS)
+        s = _LATEX_CMD_RE.sub(lambda m: sym_map.get(m.group(0), m.group(0)), s)
+    s = _SUP_BRACE_RE.sub(lambda m: m.group(1).translate(_SUP_CH), s)
+    s = _SUP_BARE_RE.sub(lambda m: m.group(1).translate(_SUP_CH), s)
+    s = _SUB_BRACE_RE.sub(lambda m: m.group(1).translate(_SUB_CH), s)
+    s = _SUB_BARE_RE.sub(lambda m: m.group(1) + m.group(2).translate(_SUB_CH), s)
+    return s
+
+
+def strip_md(text: str) -> str:
+    """Strip inline Markdown **bold** and `code` ticks and format academic LaTeX math cleanly."""
+    s = str(text or "")
+    s = _MD_BOLD_RE.sub(r"\1", s)
+    s = _MD_CODE_RE.sub(r"\1", s)
+    return clean_academic_math(s)
+
+
+def no_bullet(paragraph) -> None:
+    """Suppress bullet symbol on a native placeholder paragraph via <a:buNone/>."""
+    try:
+        from pptx.oxml.ns import qn
+        from lxml import etree
+        pPr = paragraph._p.get_or_add_pPr()
+        for tag in ("a:buChar", "a:buAutoNum", "a:buBlip", "a:buNone"):
+            for el in pPr.findall(qn(tag)):
+                pPr.remove(el)
+        etree.SubElement(pPr, qn("a:buNone"))
+    except Exception:
+        pass
+
+
+def add_rich_runs(p, text: str, base_bold: bool = False, size_pt: float | None = None,
+                  color_rgb=None) -> None:
+    """Append runs to paragraph `p`, converting Markdown **bold** into native bold runs,
+    stripping `code` ticks, and formatting academic math while NEVER overriding font.name."""
+    raw = clean_academic_math(_MD_CODE_RE.sub(r"\1", str(text or "")))
+    pos = 0
+    emitted = False
+    for m in _MD_BOLD_RE.finditer(raw):
+        if m.start() > pos:
+            r = p.add_run()
+            r.text = raw[pos : m.start()]
+            if base_bold:
+                r.font.bold = True
+            if size_pt is not None:
+                r.font.size = Pt(float(size_pt))
+            if color_rgb is not None:
+                r.font.color.rgb = color_rgb
+            emitted = True
+        r = p.add_run()
+        r.text = m.group(1)
+        r.font.bold = True
+        if size_pt is not None:
+            r.font.size = Pt(float(size_pt))
+        if color_rgb is not None:
+            r.font.color.rgb = color_rgb
+        emitted = True
+        pos = m.end()
+    if pos < len(raw) or not emitted:
+        r = p.add_run()
+        r.text = raw[pos:]
+        if base_bold:
+            r.font.bold = True
+        if size_pt is not None:
+            r.font.size = Pt(float(size_pt))
+        if color_rgb is not None:
+            r.font.color.rgb = color_rgb
+
+
+def _norm_bullets_list(raw):
+    if isinstance(raw, str):
+        return [{"t": raw, "lvl": 0}] if raw.strip() else []
+    if not isinstance(raw, list):
+        return []
+    out = []
+    for b in raw:
+        if isinstance(b, dict):
+            nb = dict(b)
+            if "t" not in nb:
+                for alt in ("text", "content", "point", "body", "label"):
+                    if nb.get(alt) is not None:
+                        nb["t"] = str(nb[alt])
+                        break
+            out.append(nb)
+        elif b is not None and str(b).strip():
+            out.append({"t": str(b), "lvl": 0})
+    return out
+
+
+def _norm_sources_list(raw):
+    if isinstance(raw, dict):
+        return [raw]
+    if isinstance(raw, list):
+        return [x for x in raw if isinstance(x, dict)]
+    return []
+
+
+def _norm_slide_spec(spec: dict) -> dict:
+    if not isinstance(spec, dict):
+        return {}
+    s = dict(spec)
+    if "bullets" in s:
+        s["bullets"] = _norm_bullets_list(s.get("bullets"))
+    if "sources" in s:
+        s["sources"] = _norm_sources_list(s.get("sources"))
+    tc = s.get("two_col")
+    if isinstance(tc, dict):
+        ntc = dict(tc)
+        if "left_bullets" in ntc:
+            ntc["left_bullets"] = _norm_bullets_list(ntc.get("left_bullets"))
+        if "right_bullets" in ntc:
+            ntc["right_bullets"] = _norm_bullets_list(ntc.get("right_bullets"))
+        s["two_col"] = ntc
+    hi = s.get("highlights")
+    if isinstance(hi, list):
+        nhi = []
+        for it in hi:
+            if isinstance(it, dict):
+                nit = dict(it)
+                if not nit.get("value"):
+                    for alt in ("metric", "num", "stat", "number", "val"):
+                        if nit.get(alt) is not None:
+                            nit["value"] = str(nit[alt])
+                            break
+                if not nit.get("label"):
+                    for alt in ("title", "name", "desc", "caption"):
+                        if nit.get(alt) is not None:
+                            nit["label"] = str(nit[alt])
+                            break
+                nhi.append(nit)
+        s["highlights"] = nhi
+    st = s.get("steps")
+    if isinstance(st, list):
+        nst = []
+        for it in st:
+            if isinstance(it, dict):
+                nit = dict(it)
+                if not nit.get("title"):
+                    for alt in ("name", "label", "stage", "step"):
+                        if nit.get(alt) is not None:
+                            nit["title"] = str(nit[alt])
+                            break
+                if not nit.get("desc") and not nit.get("detail"):
+                    for alt in ("text", "summary", "body", "description"):
+                        if nit.get(alt) is not None:
+                            nit["desc"] = str(nit[alt])
+                            break
+                nst.append(nit)
+            elif it is not None and str(it).strip():
+                nst.append(str(it))
+        s["steps"] = nst
+    tbl = s.get("table")
+    if isinstance(tbl, dict):
+        ntbl = dict(tbl)
+        hdrs = ntbl.get("headers") or ntbl.get("columns")
+        rows = list(ntbl.get("rows") or [])
+        if isinstance(hdrs, list) and hdrs:
+            hdr_strs = [str(c) for c in hdrs]
+            if not rows or [str(c) for c in rows[0]] != hdr_strs:
+                rows = [hdr_strs] + rows
+            ntbl["rows"] = rows
+        s["table"] = ntbl
+    return s
+
+
+def normalize_plan(plan: dict) -> dict:
+    """Deterministically normalize common LLM schema aliases (single-dict sources,
+    bullets[].text, table.headers, highlights[].metric, steps[].label) without altering facts."""
+    if not isinstance(plan, dict):
+        return {}
+    out = dict(plan)
+    if isinstance(out.get("slides"), list):
+        out["slides"] = [_norm_slide_spec(s) if isinstance(s, dict) else s for s in out["slides"]]
+    if isinstance(out.get("edits"), list):
+        nedits = []
+        for e in out["edits"]:
+            if not isinstance(e, dict):
+                continue
+            ne = dict(e)
+            if "sources" in ne:
+                ne["sources"] = _norm_sources_list(ne.get("sources"))
+            if "bullets" in ne:
+                ne["bullets"] = _norm_bullets_list(ne.get("bullets"))
+            if "left_bullets" in ne:
+                ne["left_bullets"] = _norm_bullets_list(ne.get("left_bullets"))
+            if "right_bullets" in ne:
+                ne["right_bullets"] = _norm_bullets_list(ne.get("right_bullets"))
+            if isinstance(ne.get("table"), dict):
+                ne["table"] = _norm_slide_spec({"table": ne["table"]}).get("table")
+            elif isinstance(ne.get("headers"), list) and ne.get("headers"):
+                hdr_strs = [str(c) for c in ne["headers"]]
+                rows = list(ne.get("rows") or [])
+                if not rows or [str(c) for c in rows[0]] != hdr_strs:
+                    ne["rows"] = [hdr_strs] + rows
+            if isinstance(ne.get("slide_spec"), dict):
+                ne["slide_spec"] = _norm_slide_spec(ne["slide_spec"])
+            nedits.append(ne)
+        out["edits"] = nedits
+    return out
+
+
+def fill_bullets_tf(tf, bullets, default_pt=None, accent_rgb=None):
     """Fill a text frame with planned bullets (replaces existing content).
-    Inherits template fonts unless bullet sets size."""
+    Renders inline Markdown **bold** as native bold runs and inherits template fonts."""
     try:
         tf.clear()  # drop pre-existing paragraphs (edit mode must not merge with old text)
     except Exception:
@@ -602,12 +846,13 @@ def fill_bullets_tf(tf, bullets, default_pt=None):
     first = True
     for b in bullets:
         if isinstance(b, dict):
-            text = str(b.get("t", ""))
+            text = str(b.get("t", b.get("text", "")))
             lvl = int(b.get("lvl", 0) or 0)
             bold = bool(b.get("bold", False))
             size = b.get("size")
+            is_col_hdr = bool(b.get("_col_header", False))
         else:
-            text, lvl, bold, size = str(b), 0, False, None
+            text, lvl, bold, size, is_col_hdr = str(b), 0, False, None, False
         if first:
             p = tf.paragraphs[0]
             first = False
@@ -617,34 +862,44 @@ def fill_bullets_tf(tf, bullets, default_pt=None):
             p.level = max(0, min(4, lvl))
         except Exception:
             pass
+        if is_col_hdr:
+            no_bullet(p)
+            try:
+                p.space_after = Pt(6)
+            except Exception:
+                pass
+            add_rich_runs(p, text, base_bold=True, size_pt=size, color_rgb=accent_rgb)
+            continue
         # Auto-bold crisp lead-in label before first ':'/'：' (2..22 chars, non-URL)
         # for executive academic scannability — never sets font.name!
         split_done = False
+        has_md_bold = "**" in text
         if not bold and text:
+            plain = strip_md(text)
             for sep in ("：", ": "):
-                idx = text.find(sep)
+                idx = plain.find(sep)
                 if 2 <= idx <= 22:
-                    head = text[: idx + len(sep)]
-                    tail = text[idx + len(sep) :]
-                    if tail.strip() and not head.lower().startswith(("http", "https", "ftp")):
-                        r1 = p.add_run()
-                        r1.text = head
-                        r1.font.bold = True
-                        if size:
-                            r1.font.size = Pt(float(size))
-                        r2 = p.add_run()
-                        r2.text = tail
-                        if size:
-                            r2.font.size = Pt(float(size))
-                        split_done = True
-                        break
+                    head = plain[: idx + len(sep)]
+                    if not head.lower().startswith(("http", "https", "ftp")):
+                        if has_md_bold:
+                            ridx = text.find(sep)
+                            if 2 <= ridx <= 28:
+                                rhead = strip_md(text[: ridx + len(sep)])
+                                rtail = text[ridx + len(sep) :]
+                                if rtail.strip():
+                                    add_rich_runs(p, rhead, base_bold=True, size_pt=size)
+                                    add_rich_runs(p, rtail, base_bold=False, size_pt=size)
+                                    split_done = True
+                                    break
+                        else:
+                            tail = text[idx + len(sep) :]
+                            if tail.strip():
+                                add_rich_runs(p, head, base_bold=True, size_pt=size)
+                                add_rich_runs(p, tail, base_bold=False, size_pt=size)
+                                split_done = True
+                                break
         if not split_done:
-            run = p.add_run()
-            run.text = text
-            if bold:
-                run.font.bold = True
-            if size:
-                run.font.size = Pt(float(size))
+            add_rich_runs(p, text, base_bold=bold, size_pt=size)
     return tf
 
 
@@ -774,7 +1029,7 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
              "line": XL_CHART_TYPE.LINE_MARKERS,
              "pie": XL_CHART_TYPE.PIE}.get(str(chart_spec.get("type", "bar")).lower(),
                                            XL_CHART_TYPE.COLUMN_CLUSTERED)
-    cats = [str(c) for c in (chart_spec.get("categories") or [])]
+    cats = [strip_md(str(c)) for c in (chart_spec.get("categories") or [])]
     series_list = chart_spec.get("series") or []
     cd = CategoryChartData()
     cd.categories = cats
@@ -789,7 +1044,7 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
             parsed_vals.append(fv)
         while len(parsed_vals) < len(cats):
             parsed_vals.append(0.0)
-        cd.add_series(str(s.get("name", "series")), tuple(parsed_vals))
+        cd.add_series(strip_md(str(s.get("name", "series"))), tuple(parsed_vals))
     l, t, w, h = [int(v) for v in rect]
     gf = slide.shapes.add_chart(ctype, Emu(l), Emu(t), Emu(w), Emu(h), cd)
     try:
@@ -802,11 +1057,11 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
             chart.legend.font.size = Pt(10.5)
         if chart_spec.get("title"):
             chart.has_title = True
-            chart.chart_title.text_frame.text = str(chart_spec["title"])
+            chart.chart_title.text_frame.text = strip_md(str(chart_spec["title"]))
             for p in chart.chart_title.text_frame.paragraphs:
-                p.font.size = Pt(12.5)
+                p.font.size = Pt(13.5)
                 for r in p.runs:
-                    r.font.size = Pt(12.5)
+                    r.font.size = Pt(13.5)
                     r.font.bold = True
         else:
             chart.has_title = False
@@ -819,7 +1074,8 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
             plot = chart.plots[0]
             plot.has_data_labels = True
             dl = plot.data_labels
-            dl.font.size = Pt(10.5)
+            dl.font.size = Pt(11.0)
+            dl.font.bold = True
             if any_pct:
                 try:
                     dl.number_format = '0.0"%"'
@@ -848,7 +1104,13 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                     c_rgb = RGBColor(*_safe_accent_for_dark_bg(c_hex)) if dark_bg else RGBColor.from_string(c_hex)
                     if ctype == XL_CHART_TYPE.LINE_MARKERS:
                         sr.format.line.color.rgb = c_rgb
-                        sr.format.line.width = Pt(2.2)
+                        sr.format.line.width = Pt(2.4)
+                        try:
+                            sr.marker.size = 7
+                            sr.marker.format.fill.solid()
+                            sr.marker.format.fill.fore_color.rgb = c_rgb
+                        except Exception:
+                            pass
                     else:
                         sr.format.fill.solid()
                         sr.format.fill.fore_color.rgb = c_rgb
@@ -869,14 +1131,15 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
             for axis_attr, title_key in (("category_axis", "x_title"), ("value_axis", "y_title")):
                 try:
                     ax = getattr(chart, axis_attr)
-                    ax.tick_labels.font.size = Pt(11)
+                    ax.tick_labels.font.size = Pt(11.5)
                     if dark_bg:
                         ax.tick_labels.font.color.rgb = RGBColor(0xD8, 0xE2, 0xEC)
                     if chart_spec.get(title_key):
                         ax.has_title = True
-                        ax.axis_title.text_frame.text = str(chart_spec[title_key])
+                        ax.axis_title.text_frame.text = strip_md(str(chart_spec[title_key]))
                         for p in ax.axis_title.text_frame.paragraphs:
-                            p.font.size = Pt(10.5)
+                            p.font.size = Pt(11.5)
+                            p.font.bold = True
                             if dark_bg:
                                 p.font.color.rgb = RGBColor(0xD8, 0xE2, 0xEC)
                     if axis_attr == "value_axis":
@@ -908,8 +1171,8 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
 
 def format_caption(ref: str | None, caption: str | None) -> str:
     """Join figure/table ref and caption without duplicating an existing prefix (e.g. 'Fig. 1 Fig. 1:')."""
-    r = str(ref or "").strip()
-    c = str(caption or "").strip()
+    r = strip_md(str(ref or "")).strip()
+    c = strip_md(str(caption or "")).strip()
     if not r:
         return c
     if not c:
@@ -1114,23 +1377,15 @@ def add_table(slide, rect, rows, header=True, font_pt=12.0, accent=None,
                 pass
             tf = cell.text_frame
             tf.word_wrap = True
-            tf.text = txt
+            tf.clear()
             p = tf.paragraphs[0]
+            plain_txt = strip_md(txt)
             if is_hdr:
                 p.alignment = PP_ALIGN.CENTER if ci > 0 else PP_ALIGN.LEFT
-            elif ci > 0 and _is_numeric_cell(txt):
+            elif ci > 0 and _is_numeric_cell(plain_txt):
                 p.alignment = PP_ALIGN.CENTER
-            size = _Pt(font_pt)
-            for r in p.runs:
-                r.font.size = size
-                if is_hdr:
-                    r.font.bold = True
-                    r.font.color.rgb = hdr_text_rgb
-                elif is_hi:
-                    r.font.bold = True
-                    r.font.color.rgb = RGBColor(*acc_safe)
-                else:
-                    r.font.color.rgb = dark_rgb
+            cell_color = hdr_text_rgb if is_hdr else (RGBColor(*acc_safe) if is_hi else dark_rgb)
+            add_rich_runs(p, txt, base_bold=(is_hdr or is_hi), size_pt=font_pt, color_rgb=cell_color)
     return gf
 
 
@@ -1145,10 +1400,10 @@ def add_step_flow(slide, rect, steps, accent=None):
     clean = []
     for idx, st in enumerate((steps or [])[:5], 1):
         if isinstance(st, dict):
-            t = str(st.get("title") or f"Step {idx}").strip()
-            d = str(st.get("desc") or st.get("detail") or "").strip()
+            t = strip_md(str(st.get("title") or f"Step {idx}")).strip()
+            d = strip_md(str(st.get("desc") or st.get("detail") or "")).strip()
         else:
-            t, d = f"Step {idx}", str(st).strip()
+            t, d = f"Step {idx}", strip_md(str(st)).strip()
         if t or d:
             clean.append((t, d))
     if not clean:
@@ -1191,8 +1446,8 @@ def add_step_flow(slide, rect, steps, accent=None):
         tf.margin_right = Inches(0.10)
         tf.margin_top = Inches(0.08)
         tf.margin_bottom = Inches(0.06)
-        t_pt = 14.0 if n <= 4 else 12.0
-        d_pt = 12.0 if n <= 4 else 10.5
+        t_pt = 15.5 if n <= 3 else (14.0 if n == 4 else 12.5)
+        d_pt = 13.0 if n <= 3 else (12.0 if n == 4 else 11.0)
         # Auto-step down font size cleanly if text would exceed card height
         while d_pt > 10.0:
             est_h = (est_lines(st_title, t_pt, card_w_pt) * t_pt * 1.25 + 4.0
@@ -1278,7 +1533,7 @@ def add_highlights(slide, rect, items, accent=None):
         tf.margin_right = Inches(0.08)
         tf.margin_top = Inches(0.05)
         tf.margin_bottom = Inches(0.05)
-        val_txt = str(it.get("value", ""))
+        val_txt = strip_md(str(it.get("value", "")))
         val_pt = 20.0 if (n <= 3 and em_width(val_txt) <= 8) else 16.5
         p0 = tf.paragraphs[0]
         p0.alignment = PP_ALIGN.CENTER
@@ -1294,7 +1549,7 @@ def add_highlights(slide, rect, items, accent=None):
         p1.space_before = Pt(0)
         p1.space_after = Pt(0)
         r_lbl = p1.add_run()
-        r_lbl.text = str(it.get("label", ""))
+        r_lbl.text = strip_md(str(it.get("label", "")))
         r_lbl.font.size = Pt(11.5)
         r_lbl.font.bold = True
         r_lbl.font.color.rgb = lbl_rgb
@@ -1304,7 +1559,7 @@ def add_highlights(slide, rect, items, accent=None):
             p2.space_before = Pt(0)
             p2.space_after = Pt(0)
             r_sub = p2.add_run()
-            r_sub.text = str(it.get("sub"))
+            r_sub.text = strip_md(str(it.get("sub")))
             r_sub.font.size = Pt(10.5)
             r_sub.font.color.rgb = sub_rgb
         # Safety check: shrink card fonts proportionally if long label/sub wraps
@@ -1349,11 +1604,8 @@ def add_takeaway_bar(slide, rect, text, accent=None):
     p.alignment = PP_ALIGN.LEFT
     p.space_before = Pt(0)
     p.space_after = Pt(0)
-    r = p.add_run()
-    r.text = str(text)
-    r.font.size = Pt(12.5)
-    r.font.bold = True
-    r.font.color.rgb = RGBColor(0xF0, 0xF4, 0xF8) if dark else acc_rgb
+    add_rich_runs(p, str(text), base_bold=True, size_pt=12.5,
+                  color_rgb=(RGBColor(0xF0, 0xF4, 0xF8) if dark else acc_rgb))
     w_pt, h_pt = max(w / 12700.0 - 20.0, 40.0), h / 12700.0
     if tf_text_height_pt(tf, w_pt, 12.5) > h_pt * 0.96:
         shrink_body_to_fit(tf, w_pt, h_pt, 12.5, min_pt=10.5)
@@ -1415,7 +1667,7 @@ def add_keypoint_cards(slide, rect, items, accent=None):
         p0.space_before = Pt(0)
         p0.space_after = Pt(2 if body else 0)
         r0 = p0.add_run()
-        r0.text = head
+        r0.text = strip_md(head)
         r0.font.size = Pt(h_sz)
         r0.font.bold = True
         r0.font.color.rgb = acc_rgb
@@ -1424,10 +1676,7 @@ def add_keypoint_cards(slide, rect, items, accent=None):
             p1.alignment = PP_ALIGN.LEFT
             p1.space_before = Pt(0)
             p1.space_after = Pt(0)
-            r1 = p1.add_run()
-            r1.text = body
-            r1.font.size = Pt(b_sz)
-            r1.font.color.rgb = body_rgb
+            add_rich_runs(p1, body, base_bold=False, size_pt=b_sz, color_rgb=body_rgb)
         if tf_text_height_pt(tf, w_pt, h_sz) > h_pt * 0.96:
             shrink_body_to_fit(tf, w_pt, h_pt, h_sz, min_pt=10.5, compact_spacing_pt=1.0)
         created.append(card)
@@ -1492,9 +1741,10 @@ def add_agenda_rows(slide, rect, bullets, accent=None):
         r_num.font.bold = True
         r_num.font.color.rgb = acc_rgb
         split_done = False
+        plain_txt = strip_md(txt)
         for sep in ("：", ": "):
-            if sep in txt:
-                hd, rest = txt.split(sep, 1)
+            if sep in plain_txt:
+                hd, rest = plain_txt.split(sep, 1)
                 if 0 < em_width(hd) <= 16 and rest.strip():
                     r1 = p.add_run()
                     r1.text = hd + sep
@@ -1508,10 +1758,7 @@ def add_agenda_rows(slide, rect, bullets, accent=None):
                     split_done = True
                     break
         if not split_done:
-            r1 = p.add_run()
-            r1.text = txt
-            r1.font.size = Pt(sz)
-            r1.font.color.rgb = body_rgb
+            add_rich_runs(p, txt, base_bold=False, size_pt=sz, color_rgb=body_rgb)
         if tf_text_height_pt(tf, w_pt, sz) > h_pt * 0.96:
             shrink_body_to_fit(tf, w_pt, h_pt, sz, min_pt=10.5)
         created.append(row)
@@ -1597,10 +1844,11 @@ def _iter_all_shapes(shapes):
 
 def replace_text_in_slide(slide, old: str, new: str) -> int:
     """In-place substring replacement across text frames, grouped shapes, tables,
-    chart titles & notes, preserving formatting (with smart-punctuation fallback)."""
+    chart titles/axis titles & notes, preserving formatting (with smart-punctuation & whitespace fallbacks)."""
     if not old:
         return 0
     old_norm = old.translate(_PUNCT_NORM)
+    old_ws = re.sub(r"\s+", " ", old_norm).strip()
     count = 0
 
     def _rep_tf(tf):
@@ -1631,6 +1879,14 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
                 p.runs[0].text = full_n.replace(old_norm, new)
                 for r in p.runs[1:]:
                     r.text = ""
+                continue
+            # 4. Whitespace-normalized fallback (handles \xa0, multi-space, soft line breaks)
+            full_ws = re.sub(r"\s+", " ", full_n)
+            if old_ws and old_ws in full_ws and p.runs:
+                count += full_ws.count(old_ws)
+                p.runs[0].text = full_ws.replace(old_ws, new)
+                for r in p.runs[1:]:
+                    r.text = ""
 
     for sh in _iter_all_shapes(slide.shapes):
         if sh.has_text_frame:
@@ -1643,8 +1899,17 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
         except Exception:
             pass
         try:
-            if sh.has_chart and sh.chart.has_title:
-                _rep_tf(sh.chart.chart_title.text_frame)
+            if sh.has_chart:
+                ch = sh.chart
+                if ch.has_title:
+                    _rep_tf(ch.chart_title.text_frame)
+                for ax_attr in ("category_axis", "value_axis"):
+                    try:
+                        ax = getattr(ch, ax_attr, None)
+                        if ax is not None and ax.has_title:
+                            _rep_tf(ax.axis_title.text_frame)
+                    except Exception:
+                        pass
         except Exception:
             pass
     if slide.has_notes_slide:
@@ -1754,13 +2019,14 @@ def fix_degenerate_placeholders(prs, slide):
 def fill_subtitle(slide, subtitle, prs):
     if not subtitle:
         return
+    clean_sub = strip_md(str(subtitle))
     sub_ph = None
     for ph in slide.placeholders:
         if ph.placeholder_format.type == PP_PLACEHOLDER.SUBTITLE:
             sub_ph = ph
             break
     if sub_ph is not None:
-        sub_ph.text_frame.text = str(subtitle)
+        sub_ph.text_frame.text = clean_sub
         _, _, sw, sh = ph_geom(prs, slide, sub_ph)
         if sw and sh and sw.pt > 20 and sh.pt > 12:
             inh = ph_inherited_pt(sub_ph, 20.0, getattr(prs, "_master_styles", None))
@@ -1768,7 +2034,7 @@ def fill_subtitle(slide, subtitle, prs):
         return
     SW, SH = int(prs.slide_width), int(prs.slide_height)
     tb = fit_textbox(slide, (int(SW * 0.10), int(SH * 0.30), int(SW * 0.80), int(SH * 0.16)),
-                     subtitle, size_pt=20)
+                     clean_sub, size_pt=20)
     shrink_body_to_fit(tb.text_frame, tb.width.pt, tb.height.pt, 20.0, min_pt=12.0)
 
 

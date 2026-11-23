@@ -642,31 +642,36 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
     if mt_raw:
         m_p1 = re.search(r"<!--\s*PDF page 1\s*-->|---\s*page 1\s*---", mt_raw)
         body = mt_raw[m_p1.start():] if m_p1 else mt_raw
-        # 4a. Opening / Abstract verbatim (never drop title/abstract/intro framing)
+        # 4a. Opening / Abstract verbatim (de-hyphenated across LaTeX line wraps, never drops framing)
         m_p2 = re.search(r"<!--\s*PDF page 2\s*-->|---\s*page 2\s*---", body)
         p1_txt = (body[:m_p2.start()] if m_p2 else body[:1800]).strip()
-        p1_clean = re.sub(r"<!--.*?-->", "", p1_txt).strip()
+        p1_clean = re.sub(r"<!--.*?-->", "", p1_txt)
+        p1_clean = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})", r"\1\2", p1_clean).strip()
         if p1_clean:
             lines.append("## Opening & Abstract (p.1 verbatim)")
             lines.append(p1_clean[:1400] + (" ..." if len(p1_clean) > 1400 else ""))
             lines.append("")
 
         q_re = re.compile(
-            r"(\d+\.\d+|\d{2,}\s*(%|ms|GB|MB|x|×|k\b|M\b|B\b)|Table\s*\d|Figure\s*\d|Fig\.\s*\d|"
+            r"(\d+\.\d+|\d{2,}\s*(%|ms|GB|MB|x|×|k\b|M\b|B\b|万|亿)|Table\s*[IVX\d]|Figure\s*[SA\d]|Fig\.\s*[SA\d]|"
             r"表\s*\d|图\s*\d|\b(outperform|achiev|reduc|improv|limitation|conclud|propos|ablation|"
             r"method|architect|dataset|benchmark|baseline|future|trade-?off|bottleneck|evaluat|significan)\w*|"
             r"(提升|降低|优于|局限|不足|未来|结论|消融|提出|架构|方法|数据集|基线|权衡|瓶颈|实验))",
             re.I,
         )
+        # De-hyphenate LaTeX line-end wraps and merge wrapped 2-column prose lines per page
+        body_clean = re.sub(r"([A-Za-z]{2,})-\s*\n\s*([a-z]{2,})", r"\1\2", body)
         cur_page = "p.1"
         by_page: dict[str, list[str]] = {}
         page_order: list[str] = []
         captions_found: list[str] = []
         seen = set()
         seen_cap = set()
-        for ln in body.splitlines():
+        raw_page_lines: list[tuple[str, str]] = []
+        for ln in body_clean.splitlines():
             s = ln.strip()
             if not s:
+                raw_page_lines.append((cur_page, ""))
                 continue
             pm = re.match(r"^(?:<!--\s*PDF page\s*(\d+)\s*-->|---\s*page\s*(\d+)\s*---)$", s)
             if pm:
@@ -674,9 +679,35 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
                 if cur_page not in by_page:
                     by_page[cur_page] = []
                     page_order.append(cur_page)
+                raw_page_lines.append((cur_page, ""))
                 continue
             if s.startswith("<!--"):
                 continue
+            raw_page_lines.append((cur_page, s))
+        # Re-join wrapped prose lines within the same page/paragraph (preserving captions & headings)
+        merged_blocks: list[tuple[str, str]] = []
+        buf_pg, buf_txt = "p.1", ""
+        for pg, s in raw_page_lines:
+            if not s or pg != buf_pg or FIG_CAP_RE.match(s) or TBL_CAP_RE.match(s):
+                if buf_txt:
+                    merged_blocks.append((buf_pg, buf_txt))
+                    buf_txt = ""
+                if s:
+                    buf_pg, buf_txt = pg, s
+                else:
+                    buf_pg = pg
+            elif (buf_txt and not re.search(r"[.!?。！？:：]$", buf_txt)
+                  and len(buf_txt) < 520 and not re.match(r"^(?:\d+\.?\s+[A-Z]|[IVX]+\.\s+)", s)):
+                joiner = "" if (re.search(r"[\u4e00-\u9fff]$", buf_txt) and re.match(r"^[\u4e00-\u9fff]", s)) else " "
+                buf_txt = buf_txt + joiner + s
+            else:
+                if buf_txt:
+                    merged_blocks.append((buf_pg, buf_txt))
+                buf_pg, buf_txt = pg, s
+        if buf_txt:
+            merged_blocks.append((buf_pg, buf_txt))
+
+        for cur_page, s in merged_blocks:
             # Capture verbatim figure/table captions across all pages
             if (FIG_CAP_RE.match(s) or TBL_CAP_RE.match(s)) and s not in seen_cap and len(captions_found) < 24:
                 seen_cap.add(s)

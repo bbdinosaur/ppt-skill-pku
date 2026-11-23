@@ -405,10 +405,18 @@ def _number_in_corpus(m: str, corpus: str, corpus_nc: str, corpus_vals: set[floa
 
 
 _SUP_MAP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+")
+_SUP_RUN_RE = re.compile(r"([⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺]+)")
+
+
+def _expand_sup(s: str) -> str:
+    """Convert Unicode superscript runs into unambiguous ^exponent (e.g. 10⁻⁶ -> 10^-6, 10⁶ -> 10^6)."""
+    return _SUP_RUN_RE.sub(lambda m: "^" + m.group(1).translate(_SUP_MAP), str(s))
+
+
 _SCI_E_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[eE]\s*([+-]?\d+)(?!\d)")
-_SCI_X10_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[×xX\*]\s*10\^?\s*\(?([+-]?\d+)\)?")
-_CORPUS_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*([kKmMbB])(?![A-Za-z0-9])")
-_SLIDE_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)([kKMB])(?![A-Za-z0-9])")
+_SCI_X10_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[×xX\*]\s*10\^\s*[\(\{]?([+-]?\d+)[\)\}]?")
+_CORPUS_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*(?:([kKMB])(?![A-Za-z0-9])|([万亿]))")
+_SLIDE_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)(?:([kKMB])(?![A-Za-z0-9])|([万亿]))")
 _LEAD_DOT_RE = re.compile(r"(?<![A-Za-z0-9.])(\.\d+)(?!\d)")
 
 
@@ -416,15 +424,15 @@ def _val_in_corpus_vals(val: float, corpus_vals: set[float]) -> bool:
     return any(abs(val - cv) <= max(1e-12, abs(val) * 1e-6) for cv in corpus_vals)
 
 
-_UNIT_EXP_RE = re.compile(r"(?:(?<![A-Za-z0-9.])10\^?\s*\(?([+-]?\d+)\)?|(?<![A-Za-z0-9.])\d+(?:\.\d+)?\s*[eE]\s*([+-]?\d+)(?!\d))")
+_UNIT_EXP_RE = re.compile(r"(?:(?<![A-Za-z0-9.])10\^\s*[\(\{]?([+-]?\d+)[\)\}]?|(?<![A-Za-z0-9.])\d+(?:\.\d+)?\s*[eE]\s*([+-]?\d+)(?!\d))")
 
 
 def _extract_special_corpus_vals(raw_corpus: str) -> tuple[set[float], set[int]]:
-    """Parse explicit scientific notation (1.2e-4, 3.5×10^-5), unit exponents (1e-6, 10^-6),
-    and suffixed magnitudes (1.2k, 3.4M, 2.5B) from raw whitespace-preserving corpus."""
+    """Parse explicit scientific notation (1.2e-4, 3.5×10^-5, 10^{-6}), unit exponents,
+    and suffixed magnitudes (1.2k, 3.4M, 2.5B, 1.2万, 3.5亿) from raw whitespace-preserving corpus."""
     vals: set[float] = set()
     exps: set[int] = set()
-    c_sup = re.sub(r"(?<=\d),(?=\d)", "", raw_corpus.translate(_SUP_MAP))
+    c_sup = re.sub(r"(?<=\d),(?=\d)", "", _expand_sup(raw_corpus))
     for rx in (_SCI_E_RE, _SCI_X10_RE):
         for m in rx.finditer(c_sup):
             try:
@@ -438,10 +446,11 @@ def _extract_special_corpus_vals(raw_corpus: str) -> tuple[set[float], set[int]]
             exps.add(int(m.group(1) or m.group(2)))
         except Exception:
             pass
-    mults = {"k": 1e3, "m": 1e6, "b": 1e9}
+    mults = {"k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9, "万": 1e4, "亿": 1e8}
     for m in _CORPUS_SUFFIX_RE.finditer(c_sup):
         try:
-            vals.add(float(m.group(1)) * mults[m.group(2).lower()])
+            suf = m.group(2) or m.group(3)
+            vals.add(float(m.group(1)) * mults[suf])
         except Exception:
             pass
     return vals, exps
@@ -518,9 +527,9 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
             r"图|表|公式|式|第)\s*\(?\d+\.\d+\)?",
             re.I,
         )
-        mults_s = {"k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9}
+        mults_s = {"k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9, "万": 1e4, "亿": 1e8}
         for t in texts:
-            t_clean = sec_tag_re.sub(" ", str(t).translate(_SUP_MAP).replace(",", ""))
+            t_clean = sec_tag_re.sub(" ", _expand_sup(str(t)).replace(",", ""))
             # 1) Check full scientific-notation tokens first (catches 100x exponent hallucinations
             #    and allows exact bidirectional match: paper 0.00035 <-> slide 3.5×10^-4)
             for rx in (_SCI_E_RE, _SCI_X10_RE):
@@ -543,7 +552,7 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                         hint = _nearest_numbers(f"{sv:g}", corpus_nums)
                         issues.append(f"slide {s.get('slide')}: number '{tok}' not found in material{hint}")
                 t_clean = rx.sub(" ", t_clean)
-            # 2) Check suffixed magnitudes (e.g. 2.4k, 1.8M, 2.5B)
+            # 2) Check suffixed magnitudes (e.g. 2.4k, 1.8M, 2.5B, 1.2万, 3.5亿)
             for sm in _SLIDE_SUFFIX_RE.finditer(t_clean):
                 tok = sm.group(0).strip()
                 if tok in seen:
@@ -552,7 +561,7 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                 checked += 1
                 try:
                     base_v = float(sm.group(1))
-                    suf = sm.group(2)
+                    suf = sm.group(2) or sm.group(3)
                     sv = base_v * mults_s[suf]
                 except Exception:
                     continue
@@ -604,6 +613,7 @@ def check_quotes(content_map, material_text_file, fallback_corpus="", skip_slide
     text, text_nc = _build_corpus(material_text_file, fallback_corpus)
     text_low = text.lower()
     text_nocite = _CITE_BRACKET_RE.sub("", text_low)
+    text_nohy = text_nocite.replace("-", "")
     raw_lines = [ln.strip() for ln in raw_corpus.splitlines() if 12 <= len(ln.strip()) <= 260][:2400]
     for s in (content_map.get("slides") or []):
         if s.get("slide") in skip:
@@ -613,16 +623,53 @@ def check_quotes(content_map, material_text_file, fallback_corpus="", skip_slide
             if len(q) < 6:
                 continue
             checked += 1
+            q_low = q.lower()
+            q_nocite = _CITE_BRACKET_RE.sub("", q_low)
+            q_nohy = q_nocite.replace("-", "")
             if text and (
                 q in text
                 or q.replace(",", "") in text_nc
-                or q.lower() in text_low
-                or _CITE_BRACKET_RE.sub("", q.lower()) in text_nocite
+                or q_low in text_low
+                or q_nocite in text_nocite
+                or (len(q_nohy) >= 12 and q_nohy in text_nohy)
             ):
                 continue
             hint = _nearest_quote_line(src.get("quote", ""), raw_lines)
             issues.append(f"slide {s.get('slide')}: quote not found in material: '{src.get('quote', '')[:45]}...'{hint}")
     return issues, checked
+
+
+_ARTIFACT_RE = re.compile(
+    r"(\*\*[^*\n]{2,60}\*\*|\bLorem\s+ipsum\b|\bClick\s+to\s+add\s+(?:title|text|subtitle)\b|"
+    r"\[(?:TODO|TBD|INSERT\b[^\]]*)\]|10\^\{[+-]?\d+\}|\\(?:times|pm|alpha|beta|gamma|leq|geq|approx)\b)",
+    re.I,
+)
+
+
+def check_placeholder_hygiene(prs, skip_slides: set[int] | None = None):
+    """Detect leaked raw Markdown **bold**, template boilerplate, or [TODO]/[TBD] artifacts."""
+    issues = []
+    skip = skip_slides or set()
+    for si, slide in enumerate(prs.slides, 1):
+        if si in skip:
+            continue
+        for sh in du._iter_all_shapes(slide.shapes):
+            texts = []
+            if sh.has_text_frame:
+                texts.append(sh.text_frame.text or "")
+            try:
+                if sh.has_table:
+                    for row in sh.table.rows:
+                        for cell in row.cells:
+                            texts.append(cell.text_frame.text or "")
+            except Exception:
+                pass
+            for txt in texts:
+                m = _ARTIFACT_RE.search(txt)
+                if m:
+                    issues.append(f"slide {si}: artifact '{m.group(0)[:36]}'")
+                    break
+    return issues
 
 
 def main() -> int:
@@ -688,10 +735,12 @@ def main() -> int:
     # warnings (and modified in-place slides from pre-existing starting-deck font overrides)
     unchanged_slides: set[int] = set()
     existing_font_slides: set[int] = set()
+    zero_hit_edits: list[dict] = []
     sdf = work / "slide_diff.json"
     if content_map.get("mode") == "edit" and sdf.is_file():
         try:
             sd = json.loads(sdf.read_text(encoding="utf-8"))
+            zero_hit_edits = list(sd.get("zero_hit_edits") or [])
             for row in (sd.get("slides") or []):
                 si = row.get("slide")
                 if not isinstance(si, int):
@@ -720,6 +769,11 @@ def main() -> int:
     add("table_fit", not tbl, f"{len(tbl)} potential table overflows" + (": " + "; ".join(tbl[:4]) if tbl else ""))
     fo = check_font_overrides(prs, existing_font_slides)
     add("font_inheritance", not fo, f"{len(fo)} overrides" + (": " + "; ".join(fo[:4]) if fo else ""))
+    ph_art = check_placeholder_hygiene(prs, unchanged_slides)
+    add("placeholder_hygiene", not ph_art, f"{len(ph_art)} artifacts" + (": " + "; ".join(ph_art[:4]) if ph_art else ""))
+    if content_map.get("mode") == "edit":
+        zh_msgs = [f"slide {z.get('slide')}: replace_text '{str(z.get('old', ''))[:32]}' matched 0 times" for z in zero_hit_edits]
+        add("edit_application", not zh_msgs, f"{len(zh_msgs)} zero-hit edits" + (": " + "; ".join(zh_msgs[:4]) if zh_msgs else ""))
 
     # evidence: every content slide cites >=1 source; quotes verified against material text
     mt_file = (inv.get("pdf_extract") or {}).get("text_file")

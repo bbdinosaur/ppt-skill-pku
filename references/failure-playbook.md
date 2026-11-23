@@ -26,11 +26,11 @@
   plan.json 留档，status=partial，不得伪造 pptx）。
 - **PIL 缺失**：图片插入退化为 width-only（仍等比），aspect 检查自动跳过。
 - **PyMuPDF 缺失**：跳过 PDF 文本抽取，quote 核验退化为对照 material.json 原文。
-- **soffice 缺失/超时(>55s)**：快失败切换至 `reportlab` 渲染**真实 PDF 交付物**（近似版式、可抽取文本、含图片表格）+ PyMuPDF/pdftoppm/PIL 100 DPI 预览与像素空白检测兜底 —— PDF 交付物永不缺失。
+- **soffice 缺失/超时(>110s)**：切换至 `reportlab` 渲染**真实 PDF 交付物**（近似版式、可抽取文本、含图片表格）+ PyMuPDF/pdftoppm/PIL 100 DPI 预览与像素空白检测兜底 —— PDF 交付物永不缺失。
 - **内置 2 轮自动修补 + 局部热修**：`run_pipeline.py deliver` 在导出前自动尝试 ≤2 轮毫秒级修补（`_tighten=1/2` 排版紧缩、表格限高、`min_font` 下限钳制、引文逐字对齐、缺源/缺备注补齐，绝不改写幻灯片数字）；遇残余硬错可用 `--patch-slide 'N:{...}'` 局部热修（最多重跑 1 次，严禁整文件重写）。
 
 ## 判定原则
 
 - 材料里没有的数字/结论 **不写**。宁缺毋编。
-- `status` 判定（`--status auto`）：核心产物齐全（有效可编辑 `presentation.pptx` ≥ 5 KB + 真实 `presentation.pdf` 导出 + 非空页面映射 + 全部必需契约字段齐备）**且**首轮 10 项关键检查（`bounds`/`aspect`/`slide_count`/`slide_limit`/`claim_sources`/`overlap`/`text_fit`/`table_fit`/`quote_verification`/`number_fidelity`）全部通过 → `ok`；Pass ≥2（经 1 次局部热修后）仍 100% 严格门禁 8 项硬事实/几何检查，仅残余纯启发式 `OVERFLOW`/`TABLE_OVERFLOW` 在真实 PDF 导出+`visual_ok`+`bounds`+`overlap` 全过时诚实记入 `exceptions` 避免第 3 轮循环；任一硬检查失败、PDF 导出失败或缺少必需契约字段 → 诚实标为 `partial`（绝不虚报 `ok`）；无有效 PPTX → `failed`。
+- `status` 判定（`--status auto`）：核心产物齐全（有效可编辑 `presentation.pptx` ≥ 5 KB + 真实 `presentation.pdf` 导出 + 非空页面映射 + 全部必需契约字段齐备）**且**首轮关键检查（`bounds`/`aspect`/`slide_count`/`slide_limit`/`claim_sources`/`overlap`/`text_fit`/`table_fit`/`quote_verification`/`number_fidelity`/`placeholder_hygiene` 及 edit 模式 `edit_application`）全部通过 → `ok`；Pass ≥2（经 1 次局部热修后）仍 100% 严格门禁全部硬事实/几何/洁净/编辑生效检查，仅残余纯启发式 `OVERFLOW`/`TABLE_OVERFLOW` 在真实 PDF 导出+`visual_ok`+`bounds`+`overlap` 全过时诚实记入 `exceptions` 避免第 3 轮循环；任一硬检查失败、PDF 导出失败或缺少必需契约字段 → 诚实标为 `partial`（绝不虚报 `ok`）；无有效 PPTX → `failed`。
 - 部分结果也要早保存：先落一版 partial 的 result.json，再迭代。

@@ -134,7 +134,7 @@ def soffice_convert(deck: Path, outdir: Path, work: Path | None = None) -> Path 
             [soffice, "--headless", "--norestore", "--nofirststartwizard",
              f"-env:UserInstallation=file://{lo_home}",
              "--convert-to", "pdf", "--outdir", str(outdir), str(deck)],
-            env=env, timeout=55,  # fail fast to reportlab fallback if LibreOffice stalls
+            env=env, timeout=110,  # generous warm-up for CJK/chart templates before reportlab fallback
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
     except Exception:

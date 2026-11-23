@@ -90,6 +90,7 @@ def main() -> int:
                     "min_font": "FONT_TOO_SMALL", "font_inheritance": "FONT_OVERRIDE",
                     "claim_sources": "EVIDENCE_MISSING", "quote_verification": "QUOTE_NOT_FOUND",
                     "number_fidelity": "NUMBER_NOT_FOUND", "table_fit": "TABLE_OVERFLOW",
+                    "placeholder_hygiene": "PLACEHOLDER_LEAK", "edit_application": "EDIT_NO_OP",
                     }.get(c["id"], "CHECK_FAILED")
             exceptions.append({"code": code, "detail": c["detail"],
                                "disposition": "reported honestly; see content_map for affected slides"})
@@ -140,7 +141,8 @@ def main() -> int:
     pdf_ok = bool(export.get("pdf")) and pdf.is_file() and pdf.stat().st_size > 500
     chk_by_id = {c["id"]: bool(c.get("pass")) for c in checks.get("checks", [])}
     hard_ids = ("bounds", "aspect", "slide_count", "slide_limit", "claim_sources",
-                "overlap", "quote_verification", "number_fidelity")
+                "overlap", "quote_verification", "number_fidelity",
+                "placeholder_hygiene", "edit_application")
     heur_ids = ("text_fit", "table_fit")
     allow_heur_soft = (
         args.pass_num >= 2
