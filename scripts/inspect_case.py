@@ -94,17 +94,35 @@ def describe_pptx(path: Path):
     return d
 
 
-FIG_CAP_RE = re.compile(r"^(?:Figure|Fig\.?|图)\s*([0-9]+[a-zA-Z]?)\b[\s:：.\-—]*(.*)$", re.I)
-TBL_CAP_RE = re.compile(r"^(?:Table|Tab\.?|表)\s*([0-9]+[a-zA-Z]?)\b[\s:：.\-—]*(.*)$", re.I)
+FIG_CAP_RE = re.compile(
+    r"^(?:(?:Extended\s+Data|Supplementary|Supp\.?)\s+)?(?:Figure|Fig\.?|图)\s*"
+    r"([SA]?\d+(?:[.\-]\d+)?[a-zA-Z]?|[IVX]{1,5})\b[\s:：.\-—]*(.*)$",
+    re.I,
+)
+TBL_CAP_RE = re.compile(
+    r"^(?:(?:Extended\s+Data|Supplementary|Supp\.?)\s+)?(?:Table|Tab\.?|表)\s*"
+    r"([SA]?\d+(?:[.\-]\d+)?[a-zA-Z]?|[IVX]{1,5})\b[\s:：.\-—]*(.*)$",
+    re.I,
+)
 
 
 def _crop_vector_figure(page, cap_bbox, fitz, fig_path: Path):
-    """Render/crop the vector figure region immediately above a Figure caption."""
+    """Render/crop the vector figure region immediately above a Figure caption.
+    Column-aware for 2-column IEEE/NeurIPS/CVPR papers so left-column captions never grab right-column drawings."""
     pr = page.rect
     x0, y0, x1, y1 = cap_bbox
-    # Search vector drawings above the caption on the same horizontal band (or full width)
+    cap_w = max(0.0, x1 - x0)
+    is_single_col = cap_w < pr.width * 0.58
+    if is_single_col:
+        mid_x = pr.x0 + pr.width * 0.5
+        if (x0 + x1) * 0.5 <= mid_x:
+            col_x0, col_x1 = pr.x0 + 6.0, max(x1 + 24.0, mid_x + 8.0)
+        else:
+            col_x0, col_x1 = min(x0 - 24.0, mid_x - 8.0), pr.x1 - 6.0
+    else:
+        col_x0, col_x1 = pr.x0 + 8.0, pr.x1 - 8.0
+    # Search vector drawings above the caption within the same column band
     top_limit = max(pr.y0 + 24.0, y0 - pr.height * 0.52)
-    bot_limit = max(top_limit + 40.0, y0 - 2.0)
     rects = []
     try:
         for d in page.get_drawings():
@@ -116,13 +134,15 @@ def _crop_vector_figure(page, cap_bbox, fitz, fig_path: Path):
             if r.width > pr.width * 0.94 and r.height > pr.height * 0.90:
                 continue  # page frame
             if r.y1 <= y0 + 4.0 and r.y0 >= top_limit - 10.0 and r.y1 > pr.y0 + 20.0:
+                if is_single_col and (r.x1 < col_x0 or r.x0 > col_x1):
+                    continue  # drawing belongs to the other column
                 rects.append(r)
     except Exception:
         rects = []
     if rects:
-        ux0 = max(pr.x0 + 8.0, min(r.x0 for r in rects) - 14.0)
+        ux0 = max(col_x0, min(r.x0 for r in rects) - 14.0)
         uy0 = max(pr.y0 + 16.0, min(r.y0 for r in rects) - 14.0)
-        ux1 = min(pr.x1 - 8.0, max(r.x1 for r in rects) + 14.0)
+        ux1 = min(col_x1, max(r.x1 for r in rects) + 14.0)
         uy1 = min(y0 - 1.0, max(r.y1 for r in rects) + 10.0)
         if ux1 - ux0 >= 80.0 and uy1 - uy0 >= 55.0:
             clip = fitz.Rect(ux0, uy0, ux1, uy1)
@@ -131,11 +151,11 @@ def _crop_vector_figure(page, cap_bbox, fitz, fig_path: Path):
     else:
         clip = None
     if clip is None:
-        # Fallback: conservative band above the caption if enough vertical space exists
+        # Fallback: conservative band above the caption within its column if enough vertical space exists
         band_top = max(pr.y0 + 36.0, y0 - pr.height * 0.34)
         if y0 - band_top < 70.0:
             return None
-        clip = fitz.Rect(pr.x0 + 24.0, band_top, pr.x1 - 24.0, y0 - 2.0)
+        clip = fitz.Rect(max(pr.x0 + 16.0, col_x0), band_top, min(pr.x1 - 16.0, col_x1), y0 - 2.0)
     pix = page.get_pixmap(clip=clip, dpi=160)
     if pix.width < 60 or pix.height < 50:
         return None
@@ -169,37 +189,59 @@ def extract_pdf(pdf_path: Path, work: Path):
                 for b in page.get_text("dict").get("blocks", []):
                     if b.get("type", 0) != 0:
                         continue
-                    btxt = " ".join(
-                        "".join(s.get("text", "") for s in ln.get("spans", [])).strip()
+                    blines = [
+                        (re.sub(r"\s+", " ", "".join(s.get("text", "") for s in ln.get("spans", []))).strip(),
+                         ln.get("bbox"))
                         for ln in b.get("lines", [])
-                    ).strip()
-                    btxt = re.sub(r"\s+", " ", btxt)
-                    if not btxt:
+                    ]
+                    blines = [(t, bb) for t, bb in blines if t]
+                    if not blines:
                         continue
-                    mf = FIG_CAP_RE.match(btxt)
-                    if mf:
-                        fig_caps.append((mf.group(1), btxt[:180], b.get("bbox")))
-                        fig_index_lines.append(f"- p{pno + 1}: {btxt[:140]}")
-                    else:
-                        mt = TBL_CAP_RE.match(btxt)
-                        if mt:
-                            page_has_tbl = True
-                            tbl_index_lines.append(f"- p{pno + 1}: {btxt[:140]}")
-                            out["tables_index"].append({"page": pno + 1, "id": mt.group(1), "caption": btxt[:180]})
+                    # Split horizontally disjoint 2-column caption lines (e.g. left Fig. S1 + right Fig. 2 at same Y)
+                    cap_groups = []
+                    for lt, lbb in blines:
+                        is_new_cap = bool(FIG_CAP_RE.match(lt) or TBL_CAP_RE.match(lt))
+                        if cap_groups and is_new_cap:
+                            prev_bb = cap_groups[-1][1]
+                            if lbb and prev_bb and (lbb[0] > prev_bb[2] - 4.0 or prev_bb[0] > lbb[2] - 4.0):
+                                cap_groups.append([lt, lbb])
+                                continue
+                        if cap_groups:
+                            cap_groups[-1][0] += " " + lt
+                            if lbb and cap_groups[-1][1]:
+                                pb = cap_groups[-1][1]
+                                cap_groups[-1][1] = (min(pb[0], lbb[0]), min(pb[1], lbb[1]),
+                                                     max(pb[2], lbb[2]), max(pb[3], lbb[3]))
+                        else:
+                            cap_groups.append([lt, lbb or b.get("bbox")])
+                    for btxt, bbox_g in cap_groups:
+                        btxt = re.sub(r"\s+", " ", btxt).strip()
+                        if not btxt:
+                            continue
+                        mf = FIG_CAP_RE.match(btxt)
+                        if mf:
+                            fig_caps.append((mf.group(1), btxt[:180], bbox_g))
+                            fig_index_lines.append(f"- p{pno + 1}: {btxt[:140]}")
+                        else:
+                            mt = TBL_CAP_RE.match(btxt)
+                            if mt:
+                                page_has_tbl = True
+                                tbl_index_lines.append(f"- p{pno + 1}: {btxt[:140]}")
+                                out["tables_index"].append({"page": pno + 1, "id": mt.group(1), "caption": btxt[:180]})
             except Exception:
                 pass
 
             # Extract structured PDF tables via PyMuPDF find_tables() using cell-clip text
-            # Strictly gated on actual Table caption blocks on this page (<0.2s on 25p PDFs!)
-            if len(out["tables_extracted"]) < 4 and page_has_tbl and hasattr(page, "find_tables"):
+            # Strictly gated on actual Table caption blocks on this page (<0.25s on 25p PDFs!)
+            if len(out["tables_extracted"]) < 8 and page_has_tbl and hasattr(page, "find_tables"):
                 try:
                     tf = page.find_tables()
                     for tb in (getattr(tf, "tables", None) or []):
                         clean_rows = []
                         tb_rows = getattr(tb, "rows", None) or []
-                        for row in tb_rows[:10]:
+                        for row in tb_rows[:12]:
                             cr = []
-                            for cell in (getattr(row, "cells", None) or [])[:8]:
+                            for cell in (getattr(row, "cells", None) or [])[:10]:
                                 if cell is None:
                                     cr.append("")
                                 else:
@@ -209,7 +251,7 @@ def extract_pdf(pdf_path: Path, work: Path):
                                 clean_rows.append(cr)
                         if len(clean_rows) >= 2 and len(clean_rows[0]) >= 2:
                             out["tables_extracted"].append({"page": pno + 1, "rows": clean_rows})
-                            if len(out["tables_extracted"]) >= 6:
+                            if len(out["tables_extracted"]) >= 8:
                                 break
                 except Exception:
                     pass
@@ -574,7 +616,7 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
             except Exception:
                 continue
 
-    # 3. Full structured material.json (verbatim up to 14KB; rich per-key preview if larger)
+    # 3. Full structured material.json (verbatim up to 9.5KB; rich per-key preview if larger)
     mat = inv.get("material") or {}
     mat_chars = 0
     mat_truncated = False
@@ -582,16 +624,16 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
         lines.append("## material.json Full Content")
         mat_str = json.dumps(mat, ensure_ascii=False, indent=1)
         mat_chars = len(mat_str)
-        if mat_chars <= 14000:
+        if mat_chars <= 9500:
             lines.append("```json\n" + mat_str + "\n```")
         else:
             mat_truncated = True
             for k, v in list(mat.items())[:24]:
                 vs = json.dumps(v, ensure_ascii=False)
-                cap_k = 2200 if k.lower() in (
+                cap_k = 1600 if k.lower() in (
                     "tables", "figures", "key_numbers", "results", "claims",
                     "metrics", "limitations", "sections", "abstract", "method", "methods"
-                ) else 800
+                ) else 600
                 lines.append(f"- **{k}**: {vs[:cap_k]}" + (" ..." if len(vs) > cap_k else ""))
         lines.append("")
 
@@ -602,11 +644,11 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
         body = mt_raw[m_p1.start():] if m_p1 else mt_raw
         # 4a. Opening / Abstract verbatim (never drop title/abstract/intro framing)
         m_p2 = re.search(r"<!--\s*PDF page 2\s*-->|---\s*page 2\s*---", body)
-        p1_txt = (body[:m_p2.start()] if m_p2 else body[:2400]).strip()
+        p1_txt = (body[:m_p2.start()] if m_p2 else body[:1800]).strip()
         p1_clean = re.sub(r"<!--.*?-->", "", p1_txt).strip()
         if p1_clean:
             lines.append("## Opening & Abstract (p.1 verbatim)")
-            lines.append(p1_clean[:1800] + (" ..." if len(p1_clean) > 1800 else ""))
+            lines.append(p1_clean[:1400] + (" ..." if len(p1_clean) > 1400 else ""))
             lines.append("")
 
         q_re = re.compile(
@@ -676,7 +718,7 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
 
     out_md = work / "material_digest.md"
     full_txt = "\n".join(lines)
-    txt = full_txt[:22000]
+    txt = full_txt[:16000]
     out_md.write_text(txt, encoding="utf-8")
     inv["completeness"] = {
         "material_json_chars": mat_chars,
@@ -684,7 +726,7 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
         "pdf_text_chars": pdf_text_chars,
         "pdf_beyond_digest": bool(pdf_text_chars > 14000),
         "digest_chars": len(txt),
-        "digest_clipped": len(full_txt) > 22000,
+        "digest_clipped": len(full_txt) > 16000,
     }
     return str(out_md)
 

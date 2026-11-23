@@ -36,11 +36,13 @@ if HAS_PPTX:
     }
     SKIP_TYPES = {PP_PLACEHOLDER.DATE, PP_PLACEHOLDER.FOOTER, PP_PLACEHOLDER.SLIDE_NUMBER}
     PIC_TYPES = {PP_PLACEHOLDER.PICTURE}
+    SUBTITLE_TYPES = {PP_PLACEHOLDER.SUBTITLE}
 else:
     TITLE_TYPES = set()
     BODY_TYPES = set()
     SKIP_TYPES = set()
     PIC_TYPES = set()
+    SUBTITLE_TYPES = set()
 
 DEFAULT_TITLE_PT = 28.0
 DEFAULT_BODY_PT = 18.0
@@ -742,6 +744,19 @@ def move_slide(prs, src0: int, dst0: int) -> None:
     lst.insert(dst0, el)
 
 
+def parse_chart_num(v) -> tuple[float, bool]:
+    """Parse numeric chart value robustly (accepts '85.4%', '1,240', '+58.4%', '−1.5').
+    Returns (float_value, had_percent_sign)."""
+    if isinstance(v, (int, float)):
+        return float(v), False
+    s = str(v or "").strip()
+    has_pct = "%" in s
+    s = s.replace(",", "").replace("%", "").replace("−", "-").replace("–", "-").strip()
+    if s.startswith("+"):
+        s = s[1:].strip()
+    return float(s), has_pct
+
+
 def add_native_chart(slide, rect, chart_spec, palette=None):
     """Add a fully-editable native PPT chart bound to plan data (创新点：图表数据绑定).
     chart_spec: {type: bar|hbar|line|pie, categories: [...], series: [{name, values}],
@@ -763,9 +778,18 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
     series_list = chart_spec.get("series") or []
     cd = CategoryChartData()
     cd.categories = cats
+    any_pct = str(chart_spec.get("unit") or "").strip() == "%"
     for s in series_list:
-        cd.add_series(str(s.get("name", "series")),
-                      tuple(float(v) for v in (s.get("values") or [])))
+        raw_vals = list(s.get("values") or [])
+        parsed_vals = []
+        for rv in raw_vals[:len(cats)]:
+            fv, is_p = parse_chart_num(rv)
+            if is_p:
+                any_pct = True
+            parsed_vals.append(fv)
+        while len(parsed_vals) < len(cats):
+            parsed_vals.append(0.0)
+        cd.add_series(str(s.get("name", "series")), tuple(parsed_vals))
     l, t, w, h = [int(v) for v in rect]
     gf = slide.shapes.add_chart(ctype, Emu(l), Emu(t), Emu(w), Emu(h), cd)
     try:
@@ -796,11 +820,28 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
             plot.has_data_labels = True
             dl = plot.data_labels
             dl.font.size = Pt(10.5)
+            if any_pct:
+                try:
+                    dl.number_format = '0.0"%"'
+                except Exception:
+                    pass
             if dark_bg:
                 dl.font.color.rgb = RGBColor(0xE2, 0xE8, 0xF0)
         # Apply theme palette to series (never sets font.name)
         cols = palette or ["#1F4E79", "#2E75B6", "#ED7D31", "#70AD47", "#5B9BD5"]
-        if ctype != XL_CHART_TYPE.PIE:
+        if ctype == XL_CHART_TYPE.PIE:
+            try:
+                if chart.series:
+                    sr0 = chart.series[0]
+                    for pi in range(len(cats)):
+                        c_hex = cols[pi % len(cols)].lstrip("#")
+                        c_rgb = RGBColor(*_safe_accent_for_dark_bg(c_hex)) if dark_bg else RGBColor.from_string(c_hex)
+                        pt = sr0.points[pi]
+                        pt.format.fill.solid()
+                        pt.format.fill.fore_color.rgb = c_rgb
+            except Exception:
+                pass
+        else:
             for idx, sr in enumerate(chart.series):
                 c_hex = cols[idx % len(cols)].lstrip("#")
                 try:
@@ -865,15 +906,54 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
     return gf
 
 
-def add_picture_fit(slide, img_path, rect, cap_text=None, cap_pt=11.0):
-    """Insert picture aspect-preserved, centered in rect; optional caption strip at rect bottom.
-    Returns (picture_shape, actual_rect)."""
+def format_caption(ref: str | None, caption: str | None) -> str:
+    """Join figure/table ref and caption without duplicating an existing prefix (e.g. 'Fig. 1 Fig. 1:')."""
+    r = str(ref or "").strip()
+    c = str(caption or "").strip()
+    if not r:
+        return c
+    if not c:
+        return r
+    r_low = r.rstrip(":：. ").lower()
+    c_low = c.lower()
+    if r_low and (c_low.startswith(r_low + " ") or c_low.startswith(r_low + ":") or c_low.startswith(r_low + "：") or c_low.startswith(r_low + ".") or c_low == r_low):
+        return c
+    return f"{r} {c}"
+
+
+def caption_height_emu(cap_text: str | None, width_emu: int, cap_pt: float = 11.0) -> int:
+    """Compute snug caption strip height (1 or 2 lines) so wrapped captions never overflow."""
+    if not cap_text:
+        return 0
+    w_pt = max(width_emu / 12700.0 - 10.0, 60.0)
+    n_ln = min(2, max(1, est_lines(cap_text, cap_pt, w_pt)))
+    return int(Inches(0.32 if n_ln == 1 else 0.50))
+
+
+def add_caption_box(slide, rect, cap_text: str, cap_pt: float = 11.0, color: str | None = None):
+    """Add an auto-fitted centered caption textbox (never triggers text_fit overflow)."""
     from pptx.enum.text import PP_ALIGN
+    if not cap_text:
+        return None
+    l, t, w, h = [int(v) for v in rect]
+    cap_col = color or ("#D8E2EC" if slide_is_dark(slide) else "#444444")
+    tb = fit_textbox(slide, (l, t, w, h), cap_text, size_pt=cap_pt, align=PP_ALIGN.CENTER, color=cap_col)
+    w_pt = max(w / 12700.0 - 8.0, 40.0)
+    h_pt = max(h / 12700.0, 14.0)
+    if tf_text_height_pt(tb.text_frame, w_pt, cap_pt) > h_pt * 0.96:
+        shrink_body_to_fit(tb.text_frame, w_pt, h_pt, cap_pt, min_pt=10.0, compact_spacing_pt=0.5)
+    return tb
+
+
+def add_picture_fit(slide, img_path, rect, cap_text=None, cap_pt=11.0):
+    """Insert picture aspect-preserved, centered in rect; optional snug caption strip below picture.
+    Returns (picture_shape, actual_rect)."""
     from pptx.util import Emu
 
     l, t, w, h = [int(v) for v in rect]
-    cap_h = int(Inches(0.34)) if cap_text else 0
-    avail_w, avail_h = w, max(h - cap_h, Inches(0.5))
+    cap_box_h = caption_height_emu(cap_text, w, cap_pt)
+    cap_h = (cap_box_h + int(Inches(0.06))) if cap_text else 0
+    avail_w, avail_h = w, max(h - cap_h, int(Inches(0.5)))
     iw_ih = None
     try:
         from PIL import Image as PILImage
@@ -893,12 +973,10 @@ def add_picture_fit(slide, img_path, rect, cap_text=None, cap_pt=11.0):
     else:  # PIL missing: width-only keeps aspect via pptx native size
         pic = slide.shapes.add_picture(str(img_path), Emu(l), Emu(t), width=Emu(int(avail_w * 0.97)))
     if cap_text:
-        cap_col = "#D8E2EC" if slide_is_dark(slide) else "#444444"
-        fit_textbox(
-            slide,
-            (l, t + avail_h + Inches(0.02), w, Inches(0.32)),
-            cap_text, size_pt=cap_pt, align=PP_ALIGN.CENTER, color=cap_col,
-        )
+        pic_bot = int(pic.top) + int(pic.height)
+        cap_y = min(t + avail_h + int(Inches(0.04)), pic_bot + int(Inches(0.08)))
+        cap_y = min(cap_y, t + h - cap_box_h)
+        add_caption_box(slide, (l, max(t, cap_y), w, cap_box_h), cap_text, cap_pt=cap_pt)
     return pic, (pic.left, pic.top, pic.width, pic.height)
 
 
@@ -1475,22 +1553,26 @@ def find_slide_title_shape(slide, prs=None):
 
 
 def find_slide_body_shapes(slide, prs=None):
-    """Return body placeholders if present; else non-title/non-footer text shapes."""
+    """Return body placeholders if present; else non-title/non-footer/non-source text shapes."""
     bphs = body_placeholders(slide)
     if bphs:
         return bphs
     tsh = find_slide_title_shape(slide, prs)
+    t_el = tsh._element if tsh is not None else None
     SH = int(prs.slide_height) if prs is not None else int(7.5 * 914400)
     cands = []
     for sh in slide.shapes:
-        if sh is tsh:
+        if t_el is not None and sh._element is t_el:
             continue
-        if sh.is_placeholder and sh.placeholder_format.type in SKIP_TYPES:
+        if sh.is_placeholder and sh.placeholder_format.type in (SKIP_TYPES | TITLE_TYPES):
             continue
         if sh.has_text_frame:
             tp = int(sh.top) if sh.top is not None else 0
-            if tp > int(SH * 0.88):
+            if tp > int(SH * 0.84):
                 continue  # likely footer/source strip
+            t_cur = (sh.text_frame.text or "").strip()
+            if t_cur.startswith(("来源：", "来源:", "Source:", "Source：")):
+                continue
             cands.append((int(sh.left or 0), tp, sh))
     cands.sort(key=lambda x: (x[0], x[1]))
     return [c[2] for c in cands]

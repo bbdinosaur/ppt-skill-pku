@@ -81,7 +81,7 @@ def build_create_case(root: Path):
     (root / "material.json").write_text(json.dumps({
         "title": "自适应稀疏注意力 ASA（自测材料）",
         "sections": {"method": quote + "，重要内容保留更大窗口。"},
-        "key_numbers": {"rouge1": "45.6", "baseline": "43.2", "latency_ms": "236"},
+        "key_numbers": {"rouge1": "45.6", "baseline": "43.2", "latency_ms": "236", "seq_len": "8000 tokens"},
         "figures": [{"id": "图D", "file": "figures/fig_demo.png",
                      "caption": "自测演示图：收敛曲线"}],
     }, ensure_ascii=False), encoding="utf-8")

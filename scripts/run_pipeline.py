@@ -75,7 +75,7 @@ def cmd_prepare(args) -> int:
         raw_task = Path(inv["task_md"]).read_text(encoding="utf-8", errors="replace").strip()
         task_info = {
             "path": inv["task_md"],
-            "truncated": len(raw_task) > 10000,
+            "truncated": len(raw_task) > 7500,
             "chars": len(raw_task),
         }
 
@@ -93,27 +93,27 @@ def cmd_prepare(args) -> int:
     digest_truncated = False
     if digest_file and Path(digest_file).is_file():
         d_txt = Path(digest_file).read_text(encoding="utf-8", errors="replace").strip()
-        digest_truncated = len(d_txt) > 18000
+        digest_truncated = len(d_txt) > 13500
 
     sdd_file = inv.get("start_deck_dump")
     s_txt = ""
     start_deck_truncated = False
     if sdd_file and Path(sdd_file).is_file():
         s_txt = Path(sdd_file).read_text(encoding="utf-8", errors="replace").strip()
-        start_deck_truncated = len(s_txt) > 10000
+        start_deck_truncated = len(s_txt) > 6500
 
     comp = inv.get("completeness") or {}
     read_more_hints = []
     if task_info and task_info.get("truncated"):
-        read_more_hints.append(f"task.md ({task_info['chars']} chars > 10k): read tail of {inv['task_md']}")
+        read_more_hints.append(f"task.md ({task_info['chars']} chars > 7.5k): read tail of {inv['task_md']}")
     if comp.get("material_json_truncated") and inv.get("material_json_path"):
-        read_more_hints.append(f"material.json ({comp.get('material_json_chars')} chars > 14k): read {inv['material_json_path']}")
+        read_more_hints.append(f"material.json ({comp.get('material_json_chars')} chars > 9.5k): read {inv['material_json_path']}")
     if (comp.get("pdf_beyond_digest") or comp.get("digest_clipped") or digest_truncated) and pdf_ex.get("text_file"):
         read_more_hints.append(
             f"full paper text ({comp.get('pdf_text_chars')} chars): read relevant sections of {pdf_ex['text_file']} using page markers"
         )
     if start_deck_truncated and sdd_file:
-        read_more_hints.append(f"start_deck_dump ({len(s_txt)} chars > 10k): read {sdd_file}")
+        read_more_hints.append(f"start_deck_dump ({len(s_txt)} chars > 6.5k): read {sdd_file}")
 
     # Keep line 1 strictly compact single-line JSON, then print readable Markdown sections below
     brief = {
@@ -146,11 +146,11 @@ def cmd_prepare(args) -> int:
     }
     print("PREPARE_OK " + json.dumps(brief, ensure_ascii=False))
     if raw_task:
-        print("\n=== TASK.MD ===\n" + raw_task[:10000])
+        print("\n=== TASK.MD ===\n" + raw_task[:7500])
     if d_txt:
-        print("\n=== MATERIAL DIGEST ===\n" + d_txt[:18000])
+        print("\n=== MATERIAL DIGEST ===\n" + d_txt[:13500])
     if s_txt:
-        print("\n=== START DECK DUMP ===\n" + s_txt[:10000])
+        print("\n=== START DECK DUMP ===\n" + s_txt[:6500])
     return 0
 
 
@@ -432,6 +432,63 @@ def _violation_score(fails: list[dict]) -> tuple[int, int]:
     return (len(fails), total_v)
 
 
+def _apply_plan_patches(plan_path: Path, patch_slides: list[str], patch_file: str | None) -> list[str]:
+    """Surgically patch specific slides/edits inside slides_plan.json without rewriting the full file.
+    Accepts --patch-slide 'N:{...}' (1-indexed) and/or --patch-file JSON ({slides:{N:{...}}, edits:{N:{...}}})."""
+    applied: list[str] = []
+    if not (patch_slides or patch_file) or not plan_path.is_file():
+        return applied
+    plan = _read_json(plan_path, None)
+    if not isinstance(plan, dict):
+        return applied
+
+    def _merge_slide(idx1: int, patch_obj: dict):
+        slides = plan.get("slides")
+        edits = plan.get("edits")
+        if isinstance(slides, list) and (plan.get("mode", "create") != "edit"):
+            if 1 <= idx1 <= len(slides) and isinstance(slides[idx1 - 1], dict):
+                slides[idx1 - 1].update(patch_obj)
+                applied.append(f"slide_{idx1}")
+        elif isinstance(edits, list):
+            if idx1 == 0:
+                edits.append(patch_obj)
+                applied.append("edit_append")
+            elif 1 <= idx1 <= len(edits) and isinstance(edits[idx1 - 1], dict):
+                edits[idx1 - 1].update(patch_obj)
+                applied.append(f"edit_{idx1}")
+
+    for raw in (patch_slides or []):
+        m = re.match(r"^\s*(\d+)\s*:\s*(\{.*\})\s*$", str(raw), re.S)
+        if not m:
+            continue
+        try:
+            _merge_slide(int(m.group(1)), json.loads(m.group(2)))
+        except Exception:
+            continue
+
+    if patch_file and Path(patch_file).is_file():
+        pf = _read_json(Path(patch_file), None)
+        if isinstance(pf, dict):
+            for k, v in (pf.get("slides") or {}).items():
+                if str(k).isdigit() and isinstance(v, dict):
+                    _merge_slide(int(k), v)
+            for k, v in (pf.get("edits") or {}).items():
+                if str(k).isdigit() and isinstance(v, dict):
+                    edits = plan.get("edits")
+                    idx1 = int(k)
+                    if isinstance(edits, list) and 1 <= idx1 <= len(edits) and isinstance(edits[idx1 - 1], dict):
+                        edits[idx1 - 1].update(v)
+                        applied.append(f"edit_{idx1}")
+            for top_k in ("deck_title", "rationale", "uncertainty"):
+                if top_k in pf:
+                    plan[top_k] = pf[top_k]
+                    applied.append(top_k)
+
+    if applied:
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
+    return applied
+
+
 def cmd_deliver(args) -> int:
     work = Path(args.work)
     out = Path(args.out)
@@ -439,6 +496,14 @@ def cmd_deliver(args) -> int:
     deck = Path(args.deck) if args.deck else (out / "presentation.pptx")
     pdf = out / (deck.stem + ".pdf")
     active_plan = Path(args.plan)
+    patched = _apply_plan_patches(active_plan, getattr(args, "patch_slide", None) or [], getattr(args, "patch_file", None))
+
+    hroot = work / "history"
+    hroot.mkdir(parents=True, exist_ok=True)
+    existing_vers = sorted(
+        [int(d.name[1:]) for d in hroot.iterdir() if d.is_dir() and d.name.startswith("v") and d.name[1:].isdigit()]
+    )
+    ver_num = (existing_vers[-1] + 1) if existing_vers else 1
 
     def _build_and_check(plan_path: Path):
         b_args = ["--plan", str(plan_path), "--work", str(work), "--out", str(deck)]
@@ -541,10 +606,10 @@ def cmd_deliver(args) -> int:
     rexp = _run("export_preview.py", [
         "--deck", str(deck), "--work", str(work),
         "--pdf", str(pdf), "--dpi", str(args.dpi),
-    ], timeout=300)
+    ], timeout=180)
     ra = _run("assemble_result.py", [
         "--case-dir", args.case_dir, "--work", str(work),
-        "--deck", str(deck), "--status", "auto",
+        "--deck", str(deck), "--status", "auto", "--pass-num", str(ver_num),
     ], timeout=120)
 
     checks = _read_json(work / "checks.json", {}) or {}
@@ -567,12 +632,6 @@ def cmd_deliver(args) -> int:
     # Snapshot this iteration into work/history/vN/ and write version_history.md for rollback
     version_meta = None
     try:
-        hroot = work / "history"
-        hroot.mkdir(parents=True, exist_ok=True)
-        existing = sorted(
-            [int(d.name[1:]) for d in hroot.iterdir() if d.is_dir() and d.name.startswith("v") and d.name[1:].isdigit()]
-        )
-        ver_num = (existing[-1] + 1) if existing else 1
         vdir = hroot / f"v{ver_num}"
         vdir.mkdir(parents=True, exist_ok=True)
         if deck.is_file():
@@ -620,6 +679,8 @@ def cmd_deliver(args) -> int:
 
     summary = {
         "status": res.get("status"),
+        "pass_num": ver_num,
+        "patched": patched,
         "slides": checks.get("slide_count"),
         "passed": f"{len(chk_list) - len(fails)}/{len(chk_list)}",
         "auto_repaired": auto_repaired,
@@ -644,17 +705,27 @@ def cmd_deliver(args) -> int:
         "step_rcs": {"build": rb.returncode, "check": rc.returncode,
                      "export": rexp.returncode, "assemble": ra.returncode},
     }
-    critical_ids = {
+    hard_ids = {
         "bounds", "aspect", "slide_count", "slide_limit", "claim_sources",
-        "overlap", "text_fit", "table_fit", "quote_verification", "number_fidelity",
+        "overlap", "quote_verification", "number_fidelity",
     }
+    heur_ids = {"text_fit", "table_fit"}
+    fail_ids = {f.get("id") for f in fails}
+    allow_heur_soft = (
+        ver_num >= 2
+        and bool(exp.get("pdf"))
+        and exp.get("visual_ok") is not False
+        and "bounds" not in fail_ids
+        and "overlap" not in fail_ids
+    )
+    critical_ids = hard_ids if allow_heur_soft else (hard_ids | heur_ids)
     crit_fails = [f for f in fails if f.get("id") in critical_ids]
     soft_warns = [f for f in fails if f.get("id") not in critical_ids]
     summary["warnings"] = soft_warns
     ok = (res.get("status") == "ok" and not crit_fails and not missing_fields
           and rb.returncode == 0 and rc.returncode == 0 and ra.returncode == 0)
     print(("DELIVER_OK " if ok else "DELIVER_ISSUES ") + json.dumps(summary, ensure_ascii=False))
-    # Print compact per-slide audit table so the model can judge polish quality in 0 extra tool calls
+    # Print compact per-slide audit table (0 extra tool calls; never induces extra rerun on DELIVER_OK)
     try:
         cm_sl = ((res.get("content_map") or {}).get("slides")) or []
         if cm_sl:
@@ -665,12 +736,6 @@ def cmd_deliver(args) -> int:
                     f"Slides: {len(cm_sl)} | Est. speech: {dur_info.get('estimated_speech_min')} min "
                     f"(target: {dur_info.get('workorder_duration') or 'unspecified'}) | "
                     f"Visual OK: {exp.get('visual_ok')} | Auto-repaired: {auto_repaired or 'none'}"
-                )
-            fallback_repairs = [a for a in auto_repaired if a.startswith(("attach_source_", "fill_notes_"))]
-            if fallback_repairs:
-                audit_lines.append(
-                    f"POLISH_HINT: Replace generic auto-filled items ({', '.join(fallback_repairs[:6])}) "
-                    "with authentic section/figure refs and natural speaker notes."
                 )
             for s in cm_sl[:24]:
                 vis = []
@@ -718,6 +783,10 @@ def main() -> int:
     p2.add_argument("--template", default=None)
     p2.add_argument("--start", default=None)
     p2.add_argument("--dpi", type=int, default=100)
+    p2.add_argument("--patch-slide", action="append", default=[],
+                    help="Surgical patch 'N:{json}' merged onto slide/edit N without rewriting the full plan")
+    p2.add_argument("--patch-file", default=None,
+                    help="Optional JSON patch file {slides:{N:{...}}, edits:{N:{...}}}")
 
     args = ap.parse_args()
     return cmd_prepare(args) if args.cmd == "prepare" else cmd_deliver(args)

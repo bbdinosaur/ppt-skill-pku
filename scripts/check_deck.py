@@ -34,8 +34,12 @@ def corpus_from_material(inv, work: Path | None = None):
 
     def walk(o):
         if isinstance(o, dict):
-            for v in o.values():
-                walk(v)
+            for k, v in o.items():
+                if isinstance(v, (str, int, float)):
+                    buf.append(f"{k}: {v}")
+                else:
+                    buf.append(str(k))
+                    walk(v)
         elif isinstance(o, list):
             for v in o:
                 walk(v)
@@ -392,8 +396,8 @@ def _number_in_corpus(m: str, corpus: str, corpus_nc: str, corpus_vals: set[floa
         v = float(m)
     except Exception:
         return False
-    # Exact decimal <-> percent (e.g. 0.854 <-> 85.4%) and exact k/M scale (1200 <-> 1.2k)
-    for scale in (1.0, 0.01, 100.0, 1000.0, 1e6):
+    # Exact decimal <-> percent (e.g. 0.854 <-> 85.4%) and exact k/M/B scale (1200 <-> 1.2k)
+    for scale in (1.0, 0.01, 100.0, 1000.0, 1e6, 1e9):
         sv = v * scale
         if any(abs(sv - cv) <= max(1e-12, abs(sv) * 1e-6) for cv in corpus_vals):
             return True
@@ -401,30 +405,46 @@ def _number_in_corpus(m: str, corpus: str, corpus_nc: str, corpus_vals: set[floa
 
 
 _SUP_MAP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁻⁺", "0123456789-+")
+_SCI_E_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[eE]\s*([+-]?\d+)(?!\d)")
+_SCI_X10_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[×xX\*]\s*10\^?\s*\(?([+-]?\d+)\)?")
+_CORPUS_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*([kKmMbB])(?![A-Za-z0-9])")
+_SLIDE_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)([kKMB])(?![A-Za-z0-9])")
+_LEAD_DOT_RE = re.compile(r"(?<![A-Za-z0-9.])(\.\d+)(?!\d)")
 
 
-def _extract_special_corpus_vals(raw_corpus: str) -> set[float]:
-    """Parse explicit scientific notation (1.2e-4, 3.5×10^-5) and suffixed magnitudes (1.2k, 3.4M, 2.5B)
-    from raw whitespace-preserving corpus."""
+def _val_in_corpus_vals(val: float, corpus_vals: set[float]) -> bool:
+    return any(abs(val - cv) <= max(1e-12, abs(val) * 1e-6) for cv in corpus_vals)
+
+
+_UNIT_EXP_RE = re.compile(r"(?:(?<![A-Za-z0-9.])10\^?\s*\(?([+-]?\d+)\)?|(?<![A-Za-z0-9.])\d+(?:\.\d+)?\s*[eE]\s*([+-]?\d+)(?!\d))")
+
+
+def _extract_special_corpus_vals(raw_corpus: str) -> tuple[set[float], set[int]]:
+    """Parse explicit scientific notation (1.2e-4, 3.5×10^-5), unit exponents (1e-6, 10^-6),
+    and suffixed magnitudes (1.2k, 3.4M, 2.5B) from raw whitespace-preserving corpus."""
     vals: set[float] = set()
+    exps: set[int] = set()
     c_sup = re.sub(r"(?<=\d),(?=\d)", "", raw_corpus.translate(_SUP_MAP))
-    for m in re.finditer(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[eE]\s*([+-]?\d+)(?!\d)", c_sup):
+    for rx in (_SCI_E_RE, _SCI_X10_RE):
+        for m in rx.finditer(c_sup):
+            try:
+                ev = int(m.group(2))
+                vals.add(float(m.group(1)) * (10.0 ** ev))
+                exps.add(ev)
+            except Exception:
+                pass
+    for m in _UNIT_EXP_RE.finditer(c_sup):
         try:
-            vals.add(float(m.group(1)) * (10.0 ** int(m.group(2))))
-        except Exception:
-            pass
-    for m in re.finditer(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[×xX\*]\s*10\^?\s*\(?([+-]?\d+)\)?", c_sup):
-        try:
-            vals.add(float(m.group(1)) * (10.0 ** int(m.group(2))))
+            exps.add(int(m.group(1) or m.group(2)))
         except Exception:
             pass
     mults = {"k": 1e3, "m": 1e6, "b": 1e9}
-    for m in re.finditer(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*([kKmMbB])(?![A-Za-z0-9])", c_sup):
+    for m in _CORPUS_SUFFIX_RE.finditer(c_sup):
         try:
             vals.add(float(m.group(1)) * mults[m.group(2).lower()])
         except Exception:
             pass
-    return vals
+    return vals, exps
 
 
 def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slides: set[int] | None = None):
@@ -440,8 +460,9 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
     if not corpus:
         return issues, checked
     corpus_nums = []
-    corpus_vals: set[float] = _extract_special_corpus_vals(raw_corpus)
-    for num_s in set(NUM_RE.findall(corpus_nc)):
+    raw_nc = re.sub(r"(?<=\d),(?=\d)", "", raw_corpus)
+    corpus_vals, corpus_exps = _extract_special_corpus_vals(raw_corpus)
+    for num_s in set(NUM_RE.findall(raw_nc)) | set(NUM_RE.findall(corpus_nc)):
         try:
             fv = float(num_s)
             corpus_nums.append((fv, num_s))
@@ -449,7 +470,7 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
         except Exception:
             pass
     # Also collect leading-dot decimals like .854 in APA/stats tables
-    for dm in set(re.findall(r"(?<!\d)\.\d+", corpus_nc)):
+    for dm in set(re.findall(r"(?<!\d)\.\d+", raw_nc)):
         try:
             corpus_vals.add(float("0" + dm))
         except Exception:
@@ -497,8 +518,62 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
             r"图|表|公式|式|第)\s*\(?\d+\.\d+\)?",
             re.I,
         )
+        mults_s = {"k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9}
         for t in texts:
-            t_clean = sec_tag_re.sub(" ", str(t).replace(",", ""))
+            t_clean = sec_tag_re.sub(" ", str(t).translate(_SUP_MAP).replace(",", ""))
+            # 1) Check full scientific-notation tokens first (catches 100x exponent hallucinations
+            #    and allows exact bidirectional match: paper 0.00035 <-> slide 3.5×10^-4)
+            for rx in (_SCI_E_RE, _SCI_X10_RE):
+                for sm in rx.finditer(t_clean):
+                    tok = sm.group(0).strip()
+                    if tok in seen:
+                        continue
+                    seen.add(tok)
+                    checked += 1
+                    try:
+                        mv = float(sm.group(1))
+                        ev = int(sm.group(2))
+                        sv = mv * (10.0 ** ev)
+                    except Exception:
+                        continue
+                    ok_sci = _val_in_corpus_vals(sv, corpus_vals) or (
+                        ev in corpus_exps and _val_in_corpus_vals(mv, corpus_vals)
+                    )
+                    if not ok_sci:
+                        hint = _nearest_numbers(f"{sv:g}", corpus_nums)
+                        issues.append(f"slide {s.get('slide')}: number '{tok}' not found in material{hint}")
+                t_clean = rx.sub(" ", t_clean)
+            # 2) Check suffixed magnitudes (e.g. 2.4k, 1.8M, 2.5B)
+            for sm in _SLIDE_SUFFIX_RE.finditer(t_clean):
+                tok = sm.group(0).strip()
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                checked += 1
+                try:
+                    base_v = float(sm.group(1))
+                    suf = sm.group(2)
+                    sv = base_v * mults_s[suf]
+                except Exception:
+                    continue
+                ok_s = _val_in_corpus_vals(sv, corpus_vals) or (
+                    suf == "K" and base_v >= 100 and _val_in_corpus_vals(base_v, corpus_vals)
+                )
+                if not ok_s:
+                    hint = _nearest_numbers(f"{sv:g}", corpus_nums)
+                    issues.append(f"slide {s.get('slide')}: number '{tok}' not found in material{hint}")
+            t_clean = _SLIDE_SUFFIX_RE.sub(" ", t_clean)
+            # 3) Check APA leading-dot decimals (e.g. .854, .001)
+            for dm in _LEAD_DOT_RE.findall(t_clean):
+                if dm in seen:
+                    continue
+                seen.add(dm)
+                checked += 1
+                if not _number_in_corpus("0" + dm, corpus, corpus_nc, corpus_vals):
+                    hint = _nearest_numbers("0" + dm, corpus_nums)
+                    issues.append(f"slide {s.get('slide')}: number '{dm}' not found in material{hint}")
+            t_clean = _LEAD_DOT_RE.sub(" ", t_clean)
+            # 4) Standard decimals and 3+ digit integers
             for m in NUM_RE.findall(t_clean):
                 if m in seen:
                     continue
@@ -629,11 +704,11 @@ def main() -> int:
         except Exception:
             pass
 
-    b = check_bounds(prs, existing_font_slides)
+    b = check_bounds(prs, unchanged_slides)
     add("bounds", not b, f"{len(b)} violations" + (": " + "; ".join(b[:6]) if b else ""))
     ov = check_text_fit(prs, unchanged_slides)
     add("text_fit", not ov, f"{len(ov)} potential overflows" + (": " + "; ".join(ov[:6]) if ov else ""))
-    ol = check_overlap(prs, existing_font_slides)
+    ol = check_overlap(prs, unchanged_slides)
     add("overlap", not ol, f"{len(ol)} overlaps" + (": " + "; ".join(ol[:6]) if ol else ""))
     asp = check_aspect(prs, unchanged_slides)
     add("aspect", not asp, f"{len(asp)} aspect changes" + (": " + "; ".join(asp[:4]) if asp else ""))

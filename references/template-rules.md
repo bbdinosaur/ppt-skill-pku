@@ -34,4 +34,4 @@
 ```bash
 python3 scripts/export_preview.py --deck /app/output/presentation.pptx --work /app/work --pdf /app/output/presentation.pdf --dpi 100
 ```
-自动执行 LibreOffice 隔离 `.lohome` 导出（90s 快失败，自动降级 `reportlab` 真 PDF）→ PyMuPDF 核验页数/字体/标题可抽取性 → 100 DPI 逐页 PNG + `contact-sheet.png` → Pillow 像素空白检测（`visual_ok`）。纯文本模型以程序化检查与 `visual_ok` 为准，严禁读取二进制 PNG。
+自动执行 LibreOffice 隔离 `.lohome` 导出（55s 快失败，自动降级 `reportlab` 真 PDF）→ PyMuPDF 核验页数/字体/标题可抽取性 → 100 DPI 逐页 PNG + `contact-sheet.png` → Pillow 像素空白检测（`visual_ok`）。纯文本模型以程序化检查与 `visual_ok` 为准，严禁读取二进制 PNG。
