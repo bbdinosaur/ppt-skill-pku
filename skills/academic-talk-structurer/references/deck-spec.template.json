@@ -1,0 +1,221 @@
+{
+ "_doc": "deck_spec 骨架示例（复制后填充；此为接口示意，非任何真实案例的答案）。规则：每页唯一 claim（≤30字/≤18英文词结论句）；bullets ≤4 且每条 ≤2 行（短前缀 标签： 自动加粗）；evidence 每条给 locator+strength(S1定量有对照/S2定量/S3定性/NA)，自动写入页底来源条；notes 为口语讲稿（中文120–180字 / 英文90–140词，不复述页面）并带衔接句；内容页带 time_s；原生视觉组件可选 steps(横向卡片)/kpis(关键指标条)/two_col(双栏结构卡)/table(原生表格)/chart({type:'bar'|'barh'|'line',categories:[],series:[{name:'',values:[]}],region:'right'|'full',caption:''})。",
+ "meta": {
+  "title": "<汇报主标题>",
+  "duration_minutes": 10,
+  "claim_on_slide": true,
+  "evidence_footer": true,
+  "language": "zh",
+  "goal": "<这次汇报要达成的可检查目标>",
+  "audience": "<受众及先验/关注点>",
+  "tradeoffs": [
+   "<说明从源论文到成稿的关键取舍：保留什么、压缩/省略什么、为何这样排顺序>"
+  ]
+ },
+ "slides": [
+  {
+   "role": "title",
+   "title": "<题目>",
+   "claim": "<一句话定位（写入备注，不在封面重复打主张条）>",
+   "bullets": [
+    "汇报人 | 场合 | 日期"
+   ],
+   "notes": "<开场 15-25s 讲稿：定位研究问题与汇报目标>",
+   "time_s": 25
+  },
+  {
+   "role": "roadmap",
+   "title": "<路线页标题>",
+   "claim": "<今天要说服听众的核心主线>",
+   "steps": [
+    {"label": "01", "title": "问题与缺口", "detail": "<一句话概括痛点>"},
+    {"label": "02", "title": "核心机制", "detail": "<一句话概括方法>"},
+    {"label": "03", "title": "关键证据", "detail": "<一句话概括主结果与边界>"}
+   ],
+   "evidence": [
+    {
+     "type": "section",
+     "locator": "§1–§5",
+     "strength": "NA"
+    }
+   ],
+   "notes": "<讲稿+衔接句>",
+   "time_s": 40
+  },
+  {
+   "role": "motivation",
+   "title": "<缺口页标题>",
+   "claim": "<缺口结论句>",
+   "bullets": [
+    "现状",
+    "核心瓶颈",
+    "本文切入点"
+   ],
+   "evidence": [
+    {
+     "type": "section",
+     "locator": "§1, p.1",
+     "strength": "S3"
+    }
+   ],
+   "notes": "<讲稿+衔接句>",
+   "time_s": 60
+  },
+  {
+   "role": "method",
+   "title": "<机制页标题>",
+   "claim": "<机制结论句（因 X 所以 Y）>",
+   "bullets": [
+    "核心组件与设计动机",
+    "关键约束或代价"
+   ],
+   "figure": {
+    "path": "/app/work/figs/fig_p2_0.png",
+    "region": "right",
+    "caption": "<图题（≤20字）>"
+   },
+   "evidence": [
+    {
+     "type": "figure",
+     "locator": "Fig.1, p.2",
+     "strength": "S2"
+    }
+   ],
+   "notes": "<讲稿：指认右图组件+衔接句>",
+   "time_s": 70
+  },
+  {
+   "role": "result",
+   "title": "<主结果页：关键数字进标题>",
+   "claim": "<含数字与对照条件的结论>",
+   "kpis": [
+    {"value": "<主指标>", "label": "<条件>", "delta": "<较基线变化>"},
+    {"value": "<次指标>", "label": "<效率/稳定性>", "delta": "<对照说明>"}
+   ],
+   "bullets": [
+    "对照提升与预算条件",
+    "稳定性/加速要点"
+   ],
+   "figure": {
+    "path": "/app/work/figs/fig_p3_0.png",
+    "region": "right",
+    "caption": "<图题>"
+   },
+   "evidence": [
+    {
+     "type": "figure",
+     "locator": "Fig.2, p.3",
+     "strength": "S1"
+    }
+   ],
+   "notes": "<讲稿：先最强证据，指认右图曲线+衔接句>",
+   "time_s": 75
+  },
+  {
+   "role": "analysis",
+   "title": "<消融/扩展对比页>",
+   "claim": "<趋势或归因结论>",
+   "bullets": [
+    "解读表中趋势与临界点（不复述表中数字）",
+    "说明边界条件"
+   ],
+   "table": {
+    "headers": [
+     "条件",
+     "基线",
+     "Ours",
+     "Δ"
+    ],
+    "rows": [
+     [
+      "<条件A>",
+      "<数>",
+      "<数>",
+      "<+x>"
+     ]
+    ],
+    "region": "right",
+    "caption": "<表题>"
+   },
+   "evidence": [
+    {
+     "type": "table",
+     "locator": "Table 1, p.4",
+     "strength": "S1"
+    }
+   ],
+   "notes": "<讲稿：指认右表趋势+衔接句>",
+   "time_s": 65
+  },
+  {
+   "role": "limitation",
+   "title": "<局限与风险页>",
+   "claim": "<诚实局限概括>",
+   "two_col": {
+    "left_title": "已知局限与边界",
+    "left_bullets": ["<局限 1 及适用范围>", "<局限 2 尚未验证场景>"],
+    "right_title": "影响与缓解方向",
+    "right_bullets": ["<对主结论的影响评估>", "<后续实验/工程缓解路径>"]
+   },
+   "evidence": [
+    {
+     "type": "section",
+     "locator": "§4",
+     "strength": "S3"
+    }
+   ],
+   "notes": "<讲稿：诚实界定边界，不辩护+衔接句>",
+   "time_s": 55
+  },
+  {
+   "role": "conclusion",
+   "title": "<结论页>",
+   "claim": "<复述主结果口径>",
+   "bullets": [
+    "Takeaway 1（与主结果口径一致）",
+    "Takeaway 2（方法启示）",
+    "Takeaway 3（适用边界与下一步）"
+   ],
+   "evidence": [
+    {
+     "type": "section",
+     "locator": "§5",
+     "strength": "S1"
+    }
+   ],
+   "notes": "<讲稿：收束主线，引出问答环节>",
+   "time_s": 50
+  },
+  {
+   "role": "qa_backup",
+   "title": "备用：追问要点",
+   "claim": "<高频追问速查（不占正文时长）>",
+   "bullets": [
+    "机制追问：要点 + locator",
+    "对照/扩展追问：要点 + locator"
+   ],
+   "evidence": [
+    {
+     "type": "table",
+     "locator": "Table 1, p.4",
+     "strength": "S1"
+    }
+   ],
+   "notes": "<备用页讲稿：何时展示、对应正文页码>",
+   "time_s": null
+  }
+ ],
+ "qa_prep": [
+  {
+   "question": "<针对机制/数据/对照/局限的高频追问>",
+   "answer_key": "<与正文口径一致的应答要点及出处>",
+   "cite_slide": 5,
+   "backup_slide": 9
+  }
+ ],
+ "result_fill": {
+  "uncertainty": ["<取舍、约束冲突或信息缺口的诚实说明>"],
+  "limits": [],
+  "changes": ["v1: initial build"]
+ }
+}

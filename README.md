@@ -1,72 +1,72 @@
 # academic-slides-pku — 学术 PPT 生成与编辑 Skill
 
-Agentic Science Challenge（北大专场 efficiency-3）赛题 `ppt-6ad93034` 的参赛作品：
-把固定论文/研究材料组织成**可编辑、模板继承、证据可追溯**的学术演示稿
-（原生 PPTX + PDF 导出 + 页级证据映射 + 合规检查报告）。
+面向科研汇报场景（组会、答辩、开题/中期、同行评审）的学术 PPT 生成与编辑 Skill：
+将固定论文或研究材料组织为**原生可编辑、模板继承、数字与引文可追溯、多轮迭代可回退、导出可复核**的演示稿
+（原生 PPTX + 真实 PDF 导出 + 100 DPI 逐页 PNG/缩略拼图 + 页级证据映射 + 逐页 Diff + 版本历史 + 合规审计报告）。
 
-## 它解决什么
+## 1. 核心架构与方法创新（两步极速确定性管线）
 
-论文→幻灯片的翻译难点不在复制段落，而在取舍与重排：哪页放什么主张、图先出谁、
-数字是否抄对、模板是否被改坏、导出是否塌版。本 Skill 用"脚本干重活、模型做决策"
-的架构，在 64 次请求 / 900 秒预算内稳定产出合格稿：
+相比通用单次生成容易出现的整段堆字、数字抄错/取整、覆盖模板母版、导出塌版、编辑误伤他页及长对话超时，本 Skill 以 **8 个自包含、无状态、路径可移植的 Python 模块** 提供工程化闭环，通过 `scripts/run_pipeline.py` 将全流程收拢为 `prepare` + `deliver` 两条确定性命令（亦可按需单步复用任意模块）：
 
-1. `scripts/inspect_case.py` — 清点输入（case.json / material.json / slide-workorder.json /
-   模板与起始 deck），抽取 PDF 全文与内嵌图，识别模板版式清单与母版字体。
-2. 模型唯一重决策点 — 读材料原文，写 `slides_plan.json`（页级主张、要点、图引用、
-   讲稿备注、逐条 claim_sources 引文）。
-3. `scripts/build_deck.py` — 按模板真实版式构建：占位符填充（不设字体名，继承主题）、
-   图片等比插入（绝不裁剪拉伸）、表格、底部来源行、讲稿备注；edit 模式只动指令页。
-4. `scripts/check_deck.py` — 9 项静态合规检查：页数/越界/文字溢出估算/内容重叠/
-   图片等比/标题与备注齐备/字号下限/字体继承/引文真实性（quote 必须逐字存在于材料原文，
-   防幻觉编造）。
-5. `scripts/export_preview.py` — LibreOffice 导出真实 PDF，PyMuPDF 校验页数/字体/标题
-   可抽取性，逐页 PNG 预览；无 soffice 时 PIL 几何预览兜底。
-6. `scripts/assemble_result.py` — 组装 `result.json`（case_id / status / editable_source /
-   export_artifact / content_map / compliance_checks / exceptions + uncertainty /
-   change_log / repro）与 plan.json、change_log.md。
+| 模块 | 核心职责与关键改进 |
+|---|---|
+| `scripts/run_pipeline.py` | **两步一键编排器**：`prepare` 清点全量输入、写出保底 `partial` 版 `result.json` 并在 stdout 直接输出紧凑 JSON（含诚实 `read_more_hints`）+ 高保真可读 `TASK.MD`（≤10 KB）/ `MATERIAL DIGEST`（≤18 KB）/ `START DECK DUMP`（≤10 KB）；`deliver` 串联构建→13 项检查→**内置 2 轮自动修补**（排版紧缩、表格限高、`min_font` 钳制、引文逐字对齐、缺源/缺备注补齐，绝不改写幻灯片数字）→PDF/PNG 导出→终版组装、`$WORK/history/vN/` 版本归档并内联 `DECK AUDIT SUMMARY` 支撑 0 额外读取的 1 轮精准精修。 |
+| `scripts/inspect_case.py` | 递归容错解析 `case.json` / `task.md` / `material.json` / `slide-workorder.json`（支持区间页数如 `"10-12"` 与显式路径）；多 PDF 全文抽取 + 论文导航地图 + 标题门控 `find_tables()` 精准抽表（最多 8 表×12 行）+ 内嵌位图与矢量图按图注自动裁切；完整 `material.json`（≤14 KB 全量保留）+ 首页摘要原文 + 全量图表原注 + 按句切分全篇关键句（不丢长段落）+ 补充 `.csv`/`.tsv`/`.md`/`.txt` 自动汇总入高保真 `material_digest.md`；edit 模式自动生成含完整表格（前 14 行）与图表序列的 `start_deck_dump.md`。 |
+| `scripts/build_deck.py` | **create 模式**：只读继承真实 `target-template.pptx` 版式/配色/主题字体（永不改母版、不覆盖 `font.name`），优先填充模板原生 `BODY`/`Two Content` 槽位（首词自动加粗、自动清理未使用的空占位符防幽灵提示框）；仅目录页升级为左对齐编号目录条（`01..06`）、仅无正文槽位版式启用要点卡片；支持扁平无阴影圆角顶/左主题色条卡片（`highlights` KPI 卡、`steps` 2–5 步横向矢量流程图、`takeaway` 结论条）、数据绑定原生可编辑图表（`bar`/`hbar`/`stacked_bar`/`line`/`pie`，含轴标题）、自适应列宽表格（含 `highlight_row`）与稀疏左栏黄金分栏（`left_frac=0.33`）、等比单/双图、多视觉零重叠 `visual_slots` 自动切分、深浅画布 WCAG 对比度自适应。<br>**edit 模式**：原地保留格式编辑，支持递归组合图形 `GROUP` 与智能破折号/引号归一的 `replace_text`（变长自动防溢出、`slide: "all"` 全稿统一术语）、原地更新 `set_table` / `set_chart`（`chart.replace_data()`）/ `set_image`、无页码偏移 `replace_slide`、`set_title`/`set_body`/`set_two_col`/`set_notes`/`set_source`/`insert_at`/`append`/`delete`/`move`，并基于对象身份输出精准 `slide_diff.json`/`slide_diff.md`。 |
+| `scripts/check_deck.py` | **13 项静态合规与事实核验**：页数/区间上下限、越界（忽略模板无内容全出血装饰条）、文字溢出、形状/表/图重叠、表格溢出（按各行实际字号估算）、图片等比（容差 2%）、标题与备注、字号下限、字体继承、页级证据覆盖、引文逐字回查（兼容 PDF 连字/标点/引用括号，附 `closest real line`）、**数字保真回查**（跨 PDF+`material.json`+补充文件+任务书+起始稿核验，支持 `0.854↔85.4%`/`.92↔0.92`/`1200↔1.2k` 精确等价并严格拦截编造数字，附 `closest in material`）；edit 模式智能豁免原稿未改页与原地修改页既有历史样式告警。 |
+| `scripts/export_preview.py` | LibreOffice 隔离 `.lohome` 无头导出真 PDF（90s 快失败，无 `soffice` 或超时自动降级 `reportlab` 真 PDF）；PyMuPDF 核验页数/字体/标题可抽取性并渲染 100 DPI 逐页 PNG 与 `contact-sheet.png`；内置纯 Python Pillow 像素空白检测（`visual_ok`）。 |
+| `scripts/assemble_result.py` | 动态满足 `case.json` 全部 `output_contract` 字段及常见别名，诚实判定 `status`（`deck_ok`+`pdf_ok`+必需契约齐备且 10 项关键检查全过才标 `ok`，任一关键检查失败或导出缺失诚实标 `partial` 并记录至 `compliance_checks`/`exceptions`/`uncertainty`，无有效 PPTX 标 `failed`），产出实算 `rubric_coverage` 审计摘要、`result.json`、`plan.json`、`qa_report.md`、`outline.md`（含中英文语速时长估算）、`change_log.md`、`slide_diff.md`。 |
+| `scripts/deckutil.py` / `scripts/selftest.py` | 共享几何/样式/WCAG 对比度/文本度量库与一键双模式合成自测工具。 |
 
-## 特性
+## 2. 命令行参数与最小调用示例（Example / 示意）
 
-- **模板铁律**：母版只读；占位符优先；显式零几何占位符自动修复（slide→layout→master
-  继承链解析）；字号收缩有下限。
-- **数字保真**：页面结论的引文必须逐字回查材料原文；材料缺口写入 uncertainty，不编造。
-- **诚实状态机**：先落 partial 结果再迭代；status=ok/partial/failed 由关键检查自动判定。
-- **异常手册**：缺图、位图、模板槽位不足、页数超限、导出失败等 13 类异常的处置对照表
-  （`references/failure-playbook.md`）。
-
-## 快速使用
+| 命令 | 关键参数 | 说明 |
+|---|---|---|
+| `run_pipeline.py prepare` | `--case-dir /input` `--work /app/work` `--out /app/output` | 清点输入、生成摘要与保底 `partial` `result.json` |
+| `run_pipeline.py deliver` | `--case-dir /input` `--work /app/work` `--out /app/output` `--plan /app/work/slides_plan.json` `[--dpi 100]` `[--template ...]` `[--start ...]` | 一键构建、13 项自检与 2 轮自动修补、导出 PDF/PNG、更新终态 `result.json` 与版本历史 |
+| `selftest.py` | （无参数） | 在临时目录动态合成 create + edit 双模式算例全流程自测，输出 `SELFTEST_OK` |
 
 ```bash
-python3 scripts/inspect_case.py  --case-dir /input --work /app/work
-python3 scripts/build_deck.py    --plan /app/work/slides_plan.json --work /app/work --out /app/output/presentation.pptx
-python3 scripts/check_deck.py    --deck /app/output/presentation.pptx --work /app/work
-python3 scripts/export_preview.py --deck /app/output/presentation.pptx --work /app/work
-python3 scripts/assemble_result.py --case-dir /input --work /app/work --deck /app/output/presentation.pptx --status auto
+# 示例（Example）：标准两步极速调用流程
+RP=/skills/weekly-skill/scripts/run_pipeline.py
+python3 "$RP" prepare --case-dir /input --work /app/work --out /app/output
+# -> 基于 stdout 输出的 TASK.MD / MATERIAL DIGEST / START DECK DUMP 编写 /app/work/slides_plan.json
+python3 "$RP" deliver --case-dir /input --work /app/work --out /app/output \
+  --plan /app/work/slides_plan.json --dpi 100
 ```
 
-依赖：`python-pptx`（必须）、`pillow`（图片等比）、`pymupdf`（PDF 抽取/校验）、
-`libreoffice`（PDF 导出，可缺失有兜底）。全流程说明见 `SKILL.md`。
-
-## 目录
-
+示意输出目录（Example output layout under `/app/output/`）：
 ```
-SKILL.md                      执行卡（触发、7 步流程、预算策略、兜底）
-references/plan-schema.md     slides_plan.json schema 与证据映射规则
-references/template-rules.md  模板继承与版式铁律
-references/failure-playbook.md 异常处置对照表
-scripts/                      6 个自包含脚本（路径自适应，任意 cwd 可用）
-```
-
-## 一键自测
-
-```bash
-python3 scripts/selftest.py   # 临时目录生成 mini 算例并全流程跑通，打印 SELFTEST_OK
+presentation.pptx   # 原生可编辑演示稿（模板继承、零母版篡改）
+presentation.pdf    # 真实渲染 PDF 导出件（LibreOffice 首选 / reportlab 兜底）
+previews/           # slide-01.png .. slide-NN.png (100 DPI) + contact-sheet.png
+result.json         # 含 case_id/status/editable_source/export_artifact/content_map/compliance_checks/exceptions/version_history
+plan.json           # 页序规划与 rationale
+qa_report.md        # 13 项合规检查 + 异常处置 + 页级证据映射一页审计报告
+outline.md          # 逐页大纲、要点与演讲备注
+change_log.md       # 全流程时间戳与修改日志
+version_history.md  # 多轮迭代版本快照与一键回退命令
+slide_diff.md       # （edit 模式）修改前后逐页变更对照表
 ```
 
-每次交付还会生成 `qa_report.md`（检查表/异常/页级证据映射的一页式审计报告）、
-`outline.md`（讲稿大纲）与 `previews/contact-sheet.png`（全 deck 缩略拼图）。
+## 3. 依赖清单与降级策略
 
-## 适用边界
+- **Python ≥ 3.10**：`python-pptx`（必需）、`pillow`（等比插图、拼图与像素空白检测）、`pymupdf`（PDF 文本/位图/矢量图/表格抽取与导出校验；缺失时自动降级 `pdfplumber` → `pdftotext`）。
+- **文档导出**：`libreoffice`（`soffice --headless --convert-to pdf`，首选，90s 快失败）；缺失或超时自动降级 `reportlab` 真实 PDF 导出与 `pdftoppm`/PIL 预览兜底。
 
-适用于"固定论文/材料 + 明确模板与页数约束 → 可核验演示稿"的学术汇报场景；
-不负责论文精读综述、数据可视化算法与学术文字润色。测试均在本地合成算例上完成。
+## 4. 目录结构与文档导航
+
+```
+SKILL.md                        精炼执行卡（<=8.0 KB，两步极速闭环、硬停机护栏、无脚本兜底与交付红线）
+README.md                       架构说明、模块参数表、最小调用示例、依赖与适用边界
+GITHUB_URL.txt                  公开仓库链接（根路径）
+references/plan-schema.md       slides_plan.json 完整 schema、3 类论文页序骨架与全部 edits 操作说明
+references/template-rules.md    模板继承、深浅画布对比度自适应、多视觉分槽与防溢出规范
+references/failure-playbook.md  15 类异常码、环境降级与诚实 status 判定手册
+scripts/                        8 个自包含可移植 Python 模块（含 run_pipeline.py 与 selftest.py）
+```
+
+## 5. 适用边界与已知限制
+
+- **适用场景**：给定论文/研究材料与真实模板/起始稿、具备明确页数/受众/语言/证据映射约束的学术汇报演示稿生成与局部编辑迭代。
+- **不适用场景**：开放式文献综述检索、科研数据可视化算法研发、论文全文润色、无文本层扫描 PDF 的复杂公式 OCR（遇扫描版 PDF 时如实标注 `SCANNED_PDF`，仅依据结构化材料字段并在 `uncertainty` 记录缺口，绝不凭图猜数）。

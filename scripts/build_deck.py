@@ -4,7 +4,8 @@
 Builds /app/output/presentation.pptx from work/slides_plan.json using the REAL
 target template (layout/placeholder inheritance; masters never modified) or the
 real starting deck in edit mode. Images are inserted aspect-preserved (never
-cropped/stretched). Speaker notes and per-slide content_map sidecar are written.
+cropped/stretched). Supports native data-bound charts, styled adaptive tables,
+KPI highlight cards, takeaway callouts, rich edit ops and per-slide diffs.
 
 Usage:
   python3 build_deck.py --plan work/slides_plan.json --work work \
@@ -22,44 +23,138 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deckutil as du  # noqa: E402
 
 from pptx import Presentation  # noqa: E402
+from pptx.enum.text import PP_ALIGN  # noqa: E402
 from pptx.util import Emu, Inches, Pt  # noqa: E402
 
 
-def resolve_path(p, base):
+def resolve_path(p, base: Path, work: Path | None = None):
+    """Resolve image/asset path across case_dir, common subdirs, and work/figs."""
     if not p:
         return None
     q = Path(p)
-    return q if q.is_absolute() else base / q
+    if q.is_absolute():
+        return q if q.is_file() else None
+    bases = [base, base / "inputs", base / "artifacts", base / "materials", base / "material"]
+    if work is not None:
+        bases.extend([work, work / "figs"])
+    for b in bases:
+        cand = b / q
+        if cand.is_file():
+            return cand
+    # Last resort: match unique filename under base or work/figs
+    name = q.name
+    for search_root in ([work / "figs"] if work is not None else []) + [base]:
+        if search_root.is_dir():
+            hits = [h for h in search_root.rglob(name) if h.is_file()]
+            if hits:
+                return hits[0]
+    return base / q
 
 
-def shrink_ph(prs, slide, ph):
+def shrink_ph(prs, slide, ph, min_pt=11.0, compact_spacing_pt=None):
     _, _, pw, phh = du.ph_geom(prs, slide, ph)
     w_pt = (pw.pt if pw else 0) or 0
     h_pt = (phh.pt if phh else 0) or 0
-    du.shrink_body_to_fit(ph.text_frame, w_pt, h_pt,
-                          du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT))
+    du.shrink_body_to_fit(
+        ph.text_frame, w_pt, h_pt,
+        du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT, getattr(prs, "_master_styles", None)),
+        min_pt=min_pt, compact_spacing_pt=compact_spacing_pt,
+    )
 
 
-def shrink_shape(sh, default_pt):
+def shrink_shape(sh, default_pt, min_pt=11.0, compact_spacing_pt=None):
     w_pt = (sh.width.pt if sh.width else 0) or 0
     h_pt = (sh.height.pt if sh.height else 0) or 0
-    du.shrink_body_to_fit(sh.text_frame, w_pt, h_pt, default_pt)
+    du.shrink_body_to_fit(sh.text_frame, w_pt, h_pt, default_pt,
+                          min_pt=min_pt, compact_spacing_pt=compact_spacing_pt)
 
 
-def build_create_slide(prs, spec, images_base: Path, accent=None):
+def shrink_title(prs, slide, tph, min_pt=17.0, is_cover: bool = False):
+    """Step title font down (1pt steps) until estimated height fits cleanly above the accent divider."""
+    try:
+        _, _, tw, th = du.ph_geom(prs, slide, tph)
+        if not (tw and th):
+            return
+        size = du.ph_inherited_pt(tph, du.DEFAULT_TITLE_PT, getattr(prs, "_master_styles", None))
+        # Cap oversized 44pt blank-default titles on content slides so claim titles stay crisp and never touch the divider
+        new = min(size, 32.0) if (not is_cover and size > 34.0) else size
+        avail_w_pt = max(tw.pt - 18.0, 120.0)
+        while new > min_pt and du.tf_text_height_pt(tph.text_frame, avail_w_pt, new) > th.pt * 0.80:
+            new -= 1.0
+        if new < size - 0.5:
+            for p in tph.text_frame.paragraphs:
+                p.font.size = Pt(new)
+                for r in p.runs:
+                    if r.font.size is None or r.font.size.pt > new:
+                        r.font.size = Pt(new)
+    except Exception:
+        pass
+
+
+def _clamp_ph_to_region(prs, slide, ph, target_l, target_t, target_w, target_h):
+    """Keep placeholder inside target region atomically (preserves inherited left/top!)."""
+    try:
+        l0, t0, w0, h0 = du.ph_geom(prs, slide, ph)
+        cur_l = int(l0) if du.ph_ok(l0) else int(target_l)
+        cur_t = int(t0) if du.ph_ok(t0) else int(target_t)
+        new_t = max(cur_t, int(target_t))
+        max_b = int(target_t) + int(target_h)
+        cur_h = int(h0) if du.ph_ok(h0) else int(target_h)
+        new_h = max(int(Inches(0.8)), min(cur_h, max_b - new_t))
+        new_w = int(target_w) if target_w is not None else (int(w0) if du.ph_ok(w0) else int(target_h))
+        if new_t != cur_t or target_w is not None or new_h < cur_h:
+            du.set_ph_rect(prs, slide, ph, left=cur_l, top=new_t, width=new_w, height=new_h)
+    except Exception:
+        pass
+
+
+def _cap_body_pt(prs, ph, bullets, max_pt: float):
+    """Cap oversized default template body fonts (e.g. 28pt default) to crisp academic
+    typography without touching font.name (template font family/color fully inherited)."""
+    try:
+        if any(isinstance(b, dict) and b.get("size") for b in (bullets or [])):
+            return  # author explicitly chose per-bullet sizes
+        inh = du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT, getattr(prs, "_master_styles", None))
+        if inh <= max_pt + 0.5:
+            return
+        for p in ph.text_frame.paragraphs:
+            lvl = getattr(p, "level", 0) or 0
+            cap = max(12.0, max_pt - lvl * 1.5)
+            p.font.size = Pt(cap)
+            for r in p.runs:
+                if r.font.size is None or r.font.size.pt > cap:
+                    r.font.size = Pt(cap)
+    except Exception:
+        pass
+
+
+def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
+                       accent=None, palette=None):
     """Create one slide from a plan spec using template layout inheritance."""
-    hint = spec.get("layout_hint") or "auto"
+    role = spec.get("role", "custom")
+    tighten = int(spec.get("_tighten", 0) or 0)
+    b_min_pt = 10.0 if tighten >= 2 else (10.5 if tighten == 1 else 11.0)
+    t_min_pt = 15.0 if tighten >= 2 else (16.0 if tighten == 1 else 17.0)
+    c_space = 1.0 if tighten >= 2 else (2.0 if tighten == 1 else None)
+    two_col = spec.get("two_col") or {}
+    hint = (spec.get("layout_hint") or "auto").lower().strip()
+    if hint == "auto":
+        if role in ("title", "qa"):
+            hint = "title"
+        elif role == "section":
+            hint = "section"
+        elif two_col:
+            hint = "two_content"
     layout, layout_name = du.pick_layout(prs, hint)
     slide = prs.slides.add_slide(layout)
     du.fix_degenerate_placeholders(prs, slide)
 
-    role = spec.get("role", "custom")
     title = spec.get("title", "")
     tph = du.slide_title_ph(slide)
     if title:
         if tph is not None:
             tph.text_frame.text = str(title)
-            shrink_title(prs, slide, tph)
+            shrink_title(prs, slide, tph, min_pt=t_min_pt, is_cover=(role in ("title", "section", "qa")))
         else:
             SW = int(prs.slide_width)
             du.fit_textbox(slide, (int(SW * 0.065), int(prs.slide_height * 0.05),
@@ -71,152 +166,342 @@ def build_create_slide(prs, spec, images_base: Path, accent=None):
         du.accent_bar(slide, prs, accent)
 
     bullets = spec.get("bullets") or []
-    two_col = spec.get("two_col") or {}
     image = spec.get("image") or {}
+    images_list = [im for im in (spec.get("images") or []) if isinstance(im, dict)][:2]
     table = spec.get("table") or {}
     chart = spec.get("chart") or {}
+    highlights = spec.get("highlights") or []
+    steps = spec.get("steps") or []
+    takeaway = spec.get("takeaway") or ""
     sources = spec.get("sources") or []
 
     img_path = None
     img_missing = False
     if image.get("path"):
-        p = resolve_path(image["path"], images_base)
+        p = resolve_path(image["path"], images_base, work)
         if p and p.is_file():
             img_path = p
         else:
             img_missing = True
 
-    body_phs = du.body_placeholders(slide)
-    region = du.content_region(prs, slide)
-    rl, rt, rw, rh = region
-    src_strip = Inches(0.36) if (sources and role not in ("title", "qa")) else 0
+    resolved_imgs = []
+    for im in images_list:
+        p = resolve_path(im.get("path"), images_base, work) if im.get("path") else None
+        resolved_imgs.append((im, p if (p and p.is_file()) else None))
 
-    has_split = bool(img_path or img_missing or table or chart) and (bullets or two_col)
+    body_phs = du.body_placeholders(slide)
+    rl, rt, rw, rh = du.content_region(prs, slide)
+    src_strip = int(Inches(0.34 if tighten else 0.36)) if (sources and role not in ("title", "qa")) else 0
+    tk_strip = int(Inches(0.44 if tighten else 0.50)) if (takeaway and role not in ("title", "qa")) else 0
+    bot_strip = src_strip + tk_strip
+
+    top_off = 0
+    if highlights and role not in ("title", "qa"):
+        hi_h = int(Inches(0.96 if tighten >= 2 else (1.06 if tighten == 1 else 1.22)))
+        du.add_highlights(slide, (rl, rt, rw, hi_h), highlights, accent=accent)
+        top_off = hi_h + int(Inches(0.10 if tighten else 0.14))
+
+    has_img = bool(img_path or img_missing or image.get("missing") or resolved_imgs)
+    has_chart = bool(chart.get("categories") or chart.get("series"))
+    has_table = bool(table.get("rows"))
+    has_visual = has_img or has_chart or has_table
+
+    if steps and role not in ("title", "qa"):
+        has_below = bool(bullets or two_col or has_visual)
+        avail_for_steps = max(int(Inches(1.1)), rh - top_off - bot_strip)
+        if not has_below:
+            st_h = min(int(Inches(2.05)), max(int(Inches(1.50)), int(avail_for_steps * 0.50)))
+            st_t = rt + top_off + max(0, (avail_for_steps - st_h) // 3)
+            du.add_step_flow(slide, (rl, st_t, rw, st_h), steps, accent=accent)
+            top_off = (st_t - rt) + st_h + int(Inches(0.14))
+        else:
+            st_h = int(Inches(1.16 if tighten >= 2 else (1.28 if tighten == 1 else 1.44)))
+            du.add_step_flow(slide, (rl, rt + top_off, rw, st_h), steps, accent=accent)
+            top_off += st_h + int(Inches(0.12 if tighten else 0.16))
+
+    ct = rt + top_off
+    ch_avail = max(int(Inches(1.2)), rh - top_off - bot_strip)
+    # If both two_col and a visual appear, fold two_col cleanly into left-column bullets to prevent overlap
+    if two_col and has_visual:
+        merged = []
+        if two_col.get("left_title"):
+            merged.append({"t": str(two_col["left_title"]), "lvl": 0, "bold": True})
+        merged.extend(list(two_col.get("left_bullets") or []))
+        if two_col.get("right_title"):
+            merged.append({"t": str(two_col["right_title"]), "lvl": 0, "bold": True})
+        merged.extend(list(two_col.get("right_bullets") or []))
+        bullets = merged + list(bullets)
+        two_col = {}
+    has_split = has_visual and bool(bullets or two_col)
+
+    # Smart left/right split ratio: short bullets need less width so figures/tables shine
+    left_frac = 0.44
+    if has_split and bullets and len(bullets) <= 3:
+        max_len = max((du.em_width(b.get("t", "") if isinstance(b, dict) else str(b)) for b in bullets), default=20)
+        tot_len = sum(du.em_width(b.get("t", "") if isinstance(b, dict) else str(b)) for b in bullets)
+        if len(bullets) <= 2 and tot_len <= 42:
+            left_frac = 0.33
+        elif max_len < 22:
+            left_frac = 0.38
+    right_l = rl + int(rw * (left_frac + 0.025))
+    right_w = rl + rw - right_l
 
     # --- bullets (placeholder first for native list styles; textbox fallback)
     if two_col:
-        left_b = two_col.get("left_bullets") or []
-        right_b = two_col.get("right_bullets") or []
-        if len(body_phs) >= 2:
+        left_b = list(two_col.get("left_bullets") or [])
+        right_b = list(two_col.get("right_bullets") or [])
+        if two_col.get("left_title"):
+            left_b = [{"t": str(two_col["left_title"]), "lvl": 0, "bold": True}] + left_b
+        if two_col.get("right_title"):
+            right_b = [{"t": str(two_col["right_title"]), "lvl": 0, "bold": True}] + right_b
+        tc_cap = 13.0 if tighten >= 2 else (14.5 if tighten == 1 else 17.5)
+        if len(body_phs) >= 2 and not has_visual:
+            col_gap = int(Inches(0.30))
+            col_w = (rw - col_gap) // 2
+            du.set_ph_rect(prs, slide, body_phs[0], left=rl, top=ct, width=col_w, height=ch_avail)
+            du.set_ph_rect(prs, slide, body_phs[1], left=rl + col_w + col_gap, top=ct, width=col_w, height=ch_avail)
             du.fill_bullets_tf(body_phs[0].text_frame, left_b)
             du.fill_bullets_tf(body_phs[1].text_frame, right_b)
-            for ph in body_phs:
-                shrink_ph(prs, slide, ph)
+            _cap_body_pt(prs, body_phs[0], left_b, tc_cap)
+            _cap_body_pt(prs, body_phs[1], right_b, tc_cap)
+            for ph in body_phs[:2]:
+                shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
         else:
             ph = body_phs[0] if body_phs else None
             if ph is not None:
-                try:
-                    new_h = max(int((ph.height or rh) - src_strip), Inches(1.0))
-                    du.set_ph_size(ph, int(rw * 0.46), new_h)
-                    du.fill_bullets_tf(ph.text_frame, left_b)
-                    shrink_ph(prs, slide, ph)
-                except Exception:
-                    pass
-            # right column textbox (match left placeholder's inherited font size)
+                _clamp_ph_to_region(prs, slide, ph, rl, ct, int(rw * 0.46), ch_avail)
+                du.fill_bullets_tf(ph.text_frame, left_b)
+                _cap_body_pt(prs, ph, left_b, min(17.0, tc_cap))
+                shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
             colw = int(rw * 0.50)
-            tx = du.fit_textbox(slide, (rl + rw - colw, rt, colw, rh - src_strip), "")
+            tx = du.fit_textbox(slide, (rl + rw - colw, ct, colw, ch_avail), "")
             du.fill_bullets_tf(tx.text_frame, right_b)
-            pt_left = du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT) if ph is not None else du.DEFAULT_BODY_PT
+            pt_left = min(min(17.0, tc_cap), du.ph_inherited_pt(ph, du.DEFAULT_BODY_PT, getattr(prs, "_master_styles", None))) if ph is not None else min(17.0, tc_cap)
             for para in tx.text_frame.paragraphs:
                 para.font.size = Pt(pt_left)
                 for r in para.runs:
                     r.font.size = Pt(pt_left)
-            shrink_shape(tx, du.DEFAULT_BODY_PT)
+            shrink_shape(tx, pt_left, min_pt=b_min_pt, compact_spacing_pt=c_space)
     elif bullets:
-        if body_phs:
-            ph = body_phs[0]
-            if has_split:
-                try:
-                    _, _, pw0, ph0 = du.ph_geom(prs, slide, ph)
-                    du.set_ph_size(ph, int(rw * 0.45), int(ph0 or (rh - src_strip)))
-                except Exception:
-                    try:
-                        ph.width = Emu(int(rw * 0.45))
-                    except Exception:
-                        pass
-            du.fill_bullets_tf(ph.text_frame, bullets)
-            shrink_ph(prs, slide, ph)
-        else:
-            colw = int(rw * (0.45 if has_split else 1.0))
-            tx = du.fit_textbox(slide, (rl, rt, colw, rh - src_strip), "")
-            du.fill_bullets_tf(tx.text_frame, bullets)
-            shrink_shape(tx, du.DEFAULT_BODY_PT)
+        rendered_cards = False
+        # Preserve native template BODY placeholder slot filling on regular content slides;
+        # only use agenda numbered strips on agenda/outline/toc, or keypoint cards when layout has no BODY placeholder.
+        if not has_split and not highlights and not steps and not tighten:
+            all_top = all((int(b.get("lvl", 0) or 0) == 0 if isinstance(b, dict) else True) for b in bullets)
+            if role in ("agenda", "outline", "toc") and 3 <= len(bullets) <= 6 and all_top:
+                du.add_agenda_rows(slide, (rl, ct, rw, ch_avail), bullets, accent=accent)
+                rendered_cards = True
+            elif (not body_phs
+                  and role not in ("title", "section", "qa", "closing", "thanks", "references", "agenda", "outline", "toc")
+                  and 2 <= len(bullets) <= 4 and all_top):
+                parsed = []
+                for b in bullets:
+                    bt = str(b.get("t") if isinstance(b, dict) else b).strip()
+                    matched = None
+                    for sep in ("：", ": "):
+                        if sep in bt:
+                            hd, rest = bt.split(sep, 1)
+                            if 0 < du.em_width(hd) <= 16 and rest.strip():
+                                matched = (hd.strip(), rest.strip())
+                                break
+                    if matched is None:
+                        parsed = []
+                        break
+                    parsed.append(matched)
+                if len(parsed) == len(bullets):
+                    du.add_keypoint_cards(slide, (rl, ct, rw, ch_avail), parsed, accent=accent)
+                    rendered_cards = True
+        if not rendered_cards:
+            b_cap = (13.0 if tighten >= 2 else (14.5 if tighten == 1 else (17.5 if has_split else 20.0)))
+            if body_phs:
+                ph = body_phs[0]
+                target_w = int(rw * left_frac) if has_split else None
+                _clamp_ph_to_region(prs, slide, ph, rl, ct, target_w, ch_avail)
+                du.fill_bullets_tf(ph.text_frame, bullets)
+                _cap_body_pt(prs, ph, bullets, b_cap)
+                if not has_split and not tighten and len(bullets) <= 5:
+                    for p in ph.text_frame.paragraphs:
+                        try:
+                            p.space_after = Pt(10 if (getattr(p, "level", 0) or 0) == 0 else 5)
+                        except Exception:
+                            pass
+                shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
+            else:
+                colw = int(rw * left_frac) if has_split else rw
+                tx = du.fit_textbox(slide, (rl, ct, colw, ch_avail), "")
+                du.fill_bullets_tf(tx.text_frame, bullets)
+                if not has_split and not tighten and len(bullets) <= 5:
+                    for p in tx.text_frame.paragraphs:
+                        try:
+                            p.space_after = Pt(10 if (getattr(p, "level", 0) or 0) == 0 else 5)
+                        except Exception:
+                            pass
+                shrink_shape(tx, min(b_cap, du.DEFAULT_BODY_PT), min_pt=b_min_pt, compact_spacing_pt=c_space)
 
-    # --- image (aspect-preserved, centered in its slot; caption + ref)
-    if img_path:
+    # --- guaranteed non-overlapping visual slots (handles 1, 2, or 3 visuals cleanly!)
+    active_vis = [k for k, on in (("table", has_table), ("chart", has_chart), ("image", has_img)) if on]
+    dual_visual = (len(active_vis) >= 2) and not (bullets or two_col)
+    visual_slots: dict[str, tuple[int, int, int, int]] = {}
+    if len(active_vis) == 1:
+        visual_slots[active_vis[0]] = (right_l, ct, right_w, ch_avail) if has_split else (rl, ct, rw, ch_avail)
+    elif len(active_vis) >= 2:
         if has_split:
-            slot = (rl + int(rw * 0.47), rt, int(rw * 0.50), rh - src_strip)
+            # Stack active visuals vertically inside the right column with clean gap (zero overlap!)
+            v_gap = int(Inches(0.14))
+            each_h = max(int(Inches(1.1)), (ch_avail - v_gap * (len(active_vis) - 1)) // len(active_vis))
+            for idx_v, vk in enumerate(active_vis):
+                visual_slots[vk] = (right_l, ct + idx_v * (each_h + v_gap), right_w, each_h)
         else:
-            slot = (rl, rt, rw, rh - src_strip)
+            # Side-by-side horizontally across full content width (table first on left)
+            h_gap = int(Inches(0.22))
+            each_w = max(int(Inches(1.8)), (rw - h_gap * (len(active_vis) - 1)) // len(active_vis))
+            for idx_v, vk in enumerate(active_vis):
+                visual_slots[vk] = (rl + idx_v * (each_w + h_gap), ct, each_w, ch_avail)
+
+    dark_canvas = du.slide_is_dark(slide)
+    cap_color = "#D8E2EC" if dark_canvas else "#444444"
+    # --- image(s) (aspect-preserved, centered in slot; supports single image or 2 side-by-side images)
+    if resolved_imgs and not img_path:
+        base_slot = visual_slots.get("image", (rl, ct, rw, ch_avail))
+        bl, bt, bw, bh = base_slot
+        n_im = len(resolved_imgs)
+        gap_im = int(Inches(0.22)) if n_im > 1 else 0
+        slot_w = (bw - gap_im * (n_im - 1)) // n_im
+        for idx_im, (im_spec, im_p) in enumerate(resolved_imgs):
+            s_rect = (bl + idx_im * (slot_w + gap_im), bt, slot_w, bh)
+            cap = im_spec.get("caption") or ""
+            ref = im_spec.get("ref") or ""
+            cap_text = (f"{ref} {cap}".strip()) if (cap or ref) else None
+            if im_p:
+                du.add_picture_fit(slide, im_p, s_rect, cap_text=cap_text)
+            else:
+                img_missing = True
+                du.fit_textbox(slide, s_rect, f"[图缺失/仅位图] {ref} {cap}".strip(),
+                               size_pt=12, italic=True, color="#666666")
+    elif img_path:
+        slot = visual_slots.get("image", (rl, ct, rw, ch_avail))
         cap = image.get("caption") or ""
         ref = image.get("ref") or ""
         cap_text = (f"{ref} {cap}".strip()) if (cap or ref) else None
         du.add_picture_fit(slide, img_path, slot, cap_text=cap_text)
     elif img_missing or image.get("missing"):
-        if has_split:
-            slot = (rl + int(rw * 0.47), rt, int(rw * 0.50), rh - src_strip)
-        else:
-            slot = (rl, rt, rw, rh - src_strip)
+        slot = visual_slots.get("image", (rl, ct, rw, ch_avail))
         cap = image.get("caption") or ""
         ref = image.get("ref") or ""
         du.fit_textbox(slide, slot, f"[图缺失/仅位图] {ref} {cap}".strip(),
-                       size_pt=12, italic=True)
+                       size_pt=12, italic=True, color="#666666")
 
-    # --- native editable chart (data-bound)
-    if chart.get("categories") or chart.get("series"):
-        if has_split:
-            cslot = (rl + int(rw * 0.47), rt, int(rw * 0.50), rh - src_strip)
-        else:
-            cslot = (rl, rt, rw, rh - src_strip)
+    # --- native editable chart (data-bound; reserves bottom strip for caption!)
+    if has_chart:
+        cslot = visual_slots.get("chart", (rl, ct, rw, ch_avail))
+        cap = chart.get("caption") or ""
+        ref = chart.get("ref") or ""
+        cap_text = f"{ref} {cap}".strip() if (cap or ref) else ""
+        cap_h = int(Inches(0.36)) if cap_text else 0
+        chart_rect = (cslot[0], cslot[1], cslot[2], max(int(Inches(1.2)), cslot[3] - cap_h))
         try:
-            du.add_native_chart(slide, cslot, chart)
-            cap = chart.get("caption") or ""
-            ref = chart.get("ref") or ""
-            if cap or ref:
-                du.fit_textbox(slide, (cslot[0], cslot[1] + cslot[3] - Inches(0.30),
-                                       cslot[2], Inches(0.28)),
-                               f"{ref} {cap}".strip(), size_pt=11)
+            du.add_native_chart(slide, chart_rect, chart, palette=palette)
+            if cap_text:
+                du.fit_textbox(
+                    slide,
+                    (cslot[0], cslot[1] + chart_rect[3] + int(Inches(0.02)), cslot[2], int(Inches(0.32))),
+                    cap_text, size_pt=11, align=PP_ALIGN.CENTER, color=cap_color,
+                )
         except Exception as e:
             du.fit_textbox(slide, cslot, f"[图表生成失败: {e}]", size_pt=12, italic=True)
 
-    # --- table
-    if table.get("rows"):
-        rows = table["rows"]
-        if has_split:
-            trect = (rl + int(rw * 0.47), rt + Inches(0.1), int(rw * 0.50),
-                     min(rh - Inches(0.2), Inches(0.35) * len(rows)))
+    # --- table (adaptive widths + theme accent header + smart wrapped-row height & caption)
+    if has_table:
+        rows = [["" if c is None else str(c) for c in r] for r in table["rows"]]
+        tslot = visual_slots.get("table", (rl, ct, rw, ch_avail))
+        t_l, t_t, t_w, t_max_h = tslot[0], tslot[1] + int(Inches(0.04)), tslot[2], max(int(Inches(1.1)), tslot[3] - int(Inches(0.08)))
+        t_cap = table.get("caption") or ""
+        t_ref = table.get("ref") or ""
+        t_cap_text = f"{t_ref} {t_cap}".strip() if (t_cap or t_ref) else ""
+        t_cap_h = int(Inches(0.34)) if t_cap_text else 0
+        t_box_h = max(int(Inches(1.0)), t_max_h - t_cap_h)
+        nrows, ncols = len(rows), max((len(r) for r in rows), default=1)
+        if "font_pt" in table and table.get("font_pt") is not None:
+            req_pt = float(table["font_pt"])
+        elif (has_split or dual_visual) and t_w < int(Inches(6.0)):
+            req_pt = 12.0 if ncols >= 4 else 13.0
         else:
-            trect = (rl, rt, rw, min(rh - Inches(0.4), Inches(0.38) * len(rows)))
-        du.add_table(slide, trect, rows, header=table.get("header", True),
-                     font_pt=float(table.get("font_pt", 12)))
+            req_pt = 14.5 if (nrows <= 5 and ncols <= 5) else (13.0 if nrows <= 7 else 12.0)
+        if tighten >= 2:
+            req_pt = min(req_pt, 10.5)
+        elif tighten == 1:
+            req_pt = min(req_pt, 11.5)
+        # Estimate wrapped-row height using the EXACT same sqrt column-width weights as add_table
+        col_widths_emu = du.compute_table_col_widths(rows, t_w)
+        col_w_est = [max(cw / 12700.0 - 16.0, 22.0) for cw in col_widths_emu]
+
+        def _est_table_h_pt(pt_sz: float) -> float:
+            tot = 0.0
+            for r in rows:
+                ml = 1
+                for ci, c in enumerate(r):
+                    ml = max(ml, du.est_lines(c, pt_sz, col_w_est[min(ci, ncols - 1)]))
+                tot += ml * pt_sz * 1.44 + 12.0
+            return tot
+
+        t_pt = req_pt
+        while t_pt > 10.0 and _est_table_h_pt(t_pt) * 12700 * 1.12 > t_box_h:
+            t_pt -= 0.5
+        base_h = int(Inches(0.44 if t_pt >= 13.5 else 0.36) * nrows)
+        est_h = int(_est_table_h_pt(t_pt) * 12700 * 1.16)
+        t_h = min(t_box_h, max(base_h, est_h))
+        # Gently vertically center compact tables so they don't float tiny at top of empty void
+        if t_h < int(t_box_h * 0.65):
+            t_t = t_t + min(int(Inches(0.42)), (t_box_h - t_h) // 4)
+        gf_tbl = du.add_table(
+            slide, (t_l, t_t, t_w, t_h), rows,
+            header=table.get("header", True), font_pt=t_pt, accent=accent,
+            highlight_row=table.get("highlight_row"), max_h=t_box_h,
+        )
+        actual_t_h = max(int(gf_tbl.height) if getattr(gf_tbl, "height", None) else t_h, est_h)
+        actual_t_h = min(t_box_h, actual_t_h)
+        if t_cap_text:
+            cap_y = min(t_t + actual_t_h + int(Inches(0.14)), ct + ch_avail - int(Inches(0.30)))
+            du.fit_textbox(
+                slide,
+                (t_l, cap_y, t_w, int(Inches(0.30))),
+                t_cap_text, size_pt=11, align=PP_ALIGN.CENTER, color=cap_color,
+            )
+
+    # --- bottom takeaway callout (above source line)
+    if takeaway and role not in ("title", "qa"):
+        tk_y = rt + rh - src_strip - int(Inches(0.46))
+        du.add_takeaway_bar(slide, (rl, tk_y, rw, int(Inches(0.42))), takeaway, accent=accent)
 
     # --- bottom source line (claim traceability on-slide)
     if sources and role not in ("title", "qa"):
-        du.source_line(slide, (rl, rt + rh - Inches(0.30), rw, Inches(0.28)), sources,
+        du.source_line(slide, (rl, rt + rh - int(Inches(0.30)), rw, int(Inches(0.28))), sources,
                        prs.slide_width, lang=getattr(prs, "_deck_lang", "zh"))
 
-    du.set_notes(slide, spec.get("notes", ""))
+    notes_text = str(spec.get("notes") or "").strip()
+    if not notes_text:
+        parts = [str(title or role)]
+        if spec.get("subtitle"):
+            parts.append(str(spec["subtitle"]))
+        if takeaway:
+            parts.append(str(takeaway))
+        elif bullets:
+            b_prev = [b.get("t", "") if isinstance(b, dict) else str(b) for b in bullets[:2]]
+            parts.extend(x for x in b_prev if x)
+        notes_text = " — ".join(p.strip() for p in parts if p and p.strip())[:240]
+    du.set_notes(slide, notes_text)
+    # Remove any untouched empty body placeholders so PowerPoint never shows ghost "Click to add text"
+    for ph in body_phs:
+        try:
+            if not ph.has_text_frame or not (ph.text_frame.text or "").strip():
+                el = ph._element
+                if el.getparent() is not None:
+                    el.getparent().remove(el)
+        except Exception:
+            pass
+    if tighten:
+        du.clamp_slide_shapes(prs, slide)
     return {"role": role, "layout": layout_name, "title": title, "image_missing": img_missing}
-
-
-def shrink_title(prs, slide, tph, min_pt=20.0):
-    """Step title font down (1pt steps) until estimated height fits the title box."""
-    try:
-        _, _, tw, th = du.ph_geom(prs, slide, tph)
-        if not (tw and th):
-            return
-        size = du.ph_inherited_pt(tph, du.DEFAULT_TITLE_PT, getattr(prs, "_master_styles", None) or None)
-        new = size
-        while new > min_pt and du.tf_text_height_pt(tph.text_frame, tw.pt, new) > th.pt * 0.90:
-            new -= 1.0
-        if new < size - 0.5:
-            for p in tph.text_frame.paragraphs:
-                p.font.size = Pt(new)
-                for r in p.runs:
-                    if r.font.size is None or r.font.size.pt > new:
-                        r.font.size = Pt(new)
-    except Exception:
-        pass
 
 
 def patch_next_partname(prs):
@@ -240,49 +525,350 @@ def patch_next_partname(prs):
         pass
 
 
-def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes, accent=None):
-    appended = {}
+def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
+                   accent=None, palette=None):
+    """Apply in-place edit operations; returns (specs_by_eid, sources_by_eid).
+    Tracks slide identity by id(slide._element) so delete+append never collides."""
+    before_snaps = {}
+    before_order = []
+    for i, slide in enumerate(prs.slides, 1):
+        eid = id(slide._element)
+        before_order.append(eid)
+        before_snaps[eid] = {"orig_slide": i, **du.extract_slide_snapshot(slide, prs)}
+
+    specs_by_eid = {}
+    sources_by_eid = {}
+    replaced_meta = {}  # new_eid -> {orig_slide, title_before}
+
+    def _rec_src(eid, srcs):
+        if srcs:
+            sources_by_eid[eid] = (sources_by_eid.get(eid) or []) + list(srcs)
+
     for e in edits:
-        op = e.get("op", "")
-        sidx = int(e.get("slide", 0)) - 1
-        if op == "set_title":
+        op = str(e.get("op", "")).strip()
+        sraw = e.get("slide", 0)
+        sidx = (int(sraw) - 1) if (isinstance(sraw, int) or str(sraw).isdigit()) else -1
+
+        if op == "set_title" and 0 <= sidx < len(prs.slides):
             slide = prs.slides[sidx]
-            tph = du.slide_title_ph(slide)
-            if tph is not None:
-                tph.text_frame.text = str(e.get("text", ""))
-                shrink_title(prs, slide, tph)
-            cm_changes.append({"op": "set_title", "slide": sidx + 1, "to": e.get("text", ""),
-                                "sources": e.get("sources") or []})
-        elif op == "set_body":
+            du.fix_degenerate_placeholders(prs, slide)
+            new_title = str(e.get("text") if e.get("text") is not None else (e.get("title") or ""))
+            tsh = du.find_slide_title_shape(slide, prs)
+            if tsh is not None and tsh.has_text_frame:
+                du.set_text_preserving_style(tsh.text_frame, new_title)
+                if tsh.is_placeholder:
+                    shrink_title(prs, slide, tsh)
+            _rec_src(id(slide._element), e.get("sources"))
+            cm_changes.append({"op": "set_title", "slide": sidx + 1, "to": new_title,
+                               "sources": e.get("sources") or []})
+
+        elif op == "set_body" and 0 <= sidx < len(prs.slides):
             slide = prs.slides[sidx]
-            bphs = du.body_placeholders(slide)
-            if bphs:
-                du.fill_bullets_tf(bphs[0].text_frame, e.get("bullets") or [])
-                shrink_ph(prs, slide, bphs[0])
+            du.fix_degenerate_placeholders(prs, slide)
+            bshs = du.find_slide_body_shapes(slide, prs)
+            if bshs:
+                du.fill_bullets_tf(bshs[0].text_frame, e.get("bullets") or [])
+                if bshs[0].is_placeholder:
+                    _cap_body_pt(prs, bshs[0], e.get("bullets") or [], 20.0)
+                    shrink_ph(prs, slide, bshs[0])
+                else:
+                    shrink_shape(bshs[0], du.DEFAULT_BODY_PT)
+            _rec_src(id(slide._element), e.get("sources"))
             cm_changes.append({"op": "set_body", "slide": sidx + 1,
                                "n_bullets": len(e.get("bullets") or []),
                                "sources": e.get("sources") or []})
-        elif op == "set_notes":
-            du.set_notes(prs.slides[sidx], e.get("text", ""))
+
+        elif op == "set_two_col" and 0 <= sidx < len(prs.slides):
+            slide = prs.slides[sidx]
+            du.fix_degenerate_placeholders(prs, slide)
+            bshs = du.find_slide_body_shapes(slide, prs)
+            left_b = e.get("left_bullets") or []
+            right_b = e.get("right_bullets") or []
+            if len(bshs) >= 2:
+                du.fill_bullets_tf(bshs[0].text_frame, left_b)
+                du.fill_bullets_tf(bshs[1].text_frame, right_b)
+                for sh, bl in ((bshs[0], left_b), (bshs[1], right_b)):
+                    if sh.is_placeholder:
+                        _cap_body_pt(prs, sh, bl, 17.5)
+                        shrink_ph(prs, slide, sh)
+                    else:
+                        shrink_shape(sh, du.DEFAULT_BODY_PT)
+            elif len(bshs) == 1:
+                du.fill_bullets_tf(bshs[0].text_frame, left_b + right_b)
+                if bshs[0].is_placeholder:
+                    _cap_body_pt(prs, bshs[0], left_b + right_b, 20.0)
+                    shrink_ph(prs, slide, bshs[0])
+                else:
+                    shrink_shape(bshs[0], du.DEFAULT_BODY_PT)
+            _rec_src(id(slide._element), e.get("sources"))
+            cm_changes.append({"op": "set_two_col", "slide": sidx + 1,
+                               "sources": e.get("sources") or []})
+
+        elif op == "replace_text":
+            old_t, new_t = str(e.get("old", "")), str(e.get("new", ""))
+            targets = list(range(len(prs.slides))) if (str(sraw).lower() == "all" or sidx < 0) else [sidx]
+            total_hits = 0
+            for ti in targets:
+                if 0 <= ti < len(prs.slides):
+                    sl_t = prs.slides[ti]
+                    hits = du.replace_text_in_slide(sl_t, old_t, new_t)
+                    if hits:
+                        total_hits += hits
+                        _rec_src(id(sl_t._element), e.get("sources"))
+                        # If replacement lengthened text and caused overflow, gently fit down
+                        if len(new_t) > len(old_t):
+                            for sh_r in sl_t.shapes:
+                                if not (sh_r.has_text_frame and sh_r.text_frame.text.strip()):
+                                    continue
+                                _, _, sw_r, sh_h = du.shape_geom(prs, sl_t, sh_r)
+                                if sw_r and sh_h and sw_r.pt > 20 and sh_h.pt > 12:
+                                    cur_pt = du.effective_pt(sh_r, du.DEFAULT_BODY_PT)
+                                    if du.tf_text_height_pt(sh_r.text_frame, sw_r.pt, cur_pt) > sh_h.pt * 1.04:
+                                        du.shrink_body_to_fit(sh_r.text_frame, sw_r.pt, sh_h.pt, cur_pt, min_pt=10.5)
+            cm_changes.append({"op": "replace_text", "slide": sraw, "old": old_t, "new": new_t,
+                               "hits": total_hits, "sources": e.get("sources") or []})
+
+        elif op == "set_source" and 0 <= sidx < len(prs.slides):
+            slide = prs.slides[sidx]
+            srcs = e.get("sources") or []
+            if srcs:
+                rl, rt, rw, rh = du.content_region(prs, slide)
+                du.source_line(slide, (rl, rt + rh - int(Inches(0.30)), rw, int(Inches(0.28))),
+                               srcs, prs.slide_width, lang=getattr(prs, "_deck_lang", "zh"))
+                _rec_src(id(slide._element), srcs)
+            cm_changes.append({"op": "set_source", "slide": sidx + 1, "sources": srcs})
+
+        elif op == "set_notes" and 0 <= sidx < len(prs.slides):
+            notes_val = e.get("text") if e.get("text") is not None else (e.get("notes") or "")
+            du.set_notes(prs.slides[sidx], str(notes_val))
             cm_changes.append({"op": "set_notes", "slide": sidx + 1})
+
+        elif op == "set_table" and 0 <= sidx < len(prs.slides):
+            slide = prs.slides[sidx]
+            tbl_spec = e.get("table") if isinstance(e.get("table"), dict) else e
+            rows = [["" if c is None else str(c) for c in r] for r in (tbl_spec.get("rows") or [])]
+            if rows:
+                existing_tbl = next((sh for sh in slide.shapes if getattr(sh, "has_table", False)), None)
+                nrows, ncols = len(rows), max(len(r) for r in rows)
+                if existing_tbl is not None and len(existing_tbl.table.rows) == nrows and len(existing_tbl.table.columns) == ncols:
+                    for ri, row in enumerate(rows):
+                        for ci, val in enumerate(row):
+                            du.set_text_preserving_style(existing_tbl.table.cell(ri, ci).text_frame, val)
+                else:
+                    rl, rt, rw, rh = du.content_region(prs, slide)
+                    if existing_tbl is not None and existing_tbl.width and existing_tbl.height:
+                        tl, tt = int(existing_tbl.left), int(existing_tbl.top)
+                        tw = min(int(existing_tbl.width), max(int(Inches(2.0)), rl + rw - tl))
+                        max_th = max(int(Inches(1.1)), min(rh - int(Inches(0.32)), rt + rh - tt - int(Inches(0.28))))
+                        try:
+                            existing_tbl._element.getparent().remove(existing_tbl._element)
+                        except Exception:
+                            pass
+                        slot = (tl, tt, tw, min(max_th, int(Inches(0.42) * nrows)))
+                    else:
+                        max_th = rh - int(Inches(0.36))
+                        slot = (rl, rt, rw, min(max_th, int(Inches(0.42) * nrows)))
+                    du.add_table(slide, slot, rows, header=tbl_spec.get("header", True),
+                                 font_pt=float(tbl_spec.get("font_pt") or 12.5),
+                                 accent=accent, highlight_row=tbl_spec.get("highlight_row"),
+                                 max_h=max_th)
+            eid = id(slide._element)
+            sp_cur = dict(specs_by_eid.get(eid) or {})
+            sp_cur["table"] = {
+                "ref": tbl_spec.get("ref"), "caption": tbl_spec.get("caption"), "rows": rows,
+            }
+            specs_by_eid[eid] = sp_cur
+            _rec_src(eid, e.get("sources"))
+            cm_changes.append({"op": "set_table", "slide": sidx + 1,
+                               "rows": len(rows), "sources": e.get("sources") or []})
+
+        elif op == "set_chart" and 0 <= sidx < len(prs.slides):
+            slide = prs.slides[sidx]
+            ch_spec = e.get("chart") if isinstance(e.get("chart"), dict) else e
+            cats = [str(c) for c in (ch_spec.get("categories") or [])]
+            sers = ch_spec.get("series") or []
+            if cats and sers:
+                existing_ch = next((sh for sh in slide.shapes if getattr(sh, "has_chart", False)), None)
+                if existing_ch is not None:
+                    try:
+                        from pptx.chart.data import CategoryChartData
+                        cd = CategoryChartData()
+                        cd.categories = cats
+                        for sr in sers:
+                            cd.add_series(str(sr.get("name", "series")),
+                                          tuple(float(v) for v in (sr.get("values") or [])))
+                        existing_ch.chart.replace_data(cd)
+                        if ch_spec.get("title"):
+                            existing_ch.chart.has_title = True
+                            existing_ch.chart.chart_title.text_frame.text = str(ch_spec["title"])
+                    except Exception:
+                        slot = (int(existing_ch.left), int(existing_ch.top),
+                                int(existing_ch.width), int(existing_ch.height))
+                        try:
+                            existing_ch._element.getparent().remove(existing_ch._element)
+                        except Exception:
+                            pass
+                        du.add_native_chart(slide, slot, ch_spec, palette=palette)
+                else:
+                    rl, rt, rw, rh = du.content_region(prs, slide)
+                    du.add_native_chart(slide, (rl, rt, rw, rh - int(Inches(0.36))), ch_spec, palette=palette)
+            eid = id(slide._element)
+            sp_cur = dict(specs_by_eid.get(eid) or {})
+            sp_cur["chart"] = dict(ch_spec)
+            specs_by_eid[eid] = sp_cur
+            _rec_src(eid, e.get("sources"))
+            cm_changes.append({"op": "set_chart", "slide": sidx + 1,
+                               "series": len(sers), "sources": e.get("sources") or []})
+
+        elif op == "set_image" and 0 <= sidx < len(prs.slides):
+            slide = prs.slides[sidx]
+            img_spec = e.get("image") if isinstance(e.get("image"), dict) else e
+            raw_p = img_spec.get("path")
+            im_p = resolve_path(raw_p, images_base, work) if raw_p else None
+            cap = img_spec.get("caption") or ""
+            ref = img_spec.get("ref") or ""
+            cap_text = (f"{ref} {cap}".strip()) if (cap or ref) else None
+            existing_pic = next(
+                (sh for sh in slide.shapes if sh.shape_type is not None and "PICTURE" in str(sh.shape_type)),
+                None,
+            )
+            if existing_pic is not None and existing_pic.width and existing_pic.height:
+                slot = (int(existing_pic.left), int(existing_pic.top),
+                        int(existing_pic.width), int(existing_pic.height))
+                try:
+                    existing_pic._element.getparent().remove(existing_pic._element)
+                except Exception:
+                    pass
+            else:
+                rl, rt, rw, rh = du.content_region(prs, slide)
+                slot = (rl + int(rw * 0.48), rt, int(rw * 0.52), rh - int(Inches(0.36)))
+            if im_p and im_p.is_file():
+                du.add_picture_fit(slide, im_p, slot, cap_text=cap_text)
+            else:
+                du.fit_textbox(slide, slot, f"[图缺失/仅位图] {ref} {cap}".strip(),
+                               size_pt=12, italic=True, color="#666666")
+            eid = id(slide._element)
+            sp_cur = dict(specs_by_eid.get(eid) or {})
+            sp_cur["image"] = {
+                "path": str(im_p or raw_p or ""), "ref": ref, "caption": cap,
+                **({"missing": True} if not (im_p and im_p.is_file()) else {}),
+            }
+            specs_by_eid[eid] = sp_cur
+            _rec_src(eid, e.get("sources"))
+            cm_changes.append({"op": "set_image", "slide": sidx + 1,
+                               "path": str(im_p or raw_p or ""), "sources": e.get("sources") or []})
+
+        elif op == "replace_slide" and 0 <= sidx < len(prs.slides):
+            old_slide = prs.slides[sidx]
+            old_eid = id(old_slide._element)
+            old_meta = before_snaps.get(old_eid)
+            spec = e.get("slide_spec") if isinstance(e.get("slide_spec"), dict) else {
+                k: v for k, v in e.items() if k not in ("op", "slide", "at")
+            }
+            info = build_create_slide(prs, spec, images_base, work, accent, palette)
+            new_idx = len(prs.slides) - 1
+            new_slide = prs.slides[new_idx]
+            new_eid = id(new_slide._element)
+            specs_by_eid[new_eid] = spec
+            if old_meta:
+                replaced_meta[new_eid] = {"orig_slide": old_meta["orig_slide"],
+                                          "title_before": old_meta["title"],
+                                          "old_eid": old_eid}
+            du.move_slide(prs, new_idx, sidx)
+            du.delete_slide(prs, sidx + 1)
+            cm_changes.append({"op": "replace_slide", "slide": sidx + 1,
+                               "role": info["role"], "title": info["title"]})
+
         elif op == "append":
-            spec = e.get("slide_spec") or {}
-            info = build_create_slide(prs, spec, images_base, accent)
-            appended[len(prs.slides)] = spec
+            spec = e.get("slide_spec") if isinstance(e.get("slide_spec"), dict) else {
+                k: v for k, v in e.items() if k not in ("op", "slide", "at")
+            }
+            info = build_create_slide(prs, spec, images_base, work, accent, palette)
+            new_slide = prs.slides[len(prs.slides) - 1]
+            specs_by_eid[id(new_slide._element)] = spec
             cm_changes.append({"op": "append", "slide": len(prs.slides),
-                                "role": info["role"], "title": info["title"]})
-        elif op == "delete":
+                               "role": info["role"], "title": info["title"]})
+
+        elif op == "insert_at":
+            spec = e.get("slide_spec") if isinstance(e.get("slide_spec"), dict) else {
+                k: v for k, v in e.items() if k not in ("op", "slide", "at")
+            }
+            at = max(1, min(int(e.get("at", len(prs.slides) + 1)), len(prs.slides) + 1))
+            info = build_create_slide(prs, spec, images_base, work, accent, palette)
+            new_idx = len(prs.slides) - 1
+            new_slide = prs.slides[new_idx]
+            specs_by_eid[id(new_slide._element)] = spec
+            if at - 1 < new_idx:
+                du.move_slide(prs, new_idx, at - 1)
+            cm_changes.append({"op": "insert_at", "at": at,
+                               "role": info["role"], "title": info["title"]})
+
+        elif op == "delete" and 0 <= sidx < len(prs.slides):
             du.delete_slide(prs, sidx)
             cm_changes.append({"op": "delete", "slide": sidx + 1})
-        elif op == "move":
-            du.move_slide(prs, sidx, int(e.get("to", 1)) - 1)
-            cm_changes.append({"op": "move", "slide": sidx + 1, "to": e.get("to")})
-    # kept pages must not lose speaker notes (completeness): add a neutral marker note
-    for i, slide in enumerate(prs.slides, 1):
+
+        elif op == "move" and 0 <= sidx < len(prs.slides):
+            dst = max(0, min(int(e.get("to", 1)) - 1, len(prs.slides) - 1))
+            du.move_slide(prs, sidx, dst)
+            cm_changes.append({"op": "move", "slide": sidx + 1, "to": dst + 1})
+
+    # Language-aware fallback note for kept slides lacking notes
+    is_en = getattr(prs, "_deck_lang", "zh") == "en"
+    default_kept_note = (
+        "(Kept slide: content unchanged from starting deck; retain previous talking points or transition to updated results.)"
+        if is_en else
+        "（保留页：内容未改动；本页讲稿可沿用上一版本的说法，或用一句话过渡到新增结果。）"
+    )
+    for slide in prs.slides:
         has_notes = slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip()
         if not has_notes:
-            du.set_notes(slide, "（保留页：内容未改动；本页讲稿可沿用上一版本的说法，或用一句话过渡到新增结果。）")
-    return appended
+            du.set_notes(slide, default_kept_note)
+
+    # Compute structured per-slide diff (before vs after)
+    after_eids = {id(s._element) for s in prs.slides}
+    replaced_old_eids = {m["old_eid"] for m in replaced_meta.values()}
+    diff_rows = []
+    for i, slide in enumerate(prs.slides, 1):
+        eid = id(slide._element)
+        after_snap = du.extract_slide_snapshot(slide, prs)
+        if eid in replaced_meta:
+            rm = replaced_meta[eid]
+            diff_rows.append({"slide": i, "orig_slide": rm["orig_slide"], "status": "replaced",
+                              "title_before": rm["title_before"], "title_after": after_snap["title"],
+                              "changes": [f"replaced slide {rm['orig_slide']} ('{rm['title_before'][:30]}')"]})
+        elif eid not in before_snaps:
+            diff_rows.append({"slide": i, "orig_slide": None, "status": "added",
+                              "title_after": after_snap["title"], "changes": ["new slide"]})
+        else:
+            b = before_snaps[eid]
+            changes = []
+            if b["orig_slide"] != i:
+                changes.append(f"reordered {b['orig_slide']} -> {i}")
+            if b["title"] != after_snap["title"]:
+                changes.append(f"title: '{b['title'][:40]}' -> '{after_snap['title'][:40]}'")
+            if b["bullets"] != after_snap["bullets"]:
+                changes.append(f"body paragraphs: {len(b['bullets'])} -> {len(after_snap['bullets'])}")
+            if b["tables"] != after_snap["tables"]:
+                changes.append("table updated")
+            if b["charts"] != after_snap["charts"]:
+                changes.append("chart updated")
+            if b.get("image_sigs", b["images"]) != after_snap.get("image_sigs", after_snap["images"]):
+                changes.append("image updated")
+            if b["notes"] != after_snap["notes"] and after_snap["notes"] != default_kept_note:
+                changes.append("notes updated")
+            status_lbl = "modified" if changes else "unchanged"
+            diff_rows.append({"slide": i, "orig_slide": b["orig_slide"], "status": status_lbl,
+                              "title_before": b["title"], "title_after": after_snap["title"],
+                              "changes": changes})
+    deleted = [{"orig_slide": before_snaps[eid]["orig_slide"], "status": "deleted",
+                "title_before": before_snaps[eid]["title"]}
+               for eid in before_order if eid not in after_eids and eid not in replaced_old_eids]
+    slide_diff = {"before_count": len(before_order), "after_count": len(prs.slides),
+                  "slides": diff_rows, "deleted": deleted, "ops_applied": cm_changes}
+    (work / "slide_diff.json").write_text(
+        json.dumps(slide_diff, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    return specs_by_eid, sources_by_eid
 
 
 def main() -> int:
@@ -308,10 +894,8 @@ def main() -> int:
 
     if mode == "edit" and start and Path(start).is_file():
         prs = Presentation(str(start))
-        base_layouts = len(prs.slide_layouts)
     elif template and Path(template).is_file():
         prs = Presentation(str(template))
-        # start from a clean slide set if template carries sample pages
         while len(prs.slides) > 0:
             du.delete_slide(prs, 0)
     else:
@@ -319,8 +903,10 @@ def main() -> int:
         print("BUILD_WARN: no template found, using default blank template")
 
     cm_edits: list = []
-    accent = du.theme_accent_color(prs, template or start)
-    master_styles = du.load_master_styles(prs, template or start)
+    theme_src = template or start
+    accent = du.theme_accent_color(prs, theme_src)
+    palette = du.theme_palette(prs, theme_src)
+    du.load_master_styles(prs, theme_src)
     patch_next_partname(prs)
     wo_lang = str((inv.get("workorder") or {}).get("language") or plan.get("language") or "zh")
     prs._deck_lang = "en" if wo_lang.lower().startswith("en") else "zh"
@@ -329,40 +915,79 @@ def main() -> int:
 
     cm = []
     if mode == "edit":
-        appended = apply_edit_ops(prs, plan.get("edits") or [], images_base, work, cm_edits, accent)
-        # content_map covers ALL final slides (kept pages included) for evidence audit
-        op_sources = {}
-        for ch in cm_edits:
-            if ch.get("sources"):
-                op_sources[ch["slide"]] = (op_sources.get(ch["slide"]) or []) + ch["sources"]
+        specs_by_eid, sources_by_eid = apply_edit_ops(
+            prs, plan.get("edits") or [], images_base, work, cm_edits, accent, palette
+        )
         for i, slide in enumerate(prs.slides, 1):
-            spec = appended.get(i) or {}
-            tph = du.slide_title_ph(slide)
-            title = tph.text_frame.text if (tph is not None and tph.has_text_frame) else ""
-            notes = ""
-            if slide.has_notes_slide:
-                notes = slide.notes_slide.notes_text_frame.text.strip()
-            cm.append({"slide": i, "role": spec.get("role", "existing"), "layout": "",
-                       "title": title,
-                       "bullets": [b.get("t") if isinstance(b, dict) else str(b)
-                                   for b in (spec.get("bullets") or [])],
-                       "notes": notes,
-                       "sources": (spec.get("sources") or []) + op_sources.get(i, []),
-                       "image": spec.get("image") or {}, "table": spec.get("table") or {}, "chart": spec.get("chart") or {}})
+            eid = id(slide._element)
+            spec = specs_by_eid.get(eid) or {}
+            snap = du.extract_slide_snapshot(slide, prs)
+            spec_bullets = [b.get("t") if isinstance(b, dict) else str(b)
+                            for b in (spec.get("bullets") or [])]
+            tbl_cm = spec.get("table") or {}
+            if not tbl_cm and snap.get("tables"):
+                tbl_cm = {"rows": snap["tables"][0].get("all_rows") or snap["tables"][0].get("preview") or []}
+            ch_cm = spec.get("chart") or {}
+            if not ch_cm and snap.get("charts"):
+                ch_cm = snap["charts"][0]
+            cm.append({
+                "slide": i,
+                "role": spec.get("role", "existing"),
+                "layout": snap["layout"],
+                "title": snap["title"],
+                "subtitle": spec.get("subtitle", ""),
+                "bullets": spec_bullets if spec_bullets else snap["bullets"],
+                "notes": snap["notes"],
+                "sources": (spec.get("sources") or []) + sources_by_eid.get(eid, []),
+                "image": spec.get("image") or {},
+                "table": tbl_cm,
+                "chart": ch_cm,
+                "highlights": spec.get("highlights") or [],
+                "steps": spec.get("steps") or [],
+                "takeaway": spec.get("takeaway") or "",
+            })
     else:
         for spec in plan.get("slides") or []:
-            info = build_create_slide(prs, spec, images_base, accent)
+            info = build_create_slide(prs, spec, images_base, work, accent, palette)
             img_spec = dict(spec.get("image") or {})
             if info.pop("image_missing", False):
                 img_spec["missing"] = True
-            cm.append({"slide": len(prs.slides), **info,
-                       "bullets": [b.get("t") if isinstance(b, dict) else str(b)
-                                   for b in (spec.get("bullets") or [])],
-                       "notes": spec.get("notes", ""),
-                       "sources": spec.get("sources") or [],
-                       "image": img_spec, "table": spec.get("table") or {}, "chart": spec.get("chart") or {}})
+            bullets_flat = []
+            two_col = spec.get("two_col") or {}
+            if two_col:
+                if two_col.get("left_title"):
+                    bullets_flat.append(str(two_col["left_title"]))
+                bullets_flat.extend(
+                    b.get("t") if isinstance(b, dict) else str(b)
+                    for b in (two_col.get("left_bullets") or [])
+                )
+                if two_col.get("right_title"):
+                    bullets_flat.append(str(two_col["right_title"]))
+                bullets_flat.extend(
+                    b.get("t") if isinstance(b, dict) else str(b)
+                    for b in (two_col.get("right_bullets") or [])
+                )
+            bullets_flat.extend(
+                b.get("t") if isinstance(b, dict) else str(b)
+                for b in (spec.get("bullets") or [])
+            )
+            cm.append({
+                "slide": len(prs.slides),
+                **info,
+                "subtitle": spec.get("subtitle", ""),
+                "bullets": bullets_flat,
+                "notes": spec.get("notes", ""),
+                "sources": spec.get("sources") or [],
+                "image": img_spec,
+                "images": spec.get("images") or [],
+                "table": spec.get("table") or {},
+                "chart": spec.get("chart") or {},
+                "highlights": spec.get("highlights") or [],
+                "steps": spec.get("steps") or [],
+                "takeaway": spec.get("takeaway") or "",
+            })
 
-    prs.save(str(out))
+    # Set core metadata BEFORE saving so it persists in the PPTX package
     try:
         cp = prs.core_properties
         cp.title = plan.get("deck_title") or "Academic Deck"
@@ -370,11 +995,14 @@ def main() -> int:
         cp.subject = "paper-to-slides with evidence mapping"
     except Exception:
         pass
+    prs.save(str(out))
+
     (work / "content_map.json").write_text(
         json.dumps({"deck_title": plan.get("deck_title", ""), "mode": mode,
-                    "out": str(out), "slides": cm,
-                    "edits_applied": cm_edits},
-                   ensure_ascii=False, indent=1), encoding="utf-8")
+                    "out": str(out), "slides": cm, "edits_applied": cm_edits},
+                   ensure_ascii=False, indent=1),
+        encoding="utf-8",
+    )
     du.log_change(work, "build", f"mode={mode} slides={len(prs.slides)} out={out}")
     print(f"BUILD_OK slides={len(prs.slides)} mode={mode} out={out}")
     return 0

@@ -1,109 +1,77 @@
 ---
 name: "academic-slides-pku"
-description: "Turn a fixed paper/research material into an editable, template-inheriting academic deck (native PPTX + PDF export + per-slide evidence map), or edit an existing deck in place. Verifies geometry, fidelity and quote authenticity with scripts before delivery."
+description: "Turn a fixed paper/research material into an editable, template-inheriting academic deck (native PPTX + PDF export + per-slide evidence map), or edit an existing deck in place with per-slide diffs. High-fidelity two-command pipeline with built-in audit and polish finishes in 5-10 steps."
 ---
 
-# 学术 PPT 生成与编辑 — 执行卡
+# 学术 PPT 生成与编辑 — 高保真两步执行卡
 
-**触发**：运行时给 `/input/case.json` + `material.json` + `artifacts/slide-workorder.json` +
-真实 `target-template.pptx` / `starting-deck.pptx`，要求产出可编辑学术演示稿、PDF 导出与
-页级证据映射。**预算 64 次请求 / 900s / 16384 tokens** — 一切以"脚本干重活、模型做决策"为原则，
-全程约 8–12 次请求、<3 分钟。先产出合法首版，再精修。
+**触发**：输入 `/input/case.json` + `task.md` + `material.json`/论文 PDF + `slide-workorder.json` +
+真实 `target-template.pptx` / `starting-deck.pptx`，产出原生 PPTX、真 PDF 导出与页级证据映射。
+**效率与质量平衡（预算 64 步 / 900s → 目标 5–10 步 / < 300s）**：
+- **严禁**单独 `ls /input`、通读 `scripts/*.py`、手写 `python-pptx` 补丁，或用 `read` 读二进制 `.png`/`.pdf`/`.pptx`（视觉看 `export.visual_ok`）。
+- **绝不盲猜原文**：Step 1 打印高保真摘要；若 `read_more_hints` 非空（长论文或大 `material.json`），务必按页码标记精准补读方法/实验/局限原文后再写计划。
 
-## 0. 路径与速览
+## 1. 高保真闭环流程（5–10 步交付）
 
-- 输入 `/input`，工作台 `WORK=/app/work`，产物 `OUT=/app/output`。
-- `S = <本 Skill 目录>`；脚本用 `python3 $S/scripts/xxx.py ...`（自带路径解析，任意 cwd 可用）。
-- 首步先看 `WORK/inventory.json` 而不是猜文件内容；**材料原文是唯一事实依据**，领域标签不可信。
-- 详细规范按需读：`references/plan-schema.md`（计划 schema+证据规则）、
-  `references/template-rules.md`（模板/版式铁律）、`references/failure-playbook.md`（异常处置）。
-
-## 1. 流程（每步一条命令，失败即看 stdout JSON）
-
-**Step 1 清点输入（1 次请求）**
+### Step 1 一键清点 + 高保真材料直出 + 落盘保底 `result.json`
 ```bash
-python3 $S/scripts/inspect_case.py --case-dir /input --work $WORK
+RP=/skills/weekly-skill/scripts/run_pipeline.py
+[ -f "$RP" ] || RP=$(find /skills /app /root /workspace -maxdepth 5 -name run_pipeline.py 2>/dev/null | head -n1)
+python3 "$RP" prepare --case-dir /input --work /app/work --out /app/output
 ```
-输出 `INSPECT_OK {...}`：workorder 约束（mode/slide_count/audience/language）、模板版式清单、
-起始 deck 页数、材料 keys、PDF 页数与抽取文本位置（`$WORK/material_text.md`）、异常清单。
-**同时**：把已有的输入异常先记下来（后面进 exceptions）。
+单命令完成解析、落盘保底 `partial` 版 `/app/output/result.json`，并向 stdout 打印：
+1. `PREPARE_OK {...}`（`workorder` 硬约束、模板版式、真实图片路径+图注、异常与 `read_more_hints`）；
+2. `=== TASK.MD ===`（≤10 KB）；3. `=== MATERIAL DIGEST ===`（论文导航、首页摘要原文、全部图表原注、PDF/CSV 表、完整 `material.json`、全篇按句切分关键句，≤18 KB）；4. `=== START DECK DUMP ===`（edit 原稿逐页内容/表格/图表/备注，≤10 KB）。
+- **按需深读（0–2 步）**：`read_more_hints` 为空直接进 Step 2；非空时先扫 `material.json` 权威数字/图表，再用 `read(offset, limit)` 按 `<!-- PDF page N -->` 补读方法、主结果、消融与局限段。
 
-**Step 2 立即落一版诚实的 partial result（防中断，0 决策）**
+### Step 2 编写学术计划 `/app/work/slides_plan.json`
+直接按下方示例写入（扩展字段按需参考 `references/plan-schema.md`）：
+
+```json
+{
+  "deck_title": "Paper Short Title", "mode": "create", "rationale": "6-slide defense deck",
+  "slides": [
+    {"role": "title", "layout_hint": "title", "title": "Main Title", "subtitle": "Authors · Venue", "notes": "Opening hook and agenda preview."},
+    {"role": "result", "layout_hint": "content", "title": "Method Cuts Error by 58.4%",
+     "highlights": [{"value": "58.4%", "label": "Error Drop"}, {"value": "142", "label": "Qubits"}],
+     "bullets": [{"t": "Core Gain: lowers error by 58.4% vs baseline", "lvl": 0}],
+     "table": {"ref": "Table 1", "caption": "Main comparison", "highlight_row": -1,
+               "rows": [["Method","Error","Time"],["Base","4.82","18.5"],["Ours","1.31","7.8"]]},
+     "takeaway": "Achieves 1.31 error at 7.8 us.", "notes": "Walk through Table 1, highlight the 58.4% reduction, and transition to ablation.",
+     "sources": [{"ref": "Table 1", "locator": "p.1", "quote": "verbatim excerpt from material"}]}
+  ],
+  "uncertainty": []
+}
+```
+- **edit/adapt 模式**（在原稿上原地修改，绝不重做无关页）：设 `"mode": "edit"`，用 `"edits"` 逐条映射任务修改指令：
+  ```json
+  {"mode": "edit", "rationale": "Apply requested edits in place", "edits": [
+    {"op": "replace_text", "slide": 2, "old": "58.0%", "new": "58.4%", "sources": [{"ref": "Table 1", "locator": "p.1", "quote": "exact text"}]},
+    {"op": "set_table", "slide": 3, "rows": [["Model","Acc"],["Ours","94.2%"]], "sources": [{"ref": "Table 2", "locator": "p.4", "quote": "exact text"}]},
+    {"op": "replace_slide", "slide": 4, "slide_spec": {"role": "result", "title": "...", "bullets": [{"t": "..."}], "notes": "...", "sources": [...]}}
+  ], "uncertainty": []}
+  ```
+  其余支持 op：`set_title`、`set_body`、`set_two_col`、`set_chart`、`set_image`（原地换图）、`set_notes`、`set_source`、`insert_at`、`append`、`delete`、`move`（`replace_text` 支持 `"slide": "all"` 且递归覆盖组合图形/表格/备注）。
+- **高分学术编排准则**：
+  - **硬约束**：严守 `slide_count`/`min_slides`/`max_slides`、`audience`、`language`、`duration` 与 `source_preservation`（术语符号一致）。
+  - **叙事与视觉节奏**：封面 → 问题/动机 → 方法（`steps` 或原图 `image`）→ 主结果（`highlights` + `table`/`chart` + `takeaway`）→ 消融/分析 → 局限与未来（`two_col` 或模板正文槽位）→ 结论/Q&A。正文页优先填模板原生 `BODY` 槽位（首词自动加粗），单页选 1 种核心视觉，目录页自动渲染编号条。
+  - **零错数与真实引文**：主张式标题（≤22 全角字，避 `→`/`·`）、≤6 条要点、自然演讲 `notes`（2–4 句，讲动机/结论/过渡）；非封面/目录/Q&A 页写 ≥1 条 `sources[].{ref,locator,quote}`（`quote` 逐字复制自材料）。位图或无完整数表只用真实图，**绝不编造或取整数字**，缺口写入 `uncertainty`。
+
+### Step 3 一键构建 + 自动修补 + 导出 + 输出逐页审计摘要
 ```bash
-python3 $S/scripts/assemble_result.py --case-dir /input --work $WORK \
-  --deck $OUT/presentation.pptx --status partial
+RP=/skills/weekly-skill/scripts/run_pipeline.py
+[ -f "$RP" ] || RP=$(find /skills /app /root /workspace -maxdepth 5 -name run_pipeline.py 2>/dev/null | head -n1)
+python3 "$RP" deliver \
+  --case-dir /input --work /app/work --out /app/output \
+  --plan /app/work/slides_plan.json --dpi 100
 ```
+单命令完成：`build_deck.py` → `check_deck.py`（13 项检查）→ 内置 ≤2 轮自动修补（排版紧缩、表格限高、字号钳制、引文对齐、缺源/缺备注补齐，绝不改数字）→ `export_preview.py`（LibreOffice 隔离 `.lohome` 90s 快失败导出真 PDF，失败降级 `reportlab` + 100 DPI PNG + Pillow `visual_ok`）→ `assemble_result.py --status auto`，并在 stdout 附带 `=== DECK AUDIT SUMMARY ===`。
 
-**Step 3 读材料 → 写计划（1–2 次请求，本 Skill 唯一重决策点）**
-读 `$WORK/material_text.md`（或 material.json），提取：研究问题/方法/主结果数字/局限 +
-每条结论的原文定位（章节号、页码、图号）。**先扫 material.json 的 key_numbers/tables/figures
-锁定权威数字集，再读全文补上下文；页面数字直接从这些字段复制粘贴，不要凭记忆打字。**
-**超长材料分段读**：先读摘要/实验/结论段与图表清单页标记，再按页码标记按需补读，
-不要一次性把几万字全部读入。**扫描版 PDF（material_text.md 为空）**：以 material.json
-为准，并在 uncertainty 记录 "PDF 无文本层，数字取自结构化材料"。
-然后**只写一个文件** `$WORK/slides_plan.json`
-（schema 见 references/plan-schema.md）：
-- 每页：主张式标题、≤6 条要点（每条 ≤2 行）、`notes` 讲稿 2–4 句、
-  `sources[].{ref,locator,quote}`（quote **逐字**取自材料，脚本会核验）；
-- 图：优先数据绑定原生图表（材料含某图完整数值时用 `chart`，数值逐项取材料，生成可在 PowerPoint
-  中直接查验/编辑的原生图表）；
-  其余图只引用真实存在的图（PDF 抽取图在 `$WORK/figs/`，材料图用 inventory 给的绝对路径），
-  位图无数据则只引用原图不重绘；`caption` 逐字用论文图注；
-- 页数 = workorder `slide_count`（无则 10–14，不得超过 `max_slides`）；edit 模式只写 `edits`，
-  不碰其他页；workorder 若给 edit_instructions 列表，逐条映射为 edits 操作；
-- 材料缺口写进 `uncertainty`，**没有的数字绝不编**。
+### Step 4 定向精修与干净停机（最多重跑 1–2 次）
+- **`DELIVER_ISSUES`**：按 `failures` 与 `closest` 提示一次性修正 `/app/work/slides_plan.json` 重跑 Step 3（≤2 轮；未消除项记入 `exceptions`，见 `references/failure-playbook.md`）。
+- **`DELIVER_OK` 且 `missing_fields: []`**：直接核对 `=== DECK AUDIT SUMMARY ===` 与 `auto_repaired`（0 次额外读文件）：若无回退项且叙事/视觉/讲稿/任务要求齐备 → **立即停止并回复交付摘要**；若存在自动回退备注/引文或漏项 → 对 `slides_plan.json` 做 **1 次精准精修**并重跑 Step 3（同步沉淀 `v1 → v2` 至 `version_history.md`），随后立即停止。
 
-**Step 4 构建（原生可编辑、模板继承）**
-```bash
-python3 $S/scripts/build_deck.py --plan $WORK/slides_plan.json --work $WORK \
-  --out $OUT/presentation.pptx
-```
-输出 `BUILD_OK slides=N`。edit 模式自动用起始 deck，create 模式用 target-template 的真实版式。
+## 2. 无脚本兜底与交付红线
 
-**Step 5 检查 + 导出**
-```bash
-python3 $S/scripts/check_deck.py --deck $OUT/presentation.pptx --work $WORK
-python3 $S/scripts/export_preview.py --deck $OUT/presentation.pptx --work $WORK
-```
-检查 13 项：页数/页数上限/越界/文字溢出/重叠/表格溢出/图片等比/标题+备注/字号下限/
-字体继承/证据来源/引文真实性/数字保真（实质性数字必须能在材料原文回查，防抄错取整）。
-导出产出真实 PDF + `previews/slide-XX.png`。
-
-**Step 6 修复循环（≤2 轮，超出即如实报告）**
-看 `CHECK_ISSUES` 的 failures 列表：改 `slides_plan.json` 对应页（精简文字/拆页/换图），
-重跑 Step 4–5。几何硬错误（越界/图片拉伸/重叠）必须清零；无法修复的按
-references/failure-playbook.md 写入 exceptions。
-若运行时支持读图：用 read 看 `previews/*.png` 逐页目检（留白、层级、图注对齐、来源行）；
-不支持读图时以程序化检查为准。
-
-**Step 7 终版 result.json（含全部契约字段）**
-```bash
-python3 $S/scripts/assemble_result.py --case-dir /input --work $WORK \
-  --deck $OUT/presentation.pptx --status auto
-```
-产出：`result.json`（case_id/status/editable_source/export_artifact/content_map/
-compliance_checks/exceptions + uncertainty/change_log）、`plan.json`、`change_log.md`、
-`qa_report.md`（一页式审计：检查表+异常+页级证据，供复核）、`outline.md`（讲稿大纲）、
-`previews/contact-sheet.png`（全 deck 缩略拼图，一眼目检）、`presentation.pptx`、
-`presentation.pdf`、`previews/*.png`。核对 stdout `missing_fields:[]`。
-
-## 2. 无脚本兜底（脚本不可用时不断链）
-
-1. 手写 `$WORK/slides_plan.json`（schema 不变）→ 若 python-pptx 可用，用一段内联 Python：
-   打开模板 → `prs.slide_layouts` 逐页 add_slide → 占位符 `text_frame` 填字（不设 font.name）→
-   `add_picture(width=…)` 等比插图 → `notes_slide` 写备注 → 保存。
-2. PDF：`soffice --headless --convert-to pdf`；预览：`pdftoppm -png -r 110`。
-3. 全部工具缺失：把计划与证据映射完整写进 result.json（status=partial, editable_source=null），
-   exceptions 注明环境缺失 —— 诚实交付优于伪造。
-
-## 3. 环境自检（可选）
-
-- 一次请求：：`python3 $S/scripts/selftest.py` — 在临时目录生成 mini 算例
-  并全流程跑通，打印 `SELFTEST_OK`；用于快速验证脚本链可用。
-
-## 4. 红线（交付底线）
-
-- 不改母版/主题；不给文字设字体名；图片等比插入。
-- 页面数字必须能在材料中指认；quote 必须逐字存在；编造=0 分。
-- workorder 的 mode/页数/受众/语言是硬约束；`source preservation`（术语符号一致）是硬约束。
-- 所有异常写 exceptions，status 用 auto 判定，不虚报 ok。
+- **无脚本降级**：若 `run_pipeline.py` 不可用，先写 `/app/work/slides_plan.json` 与诚实 `partial` 版 `/app/output/result.json`，再用内联 `python-pptx` 打开真实模板逐页 `add_slide`（不设 `font.name`、`add_picture(width=...)` 等比插图、写 `notes_slide`）→ `soffice --headless --convert-to pdf`（或 `reportlab`）+ `pdftoppm -png -r 100`；工具全缺失则输出完整页级证据的 `status=partial` `result.json` 并写明 `exceptions`。
+- **交付红线**：不改母版/主题；不给 run 设 `font.name`；图片严格等比；LibreOffice 缓存放 `/app/work/.lohome` 不污染 `/app/output`；页面实质数字必在材料/任务书中可指认，绝不虚报 `status=ok`。

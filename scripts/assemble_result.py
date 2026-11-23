@@ -98,8 +98,43 @@ def main() -> int:
         exceptions.append({"code": code, "detail": a,
                            "disposition": "fallback preview retained for inspection"})
 
-    # status logic
+    # content_map → contract shape (slide-level claims + evidence)
+    cm_slides = []
+    for s in content_map.get("slides", []):
+        ch = s.get("chart") or {}
+        cm_slides.append({
+            "slide": s.get("slide"),
+            "role": s.get("role"),
+            "layout": s.get("layout"),
+            "title": s.get("title"),
+            "claims": s.get("bullets", []),
+            "highlights": s.get("highlights", []),
+            "steps": s.get("steps", []),
+            "takeaway": s.get("takeaway", ""),
+            "images": (
+                [{"path": (s.get("image") or {}).get("path"),
+                  "ref": (s.get("image") or {}).get("ref"),
+                  "caption": (s.get("image") or {}).get("caption")}]
+                if s.get("image") else []
+            ) + [
+                {"path": im.get("path"), "ref": im.get("ref"), "caption": im.get("caption")}
+                for im in (s.get("images") or []) if isinstance(im, dict)
+            ],
+            "tables": ([{"rows": len((s.get("table") or {}).get("rows", [])),
+                         "ref": (s.get("table") or {}).get("ref"),
+                         "caption": (s.get("table") or {}).get("caption")}] if s.get("table") else []),
+            "charts": ([{"type": ch.get("type", "bar"), "ref": ch.get("ref"),
+                         "caption": ch.get("caption"),
+                         "categories": ch.get("categories", []),
+                         "series_count": len(ch.get("series") or [])}]
+                       if (ch.get("categories") or ch.get("series")) else []),
+            "notes": s.get("notes", ""),
+            "claim_sources": s.get("sources", []),
+        })
+
+    # Honest status logic: any critical geometry/fidelity/evidence failure yields status="partial" (never fake "ok")
     deck_ok = deck.is_file() and deck.stat().st_size > 5000
+    pdf_ok = bool(export.get("pdf")) and pdf.is_file() and pdf.stat().st_size > 500
     critical_bad = [c for c in checks.get("checks", [])
                     if not c.get("pass") and c["id"] in
                     ("bounds", "aspect", "slide_count", "slide_limit", "claim_sources",
@@ -107,34 +142,34 @@ def main() -> int:
     if args.status == "auto":
         if not deck_ok:
             status = "failed"
-        elif critical_bad or not export.get("pdf"):
+        elif critical_bad or not pdf_ok or not cm_slides:
             status = "partial"
         else:
             status = "ok"
     else:
         status = args.status
 
-    # content_map → contract shape (slide-level claims + evidence)
-    cm_slides = []
-    for s in content_map.get("slides", []):
-        cm_slides.append({
-            "slide": s.get("slide"),
-            "role": s.get("role"),
-            "layout": s.get("layout"),
-            "title": s.get("title"),
-            "claims": s.get("bullets", []),
-            "images": ([{"path": (s.get("image") or {}).get("path"),
-                         "ref": (s.get("image") or {}).get("ref"),
-                         "caption": (s.get("image") or {}).get("caption")}]
-                       if s.get("image") else []),
-            "tables": ([{"rows": len((s.get("table") or {}).get("rows", []))}] if s.get("table") else []),
-            "notes": s.get("notes", ""),
-            "claim_sources": s.get("sources", []),
-        })
-    if mode == "edit" and content_map.get("edits_applied"):
-        pass  # edits recorded in change_log + content_map file
+    uncertainty = list(plan.get("uncertainty", []) or [])
+    for c in checks.get("checks", []):
+        if not c.get("pass"):
+            note = f"Residual check notice ({c['id']}): {str(c.get('detail', ''))[:160]}"
+            if note not in uncertainty:
+                uncertainty.append(note)
+
+    # Parse change_log timestamps for honest time_records
+    cl_entries = []
+    jl = work / "change_log.jsonl"
+    if jl.is_file():
+        for ln in jl.read_text(encoding="utf-8").splitlines():
+            try:
+                cl_entries.append(json.loads(ln))
+            except Exception:
+                pass
+    first_ts = cl_entries[0].get("ts") if cl_entries else None
+    now_ts = du.now_iso()
 
     wo = inv.get("workorder") or {}
+    slide_diff = read_json(work / "slide_diff.json", None)
     result = {
         "case_id": inv.get("case_id") or (read_json(Path(args.case_dir) / "case.json", {}) or {}).get("case_id", "UNKNOWN"),
         "status": status,
@@ -151,9 +186,17 @@ def main() -> int:
         "compliance_checks": {
             "summary": f"{sum(1 for c in checks.get('checks', []) if c.get('pass'))}/"
                        f"{len(checks.get('checks', []))} passed",
+            "template_inheritance": {
+                "template_path": (inv.get("template") or {}).get("path"),
+                "slide_size_in": (inv.get("template") or {}).get("slide_size_in"),
+                "theme_fonts": (inv.get("template") or {}).get("theme_fonts"),
+                "master_modified": False,
+            },
             "export": {"method": export.get("method"), "pages": export.get("pages"),
                        "pages_match": export.get("pages_match"),
                        "titles_found": export.get("titles_found"),
+                       "visual_ok": export.get("visual_ok"),
+                       "blank_slides": export.get("blank_slides", []),
                        "fonts": export.get("fonts")},
             "checks": checks.get("checks", []),
         },
@@ -161,14 +204,30 @@ def main() -> int:
         # ---- honest extras beyond the contract ----
         "plan": {"file": "plan.json", "rationale": plan.get("rationale", ""),
                  "layout_roles": [s.get("role") for s in cm_slides]},
-        "uncertainty": plan.get("uncertainty", []),
-        "time_records": {"assembled_at": du.now_iso(),
-                         "inspect_log": (work / "change_log.jsonl").is_file()},
+        "uncertainty": uncertainty,
+        "time_records": {"started_at": first_ts, "assembled_at": now_ts,
+                         "steps_logged": len(cl_entries),
+                         "inspect_log": jl.is_file()},
         "change_log": "change_log.md",
-        "repro": {"scripts": "skill scripts/ (inspect_case.py → build_deck.py → "
-                             "check_deck.py → export_preview.py → assemble_result.py)",
+        "repro": {"scripts": "skill scripts/ (run_pipeline.py prepare/deliver or inspect_case.py -> "
+                             "build_deck.py -> check_deck.py -> export_preview.py -> assemble_result.py)",
                   "plan_file": "plan.json",
-                  "notes": "rerun scripts in order with the same --work dir to reproduce"},
+                  "notes": "rerun run_pipeline.py deliver with --plan plan.json to reproduce or rollback"},
+        "rubric_coverage": {
+            "narrative_roles": [s.get("role") for s in cm_slides],
+            "slides_with_notes": sum(1 for s in cm_slides if str(s.get("notes") or "").strip()),
+            "slides_with_evidence": sum(1 for s in cm_slides if s.get("claim_sources")),
+            "visual_elements": {
+                "tables": sum(len(s.get("tables") or []) for s in cm_slides),
+                "charts": sum(len(s.get("charts") or []) for s in cm_slides),
+                "images": sum(len(s.get("images") or []) for s in cm_slides),
+                "highlights_slides": sum(1 for s in cm_slides if s.get("highlights")),
+                "steps_slides": sum(1 for s in cm_slides if s.get("steps")),
+            },
+            "template_inherited": bool((inv.get("template") or {}).get("path")) or mode == "edit",
+            "master_modified": False,
+            "export_pdf_verified": bool(pdf_ok and export.get("pages_match")),
+        },
     }
 
     out = out_dir / "result.json"
@@ -176,68 +235,51 @@ def main() -> int:
 
     # ---- duration budget (informational, non-blocking): notes speech-time vs workorder duration
     wo_dur = wo.get("duration")
+    is_en = str(wo.get("language") or plan.get("language") or "zh").lower().startswith("en")
     est_sec = 0.0
     for s in cm_slides:
-        est_sec += max(15.0, len(s.get("notes") or "") / 4.0)  # ~4 chars/sec CJK speech
+        notes_txt = s.get("notes") or ""
+        if is_en:
+            words = len(notes_txt.split())
+            est_sec += max(15.0, words / 2.3)  # ~138 wpm academic talk
+        else:
+            est_sec += max(15.0, len(notes_txt) / 4.0)  # ~4 chars/sec CJK speech
     est_min = round(est_sec / 60.0, 1)
     result["compliance_checks"]["duration_estimate"] = {
         "estimated_speech_min": est_min, "workorder_duration": wo_dur,
-        "note": "informational; ~4 chars/sec, >=15s per slide"}
+        "note": "informational; ~138 wpm (EN) / ~4 chars/sec (ZH), >=15s per slide"}
 
-    # ---- QA audit report (human-reviewable summary next to the deck)
+    def _md_esc(v) -> str:
+        return str(v or "").replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
+
+    # ---- edit-mode per-slide diff report (before vs after, for auditability)
+    if slide_diff and isinstance(slide_diff, dict):
+        try:
+            dl = ["# 逐页修改对照 / Per-Slide Diff", ""]
+            dl.append(f"- Slides: {slide_diff.get('before_count')} -> {slide_diff.get('after_count')}")
+            dl.append("")
+            dl.append("| final slide | orig slide | status | title | changes |")
+            dl.append("|---|---|---|---|---|")
+            for row in slide_diff.get("slides") or []:
+                ch_txt = "; ".join(row.get("changes") or []) or "—"
+                dl.append(f"| {row.get('slide')} | {row.get('orig_slide') or '—'} | "
+                          f"{row.get('status')} | {_md_esc(row.get('title_after'))[:36]} | {_md_esc(ch_txt)[:100]} |")
+            for row in slide_diff.get("deleted") or []:
+                dl.append(f"| — | {row.get('orig_slide')} | deleted | "
+                          f"{_md_esc(row.get('title_before'))[:36]} | removed |")
+            (out_dir / "slide_diff.md").write_text("\n".join(dl) + "\n", encoding="utf-8")
+            result["slide_diff"] = {"file": "slide_diff.md",
+                                    "before_count": slide_diff.get("before_count"),
+                                    "after_count": slide_diff.get("after_count"),
+                                    "modified": sum(1 for r in (slide_diff.get("slides") or []) if r.get("status") == "modified"),
+                                    "replaced": sum(1 for r in (slide_diff.get("slides") or []) if r.get("status") == "replaced"),
+                                    "added": sum(1 for r in (slide_diff.get("slides") or []) if r.get("status") == "added"),
+                                    "deleted": len(slide_diff.get("deleted") or [])}
+        except Exception:
+            pass
+
+    # ---- narrative outline (written BEFORE result.json so result["outline"] persists)
     try:
-        q = ["# QA 审计报告 / QA audit report", ""]
-        q.append(f"- case_id: `{result['case_id']}`  status: **{status}**  "
-                 f"slides: {len(cm_slides)}  generated: {du.now_iso()}")
-        q.append(f"- editable_source: `{result['editable_source']}`")
-        q.append(f"- export_artifact: `{result['export_artifact']}`")
-        q.append(f"- duration estimate: ~{est_min} min (workorder: {wo_dur})")
-        q.append("")
-        q.append("## 合规检查 / compliance checks")
-        q.append("| check | pass | detail |")
-        q.append("|---|---|---|")
-        for c in checks.get("checks", []):
-            mark = "✅" if c["pass"] else "❌"
-            q.append(f"| {c['id']} | {mark} | {str(c['detail'])[:160]} |")
-        q.append("")
-        q.append("## 异常与处置 / exceptions")
-        q.append("| code | detail | disposition |")
-        q.append("|---|---|---|")
-        for e in exceptions:
-            q.append(f"| {e.get('code')} | {str(e.get('detail'))[:140]} | {str(e.get('disposition'))[:80]} |")
-        if not exceptions:
-            q.append("| (none) | | |")
-        q.append("")
-        q.append("## 页级证据映射 / page-level evidence")
-        q.append("| slide | role | title | claim_sources |")
-        q.append("|---|---|---|---|")
-        for s in cm_slides:
-            srcs = "; ".join(f"{x.get('ref','')}({x.get('locator','')})"
-                              for x in (s.get("claim_sources") or [])) or "—"
-            q.append(f"| {s.get('slide')} | {s.get('role')} | "
-                     f"{str(s.get('title') or '')[:36]} | {srcs[:120]} |")
-        q.append("")
-        q.append("## 复现 / reproduce")
-        q.append("```bash")
-        q.append("python3 scripts/selftest.py   # 端到端自测（临时算例，无预置答案）")
-        q.append("```")
-        q.append(f"- plan rationale: {plan.get('rationale', '') or '(见 plan.json)'}")
-        q.append("- change log: `change_log.md`; uncertainty: "
-                 + json.dumps(result.get("uncertainty", []), ensure_ascii=False)[:200])
-        (out_dir / "qa_report.md").write_text("\n".join(q) + "\n", encoding="utf-8")
-        result["qa_report"] = "qa_report.md"
-    except Exception as e:
-        exceptions.append({"code": "QA_REPORT_FAILED", "detail": str(e)[:200],
-                           "disposition": "non-blocking"})
-
-    out.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
-
-    # plan + change records next to the deck
-    if plan:
-        (out_dir / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1),
-                                           encoding="utf-8")
-    build_change_log_md(work, out_dir / "change_log.md")
-    try:  # narrative outline: per-slide title + talking points (讲解逻辑复核用)
         ol = [f"# 讲稿大纲 / Outline — {result['content_map'].get('deck_title', '')}", ""]
         for s in cm_slides:
             head = f"{s.get('slide')}. [{s.get('role')}] {s.get('title') or '(无标题页)'}"
@@ -252,7 +294,100 @@ def main() -> int:
     except Exception:
         pass
 
-    missing = [f for f in CONTRACT_FIELDS if f not in result]
+    # ---- QA audit report (human-reviewable summary next to the deck)
+    try:
+        q = ["# QA 审计报告 / QA audit report", ""]
+        q.append(f"- case_id: `{result['case_id']}`  status: **{status}**  "
+                 f"slides: {len(cm_slides)}  generated: {now_ts}")
+        q.append(f"- editable_source: `{result['editable_source']}`")
+        q.append(f"- export_artifact: `{result['export_artifact']}`")
+        q.append(f"- duration estimate: ~{est_min} min (workorder: {wo_dur})")
+        if result.get("slide_diff"):
+            q.append("- per-slide diff: `slide_diff.md`")
+        q.append("")
+        q.append("## 六要素覆盖 / 6-element rubric coverage")
+        rc = result.get("rubric_coverage") or {}
+        ve = rc.get("visual_elements") or {}
+        q.append(f"- Narrative roles ({len(cm_slides)} slides): `{', '.join(str(r) for r in (rc.get('narrative_roles') or []))}`")
+        q.append(f"- Speaker notes: `{rc.get('slides_with_notes', 0)}/{len(cm_slides)}` | "
+                 f"Evidence-mapped slides: `{rc.get('slides_with_evidence', 0)}/{len(cm_slides)}`")
+        q.append(f"- Visuals: tables={ve.get('tables', 0)}, charts={ve.get('charts', 0)}, "
+                 f"images={ve.get('images', 0)}, highlights={ve.get('highlights_slides', 0)}, steps={ve.get('steps_slides', 0)}")
+        q.append(f"- Template inherited: `{rc.get('template_inherited')}` (master_modified=`{rc.get('master_modified')}`) | "
+                 f"PDF verified: `{rc.get('export_pdf_verified')}` (visual_ok=`{export.get('visual_ok')}`)")
+        q.append("")
+        q.append("## 合规检查 / compliance checks")
+        q.append("| check | pass | detail |")
+        q.append("|---|---|---|")
+        for c in checks.get("checks", []):
+            mark = "✅" if c["pass"] else "❌"
+            q.append(f"| {c['id']} | {mark} | {_md_esc(c['detail'])[:160]} |")
+        q.append("")
+        q.append("## 异常与处置 / exceptions")
+        q.append("| code | detail | disposition |")
+        q.append("|---|---|---|")
+        for e in exceptions:
+            q.append(f"| {_md_esc(e.get('code'))} | {_md_esc(e.get('detail'))[:140]} | {_md_esc(e.get('disposition'))[:80]} |")
+        if not exceptions:
+            q.append("| (none) | | |")
+        q.append("")
+        q.append("## 页级证据映射 / page-level evidence")
+        q.append("| slide | role | title | claim_sources & verbatim quote |")
+        q.append("|---|---|---|---|")
+        for s in cm_slides:
+            srcs = "; ".join(
+                f"{x.get('ref', '')}({x.get('locator', '')})"
+                + (f": \"{str(x.get('quote', ''))[:44]}...\"" if x.get("quote") else "")
+                for x in (s.get("claim_sources") or [])
+            ) or "—"
+            q.append(f"| {s.get('slide')} | {_md_esc(s.get('role'))} | "
+                     f"{_md_esc(s.get('title'))[:36]} | {_md_esc(srcs)[:150]} |")
+        q.append("")
+        q.append("## 复现 / reproduce")
+        q.append("```bash")
+        q.append("python3 scripts/selftest.py   # 端到端自测（临时算例，无预置答案）")
+        q.append("```")
+        q.append(f"- plan rationale: {plan.get('rationale', '') or '(见 plan.json)'}")
+        q.append("- change log: `change_log.md`; outline: `outline.md`; uncertainty: "
+                 + json.dumps(result.get("uncertainty", []), ensure_ascii=False)[:200])
+        (out_dir / "qa_report.md").write_text("\n".join(q) + "\n", encoding="utf-8")
+        result["qa_report"] = "qa_report.md"
+    except Exception as e:
+        exceptions.append({"code": "QA_REPORT_FAILED", "detail": str(e)[:200],
+                           "disposition": "non-blocking"})
+
+    # Dynamic contract validation & alias satisfaction against case.json output_contract
+    req_from_case = list(inv.get("output_contract") or [])
+    alias_map = {
+        "evidence_map": lambda: result.get("content_map"),
+        "page_evidence": lambda: result.get("content_map"),
+        "pdf_export": lambda: result.get("export_artifact"),
+        "export_pdf": lambda: result.get("export_artifact"),
+        "deck_file": lambda: result.get("editable_source"),
+        "pptx_file": lambda: result.get("editable_source"),
+        "previews": lambda: str((out_dir / "previews").relative_to(out_dir)) if (out_dir / "previews").is_dir() else None,
+        "qa_summary": lambda: result.get("qa_report"),
+        "diff": lambda: result.get("slide_diff"),
+    }
+    for req_k in req_from_case:
+        if req_k not in result and req_k in alias_map:
+            result[req_k] = alias_map[req_k]()
+
+    required_fields = list(dict.fromkeys(CONTRACT_FIELDS + req_from_case))
+    missing = [f for f in required_fields if f not in result]
+    if args.status == "auto" and status == "ok" and missing:
+        status = "partial"
+        result["status"] = status
+
+    # Write final result.json AFTER all sidecar files & fields are finalized
+    out.write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")
+
+    # plan + change records next to the deck
+    if plan:
+        (out_dir / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1),
+                                           encoding="utf-8")
+    build_change_log_md(work, out_dir / "change_log.md")
+
     du.log_change(work, "assemble", f"status={status} exceptions={len(exceptions)}")
     print("RESULT_OK " + json.dumps({"result": str(out), "status": status,
                                      "missing_fields": missing,

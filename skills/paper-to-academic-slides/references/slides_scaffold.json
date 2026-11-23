@@ -1,0 +1,97 @@
+{
+  "_comment": "页级大纲脚手架 / scaffold — 复制后按论文填写，标注字段说明见 references/slides-schema.md。本文件是示例模板（Example），非任何真实案例的结果。",
+  "meta": {
+    "deck_title": "",
+    "authors": "",
+    "audience": "",
+    "language": "zh",
+    "max_slides": 12
+  },
+  "slides": [
+    {
+      "kind": "cover",
+      "title": "<论文标题的忠实中文缩写>",
+      "bullets": [{"level": 0, "text": "<作者 · 单位，取自论文首页>"}],
+      "notes": "<开场30秒：一句话问题+一句话贡献；过渡句>",
+      "evidence": {
+        "paper_refs": [{"type": "page", "id": "title", "page": 1}],
+        "slide_line": "证据: p.1 标题页"
+      }
+    },
+    {
+      "title": "<主张句：论文要解决什么、为什么难>",
+      "bullets": [
+        {"level": 0, "text": "<现状/痛点，≤30字>"},
+        {"level": 0, "text": "<关键矛盾或代价>"},
+        {"level": 1, "text": "<论文的核心问题句（可加引号）>"}
+      ],
+      "notes": "<过渡：为什么现在讲这个；强调：哪个硬约束；追问：引言哪一段支撑>",
+      "evidence": {
+        "paper_refs": [{"type": "section", "id": "1 Introduction", "page": 1,
+                        "quote": "<≤25词原文片段，逐字>"}],
+        "slide_line": "证据: §1 (p.1)"
+      }
+    },
+    {
+      "title": "<主张句：方法一句话>",
+      "bullets": [
+        {"level": 0, "text": "<组件1：做什么>"},
+        {"level": 0, "text": "<组件2：怎么连>"},
+        {"level": 1, "text": "<框架图说明（示意图，非实验数据）>"}
+      ],
+      "image": "<可选：/app/work/paper/figs/fig_pNN_0.png>",
+      "image_caption": "<可选：Fig. 1 方法框架示意图（非实验数据）>",
+      "table": {
+        "headers": ["<表头逐字>"],
+        "rows": [["<数据行逐字，>6行自动截断>"]],
+        "note": "<单位/条件表注>"
+      },
+      "notes": "<强调：方法与结果的分界；追问：公式/算法在第几节>",
+      "evidence": {
+        "paper_refs": [
+          {"type": "figure", "id": "Fig. 1", "page": 3, "quote": "<题注原文>"},
+          {"type": "section", "id": "2 Method", "page": 3}
+        ],
+        "slide_line": "证据: Fig. 1 (p.3); §2 (p.3)"
+      }
+    },
+    {
+      "title": "<主张句：主结果数字+对照条件>",
+      "bullets": [
+        {"level": 0, "text": "<指标+数值+单位（逐字）>"},
+        {"level": 0, "text": "<对照基线及其数值>"},
+        {"level": 0, "text": "<代价/延迟等次要指标>"}
+      ],
+      "image": "<主结果图/表路径>",
+      "notes": "<强调：数字的对照对象与前提；追问：Table 几/设置节>",
+      "evidence": {
+        "paper_refs": [
+          {"type": "table", "id": "Table 2", "page": 6, "quote": "<关键行逐字，多行用分号隔开>"},
+          {"type": "figure", "id": "Fig. 4", "page": 7}
+        ],
+        "slide_line": "证据: Table 2 (p.6); Fig. 4 (p.7)"
+      }
+    },
+    {
+      "title": "<主张句：作者自认的局限>",
+      "bullets": [{"level": 0, "text": "<局限1>"}],
+      "notes": "<诚实交底；过渡：结论>",
+      "evidence": {
+        "paper_refs": [{"type": "section", "id": "5 Conclusion", "page": 8,
+                        "quote": "<局限原文>"}],
+        "slide_line": "证据: §5 (p.8)"
+      }
+    },
+    {
+      "kind": "closing",
+      "title": "<主张句：结论复述贡献>",
+      "bullets": [{"level": 0, "text": "<贡献1+数字>"}],
+      "notes": "<收尾+留讨论问题>",
+      "evidence": {
+        "paper_refs": [{"type": "section", "id": "Abstract", "page": 1,
+                        "quote": "<abstract 关键句>"}],
+        "slide_line": "证据: Abstract (p.1)"
+      }
+    }
+  ]
+}

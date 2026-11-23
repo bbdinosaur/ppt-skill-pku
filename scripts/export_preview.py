@@ -7,7 +7,7 @@ inspection. If soffice is unavailable, falls back to a PIL geometry previewer
 (rectangles + wrapped text) so a visual check is always possible.
 
 Usage: python3 export_preview.py --deck out/presentation.pptx --work work \
-           --pdf out/presentation.pdf [--previews-dir out/previews] [--dpi 110]
+           --pdf out/presentation.pdf [--previews-dir out/previews] [--dpi 100]
 Writes work/export_report.json, prints EXPORT_OK / EXPORT_FALLBACK / EXPORT_FAILED.
 """
 from __future__ import annotations
@@ -71,10 +71,11 @@ def reportlab_pdf(deck: Path, out_pdf: Path, content_map_path: Path | None):
     for idx, slide in enumerate(prs.slides):
         info = slides[idx] if idx < len(slides) else {}
         for sh in slide.shapes:
-            if sh.left is None:
+            sl, st, sw, shh = du.shape_geom(prs, slide, sh)
+            if sl is None or st is None or not sw or not shh:
                 continue
-            l, tp = int(sh.left) / SWd * W * sx, int(sh.top) / SHd * H * sy
-            w, h = int(sh.width or 0) / SWd * W * sx, int(sh.height or 0) / SHd * H * sy
+            l, tp = int(sl) / SWd * W * sx, int(st) / SHd * H * sy
+            w, h = int(sw) / SWd * W * sx, int(shh) / SHd * H * sy
             try:
                 if "PICTURE" in str(sh.shape_type) and sh.image:
                     img_path = sh.image.blob and None
@@ -121,18 +122,19 @@ def reportlab_pdf(deck: Path, out_pdf: Path, content_map_path: Path | None):
     return out_pdf
 
 
-def soffice_convert(deck: Path, outdir: Path) -> Path | None:
+def soffice_convert(deck: Path, outdir: Path, work: Path | None = None) -> Path | None:
     soffice = shutil.which("soffice") or shutil.which("libreoffice")
     if not soffice:
         return None
-    lo_home = (outdir / ".lohome").resolve()
+    lo_home = ((work or outdir) / ".lohome").resolve()
     lo_home.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "HOME": str(lo_home)}
     try:
         subprocess.run(
-            [soffice, "--headless", "--norestore", "--convert-to", "pdf",
-             "--outdir", str(outdir), str(deck)],
-            env=env, timeout=240,  # keep within the 900s per-case budget
+            [soffice, "--headless", "--norestore", "--nofirststartwizard",
+             f"-env:UserInstallation=file://{lo_home}",
+             "--convert-to", "pdf", "--outdir", str(outdir), str(deck)],
+            env=env, timeout=90,  # fail fast to reportlab fallback if LibreOffice stalls
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
     except Exception:
@@ -141,7 +143,7 @@ def soffice_convert(deck: Path, outdir: Path) -> Path | None:
     return pdf if pdf.is_file() and pdf.stat().st_size > 500 else None
 
 
-def verify_pdf(pdf: Path, expect_pages: int, titles, previews_dir: Path):
+def verify_pdf(pdf: Path, expect_pages: int, titles, previews_dir: Path, dpi: int = 100):
     rep = {"pdf": str(pdf), "pages": 0, "fonts": [], "pages_match": None,
            "titles_found": None, "previews": 0, "anomalies": []}
     try:
@@ -162,7 +164,8 @@ def verify_pdf(pdf: Path, expect_pages: int, titles, previews_dir: Path):
         if titles:
             import re
             def norm(s):
-                return re.sub(r"\s+", "", s or "")
+                s = re.sub(r"[→←↔·•\u2013\u2014\-:：（）()]", "", s or "")
+                return re.sub(r"\s+", "", s).lower()
             t = norm(all_text)
             found = sum(1 for x in titles if norm(x) and norm(x) in t)
             rep["titles_found"] = f"{found}/{len(titles)}"
@@ -170,17 +173,73 @@ def verify_pdf(pdf: Path, expect_pages: int, titles, previews_dir: Path):
                 rep["anomalies"].append("many titles not extractable from PDF — check font substitution")
         if "\ufffd" in all_text:
             rep["anomalies"].append("replacement chars found in PDF text")
-        # export PNG previews
+        # export PNG previews (clean stale previews from previous larger decks first)
         previews_dir.mkdir(parents=True, exist_ok=True)
+        for old_png in previews_dir.glob("slide-*.png"):
+            try:
+                old_png.unlink()
+            except Exception:
+                pass
+        cs = previews_dir / "contact-sheet.png"
+        if cs.is_file():
+            try:
+                cs.unlink()
+            except Exception:
+                pass
         for pno in range(doc.page_count):
-            pix = doc[pno].get_pixmap(dpi=110)
+            pix = doc[pno].get_pixmap(dpi=dpi)
             pix.save(str(previews_dir / f"slide-{pno + 1:02d}.png"))
         rep["previews"] = doc.page_count
         make_contact_sheet(previews_dir, doc.page_count)
+        vis = visual_sanity_check(previews_dir)
+        rep["blank_slides"] = vis["blank_slides"]
+        rep["visual_ok"] = bool(rep["pages_match"]) and not vis["blank_slides"]
+        if vis["blank_slides"]:
+            rep["anomalies"].append(f"nearly blank rendered slides: {vis['blank_slides']}")
         doc.close()
     except Exception as e:
-        rep["anomalies"].append(f"pdf verify failed: {e}")
+        # Fallback to pdftoppm if PyMuPDF is missing in the runtime container
+        ppm = shutil.which("pdftoppm")
+        if ppm and pdf.is_file():
+            try:
+                previews_dir.mkdir(parents=True, exist_ok=True)
+                for old_png in previews_dir.glob("slide-*.png"):
+                    old_png.unlink(missing_ok=True)
+                subprocess.run([ppm, "-png", "-r", str(dpi), str(pdf), str(previews_dir / "slide")],
+                               timeout=60, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+                pngs = sorted(previews_dir.glob("slide-*.png"))
+                rep["pages"] = len(pngs)
+                rep["pages_match"] = (len(pngs) == expect_pages)
+                rep["previews"] = len(pngs)
+                if pngs:
+                    make_contact_sheet(previews_dir, len(pngs))
+                    vis = visual_sanity_check(previews_dir)
+                    rep["blank_slides"] = vis["blank_slides"]
+                    rep["visual_ok"] = bool(rep["pages_match"]) and not vis["blank_slides"]
+                else:
+                    rep["anomalies"].append(f"pdf verify failed: {e}")
+            except Exception:
+                rep["anomalies"].append(f"pdf verify failed: {e}")
+        else:
+            rep["anomalies"].append(f"pdf verify failed: {e}")
     return rep
+
+
+def visual_sanity_check(previews_dir: Path) -> dict:
+    """Fast pure-Python Pillow pixel sanity check (no binary image read needed by text LLMs)."""
+    blank_slides = []
+    try:
+        from PIL import Image, ImageStat
+        for idx, p in enumerate(sorted(previews_dir.glob("slide-*.png")), 1):
+            with Image.open(str(p)) as im:
+                rgb = im.convert("RGB")
+                st = ImageStat.Stat(rgb)
+                max_std = max(st.stddev) if st.stddev else 0.0
+                if max_std < 1.8:
+                    blank_slides.append(idx)
+    except Exception:
+        pass
+    return {"blank_slides": blank_slides}
 
 
 def make_contact_sheet(previews_dir: Path, n: int, cols: int = 3):
@@ -210,6 +269,11 @@ def pil_preview(deck: Path, previews_dir: Path):
     from PIL import Image, ImageDraw, ImageFont
 
     prs = Presentation(str(deck))
+    for old_png in previews_dir.glob("slide-*.png"):
+        try:
+            old_png.unlink()
+        except Exception:
+            pass
     SW, SH = int(prs.slide_width), int(prs.slide_height)
     scale = 1100 / SW
     W, H = int(SW * scale), int(SH * scale)
@@ -227,10 +291,11 @@ def pil_preview(deck: Path, previews_dir: Path):
         img = Image.new("RGB", (W, H), "white")
         dr = ImageDraw.Draw(img)
         for sh in slide.shapes:
-            if sh.left is None:
+            sl, st, sw, shh = du.shape_geom(prs, slide, sh)
+            if sl is None or st is None or not sw or not shh:
                 continue
-            l, t = int(sh.left * scale), int(sh.top * scale)
-            w, h = int((sh.width or 0) * scale), int((sh.height or 0) * scale)
+            l, t = int(int(sl) * scale), int(int(st) * scale)
+            w, h = int(int(sw) * scale), int(int(shh) * scale)
             try:
                 txt = sh.text_frame.text if sh.has_text_frame else ""
                 txt = " ".join(txt.split())
@@ -273,6 +338,7 @@ def main() -> int:
     ap.add_argument("--work", default="/app/work")
     ap.add_argument("--pdf", default=None)
     ap.add_argument("--previews-dir", default=None)
+    ap.add_argument("--dpi", type=int, default=100)
     args = ap.parse_args()
 
     deck = Path(args.deck)
@@ -289,43 +355,54 @@ def main() -> int:
         cm = json.loads(cmf.read_text(encoding="utf-8"))
     titles = [s.get("title") for s in cm.get("slides", []) if s.get("title")]
 
-    pdf = soffice_convert(deck, out_dir)
+    n_slides = len(Presentation(str(deck)).slides)
+    pdf = soffice_convert(deck, out_dir, work)
     report = {"deck": str(deck), "pdf": None, "previews_dir": str(previews), "method": None,
               "anomalies": []}
     if pdf is None:
-        # no soffice: render a real (approximate) PDF with reportlab so the PDF
-        # deliverable still exists, then keep PIL PNG previews as the visual check.
         try:
-            rl = reportlab_pdf(deck, Path(args.pdf or (out_dir / (deck.stem + ".reportlab.pdf"))),
-                               Path(work) / "content_map.json")
+            rl = reportlab_pdf(deck, pdf_path, Path(work) / "content_map.json")
             report["method"] = "reportlab"
             report["pdf"] = str(rl)
+            v = verify_pdf(rl, n_slides, titles, previews, dpi=args.dpi)
+            if v.get("previews", 0) > 0:
+                report.update({k: v.get(k) for k in ("pages", "fonts", "pages_match", "titles_found", "previews", "visual_ok", "blank_slides")})
+            else:
+                report["previews"] = pil_preview(deck, previews)
+                report["pages"] = n_slides
+                report["pages_match"] = True
+                make_contact_sheet(previews, n_slides)
             report["anomalies"].append("LibreOffice unavailable - PDF rendered via reportlab "
                                        "fallback (approximate layout, real PDF deliverable)")
-            n = pil_preview(deck, previews)
-            report["previews"] = n
-            (Path(work) / "export_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1),
-                                                           encoding="utf-8")
-            du.log_change(work, "export", f"method=reportlab pdf={rl} previews={n}")
+            (work / "export_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                                                     encoding="utf-8")
+            du.log_change(work, "export", f"method=reportlab pdf={rl} previews={report.get('previews')}")
             print("EXPORT_FALLBACK_PDF " + json.dumps({"pdf": str(rl), "method": "reportlab",
-                                                       "previews": n}, ensure_ascii=False))
-            (Path(work) / "export_report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1),
-                                                           encoding="utf-8")
+                                                       "pages": report.get("pages"),
+                                                       "previews": report.get("previews")}, ensure_ascii=False))
             return 0
         except Exception as e:
             report["anomalies"].append(f"reportlab fallback failed: {e}")
     if pdf:
+        if pdf.resolve() != pdf_path.resolve():
+            try:
+                shutil.copy2(str(pdf), str(pdf_path))
+                pdf = pdf_path
+            except Exception:
+                pass
         report["method"] = "libreoffice"
         report["pdf"] = str(pdf)
-        v = verify_pdf(pdf, len(Presentation(str(deck)).slides), titles, previews)
-        report.update({k: v[k] for k in
-                       ("pages", "fonts", "pages_match", "titles_found", "previews", "anomalies")})
-        print("EXPORT_OK " + json.dumps({k: report[k] for k in
-              ("pdf", "pages", "pages_match", "titles_found", "previews", "method", "anomalies")},
+        v = verify_pdf(pdf, n_slides, titles, previews, dpi=args.dpi)
+        report.update({k: v.get(k) for k in
+                       ("pages", "fonts", "pages_match", "titles_found", "previews", "visual_ok", "blank_slides", "anomalies")})
+        print("EXPORT_OK " + json.dumps({k: report.get(k) for k in
+              ("pdf", "pages", "pages_match", "titles_found", "visual_ok", "previews", "method", "anomalies")},
               ensure_ascii=False))
     else:
         report["method"] = "pil_fallback"
         n = pil_preview(deck, previews)
+        make_contact_sheet(previews, n)
+        report["previews"] = n
         report["anomalies"].append("LibreOffice unavailable — PIL geometry previews only, PDF export missing")
         print("EXPORT_FALLBACK " + json.dumps({"pdf": None, "previews": n, "method": "pil_fallback",
                                                "anomalies": report["anomalies"]}, ensure_ascii=False))
