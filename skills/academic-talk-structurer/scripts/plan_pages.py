@@ -134,6 +134,33 @@ def classify(audience_text):
     return best_name
 
 
+def parse_task_md_fallbacks(case_path: Path):
+    """Extract fallback (audience_hint, duration_minutes, lo_slides, hi_slides) from sibling task.md."""
+    import re
+    tmd = case_path.parent / "task.md"
+    if not tmd.exists():
+        return "", None, 0, 0
+    txt = tmd.read_text(encoding="utf-8", errors="ignore")[:12000]
+    m_aud = re.search(r"(?:target\s+)?(?:audience|listener|受众|听众)\s*[:：]\s*([^\n]+)", txt, re.I)
+    aud_hint = m_aud.group(1).strip() if m_aud else txt
+    dur = None
+    m_dur = re.search(r"(\d+(?:\.\d+)?)\s*[-]?\s*(?:min(?:ute)?s?|分钟)", txt, re.I)
+    if m_dur:
+        try:
+            dur = float(m_dur.group(1))
+        except ValueError:
+            dur = None
+    lo = hi = 0
+    m_rng = re.search(r"(\d{1,2})\s*[-–~]\s*(\d{1,2})\s*(?:slides?|页|张)", txt, re.I)
+    if m_rng and 2 <= int(m_rng.group(1)) <= int(m_rng.group(2)) <= 40:
+        lo, hi = int(m_rng.group(1)), int(m_rng.group(2))
+    else:
+        m_one = re.search(r"(\d{1,2})\s*[-]?\s*(?:slides?|页|张)", txt, re.I)
+        if m_one and 2 <= int(m_one.group(1)) <= 40:
+            lo = hi = int(m_one.group(1))
+    return aud_hint, dur, lo, hi
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("mode", choices=["plan", "check"])
@@ -143,18 +170,22 @@ def main():
     ap.add_argument("--out")
     ap.add_argument("--justif", help='justification json keyed by issue: {"share[method]":"...","slide_count":"..."}')
     a = ap.parse_args()
-    case = json.loads(Path(a.case).read_text(encoding="utf-8")) if Path(a.case).exists() else {}
+    cpath = Path(a.case)
+    case = json.loads(cpath.read_text(encoding="utf-8")) if cpath.exists() else {}
+    tmd_text, tmd_dur, tmd_lo, tmd_hi = parse_task_md_fallbacks(cpath)
     aud_raw = find_nested(case, ["audience", "audience_profile", "target_audience", "task", "presentation_type"]) or ""
     if isinstance(aud_raw, dict):
         aud_raw = json.dumps(aud_raw, ensure_ascii=False)
-    aud = classify(str(aud_raw))
+    aud = classify(str(aud_raw) if str(aud_raw).strip() else tmd_text)
     cfg = AUDIENCE[aud]
     dur_raw = find_nested(case, ["duration_minutes", "duration", "minutes", "time_limit_minutes"])
     try:
-        minutes = float(dur_raw) if dur_raw is not None else 10.0
+        minutes = float(dur_raw) if dur_raw is not None else (tmd_dur if tmd_dur is not None else 10.0)
     except (TypeError, ValueError):
-        minutes = 10.0
+        minutes = tmd_dur if tmd_dur is not None else 10.0
     lo_slides, hi_slides = parse_slide_bounds(case)
+    if not lo_slides and not hi_slides and (tmd_lo or tmd_hi):
+        lo_slides, hi_slides = tmd_lo, tmd_hi
     total = hi_slides or lo_slides
 
     spec = json.loads(Path(a.spec).read_text(encoding="utf-8")) if (a.spec and Path(a.spec).exists()) else None

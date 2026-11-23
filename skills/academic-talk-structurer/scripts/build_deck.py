@@ -841,6 +841,15 @@ def main():
         fr.font.size = Pt(9.5)
         fr.font.color.rgb = RGBColor(*text_muted)
         apply_font(fr, text)
+        if mode == "no_template":
+            try:
+                fdiv = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, fl, int(foot_y - Inches(0.05)), fw, Inches(0.012))
+                fdiv.fill.solid()
+                fdiv.fill.fore_color.rgb = RGBColor(*card_border)
+                fdiv.line.fill.background()
+                strip_shadow(fdiv)
+            except Exception:
+                pass
 
     def add_kpis(slide, kpis, top_y, frame=None, clear_old=False):
         """Render 2-4 compact metric highlight cards across top band; returns bottom EMU."""
@@ -855,15 +864,15 @@ def main():
         card_w = int((total_w - gap * (n - 1)) / n)
         w_pt_est = max(72.0, (card_w - Inches(0.28)) / EMU_IN * 72.0)
         # Fit value & label font sizes cleanly so KPI cards NEVER overflow even with 4 cards on 4:3
-        val_sz = 20.5 if n <= 3 else 17.5
-        lbl_sz = 11.0 if n <= 3 else 10.0
-        need_h_in = 0.96
+        val_sz = 22.5 if n <= 3 else 18.5
+        lbl_sz = 11.2 if n <= 3 else 10.0
+        need_h_in = 1.04
         for k in items:
             vtxt = str(k.get("value", ""))
             dtxt = str(k.get("delta", "") or "")
             ltxt = str(k.get("label", "") or "")
             best_k = 13.5
-            for cand in (val_sz, 17.5, 15.5, 13.5):
+            for cand in (val_sz, 20.0, 17.5, 15.5, 13.5):
                 if cand > val_sz:
                     continue
                 used = char_units(vtxt) * cand + (char_units(f"  {dtxt}") * 12.0 if dtxt else 0.0)
@@ -876,12 +885,12 @@ def main():
                 if lc > lbl_sz:
                     continue
                 l_lines = max(1, math.ceil(char_units(ltxt) * lc / w_pt_est)) if ltxt else 0
-                est_in = (v_lines * val_sz * 1.28 + l_lines * lc * 1.30 + 16.0) / 72.0 + 0.16
-                if est_in <= 1.20 or lc == 8.8:
+                est_in = (v_lines * val_sz * 1.28 + l_lines * lc * 1.30 + 18.0) / 72.0 + 0.18
+                if est_in <= 1.26 or lc == 8.8:
                     lbl_sz = min(lbl_sz, lc)
                     need_h_in = max(need_h_in, est_in)
                     break
-        card_h = int(Inches(min(1.24, max(0.96, need_h_in))))
+        card_h = int(Inches(min(1.28, max(1.04, need_h_in))))
         y = int(top_y + Inches(0.10))
         if clear_old:
             clear_overlapping_visuals(slide, (fl, y, fw, card_h))
@@ -947,7 +956,7 @@ def main():
         card_w = int((total_w - gap * (n - 1)) / n)
         y = int(top_y + Inches(0.14))
         max_bot = foot_y - Inches(0.16)
-        avail_h = int(max(Inches(1.55), (max_bot - y) if not has_below else min(Inches(2.35), (max_bot - y) * 0.52)))
+        avail_h = int(max(Inches(1.42), (max_bot - y) if not has_below else min(Inches(1.92), (max_bot - y) * 0.42)))
         w_pt_est = max(72.0, (card_w - Inches(0.32)) / EMU_IN * 72.0)
 
         def est_step_in(ts, ds):
@@ -969,8 +978,8 @@ def main():
             if ni <= avail_in * 0.96:
                 t_sz, d_sz, need_max_in = ts_c, ds_c, ni
                 break
-        min_stand_in = 1.85 if not has_below else 1.55
-        cap_h = int(Inches(min(3.30, max(min_stand_in, need_max_in + (0.20 if not has_below else 0.0)))))
+        min_stand_in = 1.90 if not has_below else 1.40
+        cap_h = int(Inches(min(3.30 if not has_below else 1.92, max(min_stand_in, need_max_in + (0.20 if not has_below else 0.0)))))
         card_h = int(min(avail_h, cap_h))
         # Optical vertical balance when steps are the standalone body of the slide
         if not has_below and avail_h > card_h + Inches(0.50):
@@ -1107,9 +1116,9 @@ def main():
                 lines = max(1, math.ceil(char_units(f"•  {txt}") * 16.0 / w_pt_est))
                 pts += lines * 16.0 * 1.32 + 9.0
             need_col_in = max(need_col_in, pts / 72.0 + 0.65)
-        col_h = int(min(max_col_h, Inches(need_col_in)))
-        if max_col_h > col_h + Inches(0.50):
-            y = int(y + min(Inches(0.60), (max_col_h - col_h) * 0.25))
+        col_h = int(min(max_col_h, max(Inches(2.85), Inches(need_col_in + 0.25))))
+        if max_col_h > col_h + Inches(0.40):
+            y = int(y + min(Inches(0.55), (max_col_h - col_h) * 0.28))
         if clear_old:
             clear_overlapping_visuals(slide, (fl, y, fw, col_h))
         bar_h = Inches(0.08)
@@ -1402,35 +1411,46 @@ def main():
         ncols = len(headers) or max((len(r) for r in rows), default=1) or 1
         nrows = len(rows) + (1 if headers else 0)
         all_rows = ([headers] if headers else []) + list(rows)
-        # Proportional column widths from actual text width so headers/metrics never break mid-word
+        # Proportional column widths with unbroken-word floor so headers/metrics never break mid-word
+        def _max_word_units(s_val):
+            ws = re.findall(r"[A-Za-z0-9%./+\-−]+", str(s_val or ""))
+            return max((char_units(tok) for tok in ws if len(tok) <= 14), default=0.0)
+
         col_weights = []
+        col_word_floors = []
         for ci in range(ncols):
             mx = max((char_units(str(r[ci])) if ci < len(r) else 0.0) for r in all_rows)
-            col_weights.append(max(3.5, min(18.0, mx + 1.8)))
+            mw = max((_max_word_units(r[ci]) if ci < len(r) else 0.0) for r in all_rows)
+            col_word_floors.append(mw)
+            col_weights.append(max(3.8, mw * 1.35 + 1.6, min(18.0, mx + 1.8)))
         w_sum = sum(col_weights) or 1.0
         col_widths = [int(w * (cw / w_sum)) for cw in col_weights]
         if col_widths:
             col_widths[0] += int(w - sum(col_widths))
 
-        # Auto-shrink table fonts so total wrapped height NEVER overflows box h into caption/footer
+        # Auto-shrink table fonts so total wrapped height NEVER overflows box h AND header words never break mid-word
         def est_rows(hp, cp):
             rhs = []
+            word_breaks = False
             for r_idx, r_vals in enumerate(all_rows):
-                pt_sz = hp if (headers and r_idx == 0) else cp
+                is_h = bool(headers and r_idx == 0)
+                pt_sz = hp if is_h else cp
                 max_lines = 1
                 for ci in range(ncols):
                     txt = str(r_vals[ci]) if ci < len(r_vals) else ""
-                    cw_pt = max(34.0, (col_widths[ci] - Inches(0.16)) / EMU_IN * 72.0)
+                    cw_pt = max(34.0, (col_widths[ci] - Inches(0.18)) / EMU_IN * 72.0)
+                    if is_h and _max_word_units(txt) * (pt_sz * 1.08) > cw_pt:
+                        word_breaks = True
                     lines = max(1, math.ceil(char_units(txt) * pt_sz / cw_pt))
                     max_lines = max(max_lines, lines)
-                rhs.append(int(max(Inches(0.32), Inches(max_lines * (pt_sz * 1.36 / 72.0) + 0.12))))
-            return rhs
+                rhs.append(int(max(Inches(0.36), Inches(max_lines * (pt_sz * 1.38 / 72.0) + 0.14))))
+            return rhs, word_breaks
 
         hdr_pt, cell_pt = 10.0, 9.0
-        row_heights = est_rows(hdr_pt, cell_pt)
-        for hp, cp in ((12.5, 11.5), (11.5, 10.5), (10.5, 9.5), (9.5, 8.8)):
-            cand_rh = est_rows(hp, cp)
-            if sum(cand_rh) <= h:
+        row_heights, _ = est_rows(hdr_pt, cell_pt)
+        for hp, cp in ((13.5, 12.5), (12.5, 11.5), (11.5, 10.5), (10.5, 9.5), (9.5, 8.8)):
+            cand_rh, wb = est_rows(hp, cp)
+            if sum(cand_rh) <= h and (not wb or hp <= 9.5):
                 hdr_pt, cell_pt, row_heights = hp, cp, cand_rh
                 break
         if sum(row_heights) > h and sum(row_heights) > 0:
@@ -1440,8 +1460,8 @@ def main():
         tbl_h = min(h, sum(row_heights))
         # Optical vertical balance when a compact table sits in a tall region (avoid top-heavy dead void)
         tp_eff = tp
-        if region in ("full", "right") and tbl_h < int(h * 0.68):
-            tp_eff = int(tp + min(Inches(0.42), int((h - tbl_h) * 0.20)))
+        if region in ("full", "right") and tbl_h < int(h * 0.72):
+            tp_eff = int(tp + min(Inches(0.55), int((h - tbl_h) * 0.26)))
         gshape = slide.shapes.add_table(nrows, ncols, l, tp_eff, w, tbl_h)
         gt = gshape.table
         for ci, cw in enumerate(col_widths):

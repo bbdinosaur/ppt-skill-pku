@@ -10,7 +10,8 @@
 | check_layout.py [--plan] | 越界/溢出/重叠(含表格/图表)/图片拉伸 + 建议级告警：低DPI(<90)/原始LaTeX与乱码/双语讲稿长度/总时长/泛化或重复标题/标题与主张雷同/文字墙密度/主张过长/S3夸大/S1定量校准/无视觉组件/空目标与取舍 | 存在硬布局或讲稿硬错 | 删内容不强缩；补讲稿至 ≥35 语速单位；按建议告警精修视觉与措辞 |
 | check_numbers.py | 全页(含表格/图表/卡片)数字能否在源文本+补充文件+`paper_tables.json` 精确 token 溯源（含 `10^k`/PDF Unicode `10⁻⁴`/`10−3` 科学计数、`thousand`/`million`/`billion`、`min↔s`/`ms↔s`/`GB↔MB`/`KB↔MB`/`TB↔GB`/`µs↔ms`/`hr↔min`、`pp`/百分点、分类型衍生差值/倍率/相对降幅）；同步对 `qa_plan.json` 回答要点做建议级数值口径核验 | 存在不可溯源数字 | 改回源值 / 降级 S3+uncertainty / 白名单 |
 | check_evidence.py | Fig/Tab/Sec/§/Slide/页码/补充文件名 locator 校验（Eq/Alg/Appendix 编号差异与模糊定位为建议告警，防 LaTeX 数学字体断行误报） | 悬空引用 | 必须修复：改 locator 或删引用，禁止豁免 |
-| plan_pages.py check | 受众配比（容差 max(10%, 0.55/内容页数)）/qa 备用页/页数一致 | 配比偏差 | 调整 spec 或 justification 豁免 |
+| plan_pages.py check | 受众配比（支持 `task.md` 约束兜底，容差 max(12%, 1.15/内容页数)）/qa 备用页/页数一致 | 配比偏差 | 调整 spec 或 justification 豁免 |
+| audit_talk.py | 渲染 PNG 像素审计（空白页/过密/边缘截断）+ 语义审计（连续纯文字页/漏用清晰原图或表/无数字结果主张/短讲稿/问答维度与定位） | 仅建议级（永不阻断，exit 0） | 结合 `== POLISH OPPORTUNITIES ==` 执行 1 轮定点精修 |
 
 ## 2. 数字白名单（number_allow.json）
 格式：`[{"value":"5.5","reason":"derived from Table 2: 75.2-69.7"}]`

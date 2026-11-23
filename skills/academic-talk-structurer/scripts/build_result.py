@@ -214,6 +214,7 @@ def main():
     numchk = load("number_check.json")
     evchk = load("evidence_check.json")
     budchk = load("budget_check.json")
+    qaud = load("quality_audit.json")
     changes = load("changes.json") or ["v1: initial build per SKILL.md pipeline"]
 
     outdir = out.parent
@@ -487,12 +488,33 @@ def main():
                 f"added={starting_deck_diff['added']}, pruned={starting_deck_diff['pruned_orig_slides']}."
             )
 
+    auto_goal = fill.get("report_goal") or plan_meta.get("goal")
+    if not auto_goal:
+        # Synthesize honest default verifiable objective from audience + headline claim if omitted
+        headline = next((s.get("claim") for s in (plan.get("slides") or []) if s.get("role") in ("result", "conclusion", "title") and s.get("claim")), "")
+        if headline:
+            auto_goal = f"Deliver an evidence-bound talk for {audience_adaptation['audience']} demonstrating: {str(headline)[:140]}"
+
+    qaud_summary = None
+    if isinstance(qaud, dict):
+        pa = qaud.get("pixel_audit") or {}
+        ea = qaud.get("editorial_audit") or {}
+        qaud_summary = {
+            "pixel_check_ran": bool(pa.get("ran")),
+            "pixel_slides_checked": pa.get("slides_checked", 0),
+            "mean_body_ink_pct": pa.get("mean_ink_pct"),
+            "pixel_flags": pa.get("flags") or [],
+            "max_bullet_only_streak": ea.get("max_bullet_only_streak", 0),
+            "unused_clean_figures": ea.get("unused_clean_figures") or [],
+            "polish_opportunities": qaud.get("top_polish_opportunities") or [],
+        }
+
     result = {
         "case_id": case_id,
         "status": status,
         "sources": collect_sources(case_path, inspect, plan_meta, ingest),
         "deliverables": deliver,
-        "report_goal": fill.get("report_goal") or plan_meta.get("goal"),
+        "report_goal": auto_goal,
         "audience": audience_adaptation["audience"],
         "audience_adaptation": audience_adaptation,
         "tradeoffs": raw_tradeoffs,
@@ -511,6 +533,7 @@ def main():
             "qa_numeric_advisories": len(qa_num_adv),
         },
         "rendering": rendering,
+        "quality_audit": qaud_summary,
         "uncertainty": auto_uncertainty,
         "changes": fill.get("changes", changes),
         "limits": auto_limits,

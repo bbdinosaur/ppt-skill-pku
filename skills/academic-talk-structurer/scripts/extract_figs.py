@@ -26,7 +26,7 @@ CAPTION_RE = re.compile(
 )
 
 SECTION_RE = re.compile(
-    r"^\s*((?:\d+(?:\.\d+)?|[IVX]+)\.?\s+[A-Z\u4e00-\u9fff][^\n]{2,65}|(?:Abstract|Introduction|Related\s+Work|Method(?:ology)?|Experiments?|Results?|Discussion|Limitations?|Conclusion(?:s)?|摘要|引言|相关工作|方法|实验|结果|讨论|局限|结论)\s*$)",
+    r"^\s*((?:\d+(?:\.\d+)*|[IVX]+(?:-[A-Z])?|[A-H]\.)\.?\s+[A-Z\u4e00-\u9fff][^\n]{2,68}|(?:Abstract|Main|Background|Introduction|Related\s+Work|Problem\s+(?:Formulation|Statement)|Method(?:ology|s)?|Approach|Architecture|Experimental\s+Setup|Experiments?|Evaluation|Results?(?:\s+and\s+Discussion)?|Ablation(?:\s+Stud(?:y|ies))?|Discussion|Limitations?(?:\s+and\s+Conclusion)?|Threats\s+to\s+Validity|Conclusion(?:s)?|Extended\s+Data|摘要|引言|背景|相关工作|问题定义|方法|实验设置|实验|结果|消融|讨论|局限|结论)\s*$)",
     re.IGNORECASE,
 )
 
@@ -104,7 +104,7 @@ def dump_text_fallback(pdf_path: str, text_path: Path):
 
 
 def find_vector_crop(page, cap):
-    """Find tight clip rect for a vector figure (above Fig caption) or table (below Table caption)."""
+    """Find tight clip rect for a vector figure (above or below caption) or table (below Table caption)."""
     pr = page.rect
     pw, ph = pr.width, pr.height
     drawings = []
@@ -124,17 +124,6 @@ def find_vector_crop(page, cap):
     if not drawings:
         return None
 
-    # search window: above figure caption, or below table caption (within ~55% of page height)
-    if cap["kind"] == "figure":
-        win_y0 = max(pr.y0 + 18, cap["y0"] - ph * 0.58)
-        win_y1 = cap["y0"] - 1
-    else:
-        win_y0 = cap["y1"] + 1
-        win_y1 = min(pr.y1 - 18, cap["y1"] + ph * 0.48)
-    if win_y1 - win_y0 < 35:
-        return None
-
-    # determine column span: full-width if wide caption, centered caption, single-column page, or drawings cross midline
     cap_w = cap["x1"] - cap["x0"]
     mid = pw / 2.0
     cap_cx = 0.5 * (cap["x0"] + cap["x1"])
@@ -147,78 +136,91 @@ def find_vector_crop(page, cap):
         is_single_col_page = wide_blocks >= 2
     except Exception:
         pass
-    band_drawings = [r for r in drawings if r.y1 >= win_y0 and r.y0 <= win_y1]
-    band_crosses_mid = any(r.x0 < pw * 0.44 and r.x1 > pw * 0.56 for r in band_drawings) or (
-        any(r.x1 < mid for r in band_drawings) and any(r.x0 > mid for r in band_drawings) and abs(cap_cx - mid) < pw * 0.16
-    )
-    if cap_w > pw * 0.50 or abs(cap_cx - mid) < pw * 0.14 or is_single_col_page or band_crosses_mid:
-        col_x0, col_x1 = pr.x0 + 8, pr.x1 - 8
-    elif cap_cx < mid:
-        col_x0, col_x1 = pr.x0 + 8, mid + 18
-    else:
-        col_x0, col_x1 = mid - 18, pr.x1 - 8
 
-    cand = []
-    for r in drawings:
-        if r.x1 < col_x0 or r.x0 > col_x1:
-            continue
-        if r.y1 < win_y0 or r.y0 > win_y1:
-            continue
-        cand.append(r)
-    if not cand:
-        return None
+    def _search_direction(direction):
+        if direction == "above":
+            win_y0 = max(pr.y0 + 18, cap["y0"] - ph * 0.58)
+            win_y1 = cap["y0"] - 1
+        else:
+            win_y0 = cap["y1"] + 1
+            win_y1 = min(pr.y1 - 18, cap["y1"] + ph * 0.52)
+        if win_y1 - win_y0 < 35:
+            return None
+        band_drawings = [r for r in drawings if r.y1 >= win_y0 and r.y0 <= win_y1]
+        band_crosses_mid = any(r.x0 < pw * 0.44 and r.x1 > pw * 0.56 for r in band_drawings) or (
+            any(r.x1 < mid for r in band_drawings) and any(r.x0 > mid for r in band_drawings) and abs(cap_cx - mid) < pw * 0.16
+        )
+        if cap_w > pw * 0.50 or abs(cap_cx - mid) < pw * 0.14 or is_single_col_page or band_crosses_mid:
+            col_x0, col_x1 = pr.x0 + 8, pr.x1 - 8
+        elif cap_cx < mid:
+            col_x0, col_x1 = pr.x0 + 8, mid + 18
+        else:
+            col_x0, col_x1 = mid - 18, pr.x1 - 8
 
-    # cluster drawings contiguous with the caption (stop at large vertical gaps > 36pt)
+        cand = [r for r in drawings if not (r.x1 < col_x0 or r.x0 > col_x1 or r.y1 < win_y0 or r.y0 > win_y1)]
+        if not cand:
+            return None
+
+        if direction == "above":
+            cand.sort(key=lambda r: -r.y1)
+            cur_top = cap["y0"]
+            kept = []
+            for r in cand:
+                if cur_top - r.y1 > 48 and kept:
+                    break
+                if not kept and cur_top - r.y1 > 95:
+                    return None
+                kept.append(r)
+                cur_top = min(cur_top, r.y0)
+        else:
+            cand.sort(key=lambda r: r.y0)
+            cur_bot = cap["y1"]
+            kept = []
+            for r in cand:
+                if r.y0 - cur_bot > 48 and kept:
+                    break
+                if not kept and r.y0 - cur_bot > 95:
+                    return None
+                kept.append(r)
+                cur_bot = max(cur_bot, r.y1)
+        if not kept:
+            return None
+        x0 = min(r.x0 for r in kept)
+        y0 = min(r.y0 for r in kept)
+        x1 = max(r.x1 for r in kept)
+        y1 = max(r.y1 for r in kept)
+
+        # include axis labels / legend text blocks overlapping or tightly adjacent to drawing cluster
+        for b in page.get_text("blocks"):
+            if len(b) < 5 or (len(b) >= 7 and b[6] != 0):
+                continue
+            bx0, by0, bx1, by1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            if abs(by0 - cap["y0"]) < 3 and abs(bx0 - cap["x0"]) < 10:
+                continue
+            if direction == "above" and by1 > cap["y0"] - 1:
+                continue
+            if direction == "below" and by0 < cap["y1"] + 1:
+                continue
+            if bx1 >= x0 - 40 and bx0 <= x1 + 32 and by1 >= y0 - 18 and by0 <= y1 + 22:
+                txt = " ".join((b[4] or "").split())
+                if txt and len(txt) <= 120 and (bx1 - bx0) <= (x1 - x0) + 70 and not (txt.endswith((".", "。")) and len(txt) > 45):
+                    x0, y0 = min(x0, bx0), min(y0, by0)
+                    x1, y1 = max(x1, bx1), max(y1, by1)
+
+        if (x1 - x0) < 70 or (y1 - y0) < 45:
+            return None
+        pad = 8.0
+        return [
+            max(pr.x0, x0 - pad),
+            max(pr.y0, y0 - pad),
+            min(pr.x1, x1 + pad),
+            min(pr.y1, y1 + pad),
+        ]
+
     if cap["kind"] == "figure":
-        cand.sort(key=lambda r: -r.y1)
-        cur_top = cap["y0"]
-        kept = []
-        for r in cand:
-            if cur_top - r.y1 > 48 and kept:
-                break
-            kept.append(r)
-            cur_top = min(cur_top, r.y0)
-    else:
-        cand.sort(key=lambda r: r.y0)
-        cur_bot = cap["y1"]
-        kept = []
-        for r in cand:
-            if r.y0 - cur_bot > 48 and kept:
-                break
-            kept.append(r)
-            cur_bot = max(cur_bot, r.y1)
-
-    if not kept:
-        return None
-    x0 = min(r.x0 for r in kept)
-    y0 = min(r.y0 for r in kept)
-    x1 = max(r.x1 for r in kept)
-    y1 = max(r.y1 for r in kept)
-
-    # include axis labels / legend text blocks overlapping or tightly adjacent to drawing cluster
-    for b in page.get_text("blocks"):
-        if len(b) < 5 or (len(b) >= 7 and b[6] != 0):
-            continue
-        bx0, by0, bx1, by1 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
-        # skip the caption itself and distant body paragraphs
-        if abs(by0 - cap["y0"]) < 3 and abs(bx0 - cap["x0"]) < 10:
-            continue
-        if bx1 >= x0 - 40 and bx0 <= x1 + 32 and by1 >= y0 - 18 and by0 <= min(cap["y0"] - 1, y1 + 22):
-            # only absorb short chart labels/ticks/legends (avoid grabbing a body paragraph)
-            txt = " ".join((b[4] or "").split())
-            if txt and len(txt) <= 120 and (bx1 - bx0) <= (x1 - x0) + 70 and not (txt.endswith((".", "。")) and len(txt) > 45):
-                x0, y0 = min(x0, bx0), min(y0, by0)
-                x1, y1 = max(x1, bx1), max(y1, by1)
-
-    if (x1 - x0) < 70 or (y1 - y0) < 45:
-        return None
-    pad = 8.0
-    return [
-        max(pr.x0, x0 - pad),
-        max(pr.y0, y0 - pad),
-        min(pr.x1, x1 + pad),
-        min(pr.y1, y1 + pad),
-    ]
+        res = _search_direction("above")
+        return res if res is not None else _search_direction("below")
+    return _search_direction("below")
 
 
 def build_paper_outline(doc):
@@ -582,7 +584,7 @@ def main():
     ap.add_argument("--text", help="optional path to dump full page-marked text (e.g. /app/work/paper.txt)")
     ap.add_argument("--outline", help="optional path to save paper_outline.json (default: sibling of --text)")
     ap.add_argument("--tables", help="optional path to save paper_tables.json (default: sibling of --text)")
-    ap.add_argument("--max-pages", type=int, default=8)
+    ap.add_argument("--max-pages", type=int, default=14)
     ap.add_argument("--min-px", type=int, default=140)
     a = ap.parse_args()
     out = Path(a.out)
@@ -696,11 +698,24 @@ def main():
                 xref_i, smask_i, r_only = items[0]
                 if page_drawings is None:
                     try:
-                        page_drawings = [d["rect"] for d in page.get_drawings() if d.get("rect")]
+                        page_drawings = [
+                            d["rect"] for d in page.get_drawings()
+                            if d.get("rect") and not (d["rect"].width > pr.width * 0.94 and d["rect"].height > pr.height * 0.90)
+                        ]
                     except Exception:
                         page_drawings = []
                 ov_draw = sum(1 for dr in page_drawings if dr.intersects(r_only) and (dr.width > 8 or dr.height > 8))
-                if ov_draw < 6:
+                # Also detect adjacent sibling vector panel in the same horizontal figure band (e.g. Panel A raster + Panel B vector plot)
+                adj_vec = [
+                    dr for dr in page_drawings
+                    if (dr.width > 10 or dr.height > 10)
+                    and dr.y0 >= r_only.y0 - 24 and dr.y1 <= r_only.y1 + 24
+                    and not dr.intersects(r_only)
+                    and (dr.x0 >= r_only.x1 - 4 or dr.x1 <= r_only.x0 + 4)
+                    and (cap["y0"] >= r_only.y1 - 4 and dr.y1 <= cap["y0"] - 1 or cap["y1"] <= r_only.y0 + 4 and dr.y0 >= cap["y1"] + 1)
+                ]
+                has_sibling_vector_panel = len(adj_vec) >= 4 and (max(d.x1 for d in adj_vec) - min(d.x0 for d in adj_vec)) >= 60
+                if ov_draw < 6 and not has_sibling_vector_panel:
                     try:
                         cand_px = _extract_native_pixmap(xref_i, smask_i)
                         if cand_px.width >= a.min_px and cand_px.height >= a.min_px // 2:
@@ -708,6 +723,9 @@ def main():
                             crop = [r_only.x0, r_only.y0, r_only.x1, r_only.y1]
                     except Exception:
                         pix = None
+                elif has_sibling_vector_panel:
+                    rs = list(rs) + adj_vec
+                    method_tag = "raster_composite"
             if pix is None:
                 ux0 = min(r.x0 for r in rs)
                 uy0 = min(r.y0 for r in rs)

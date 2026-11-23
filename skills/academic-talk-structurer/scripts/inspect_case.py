@@ -191,12 +191,30 @@ def main():
     rep = {"case_path": str(cpath), "case_keys": list(case.keys()) if isinstance(case, dict) else []}
     rep["constraints_digest"] = extract_constraints_digest(case)
 
-    # check sibling task.md so S0 sees task instructions in one call
+    # check sibling task.md so S0 sees full task instructions & fallback constraints in one call
     task_md = cpath.parent / "task.md"
     if task_md.exists():
+        import re as _re_t
         t_txt = task_md.read_text(encoding="utf-8", errors="ignore")
         rep["task_md_path"] = str(task_md)
-        rep["task_md_preview"] = t_txt[:2000]
+        rep["task_md_preview"] = t_txt[:6000]
+        # Supplement missing constraints from task.md (never overriding explicit case.json keys)
+        cd = rep["constraints_digest"]
+        if "duration_minutes" not in cd:
+            md_dur = _re_t.search(r"(\d+(?:\.\d+)?)\s*(?:[-–]?\s*(?:min(?:ute)?s?|分钟))", t_txt, _re_t.I)
+            if md_dur:
+                cd["duration_minutes"] = [{"path": "task.md", "value": float(md_dur.group(1)) if "." in md_dur.group(1) else int(md_dur.group(1))}]
+        if "slide_count" not in cd:
+            md_rng = _re_t.search(r"(\d{1,2})\s*[-–~]\s*(\d{1,2})\s*(?:slides?|页|张)", t_txt, _re_t.I)
+            md_one = _re_t.search(r"(\d{1,2})\s*[-]?\s*(?:slides?|页|张)", t_txt, _re_t.I)
+            if md_rng and 2 <= int(md_rng.group(1)) <= int(md_rng.group(2)) <= 40:
+                cd["slide_count"] = [{"path": "task.md", "value": f"{md_rng.group(1)}-{md_rng.group(2)}"}]
+            elif md_one and 2 <= int(md_one.group(1)) <= 40:
+                cd["slide_count"] = [{"path": "task.md", "value": int(md_one.group(1))}]
+        if "output_file" not in cd:
+            md_out = _re_t.findall(r"(?:/app/output/|output/)([A-Za-z0-9_.\-]+\.(?:pptx|json|md))", t_txt)
+            if md_out:
+                cd["output_file"] = [{"path": "task.md", "value": f"/app/output/{x}"} for x in list(dict.fromkeys(md_out))[:3]]
 
     # output contract (verbatim so agent sees exact required fields)
     rep["contract_hits"] = [

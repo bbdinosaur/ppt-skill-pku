@@ -212,7 +212,15 @@ def main():
     results.append(("check_numbers+ev (sci+unit+qa)", r_num.returncode == 1 and r_num_ok.returncode == 0 and r_ev_ok.returncode == 0 and qa_caught,
                     (r_num.stdout + r_num_ok.stdout + r_ev_ok.stdout).strip()[-140:]))
 
-    # 7) result assembly + soffice availability
+    # 7) audit_talk + result assembly + soffice availability
+    r_aud = run([str(HERE / "audit_talk.py"), "--work", str(pipe_dir / "work"), "--out-dir", str(pipe_dir / "out"),
+                 "--spec", str(pipe_dir / "work" / "deck_spec.json"), "--out", str(pipe_dir / "work" / "quality_audit.json")])
+    aud_ok = (r_aud.returncode == 0 and (pipe_dir / "work" / "quality_audit.json").exists())
+    if aud_ok:
+        qa_j = json.loads((pipe_dir / "work" / "quality_audit.json").read_text(encoding="utf-8"))
+        aud_ok = "editorial_audit" in qa_j and "pixel_audit" in qa_j
+    results.append(("audit_talk (pixel+editorial)", aud_ok, (r_aud.stdout + r_aud.stderr).strip()[-120:]))
+
     (tmp / "qa_plan.json").write_text("[]", encoding="utf-8")
     r = run([str(HERE / "build_result.py"), "--work", str(tmp), "--out", str(tmp / "result.json")])
     ok = r.returncode == 0 and (tmp / "result.json").exists()

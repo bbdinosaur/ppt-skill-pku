@@ -91,10 +91,10 @@ def resolve_pptx_roles(case: dict, inspect: dict, case_dir: Path):
     return mode, starting_deck, template
 
 
-def resolve_output_names(case: dict):
-    """Infer target deck filename and result filename from case.json / output_contract."""
-    deck_name = "talk.pptx"
-    result_name = "result.json"
+def resolve_output_names(case: dict, task_md_path: Path = None):
+    """Infer target deck filename and result filename from case.json / output_contract / task.md."""
+    deck_name = None
+    result_name = None
     for path_k, k, v in walk_kv(case):
         if not isinstance(v, str):
             continue
@@ -102,10 +102,20 @@ def resolve_output_names(case: dict):
         vl = v.lower()
         is_out_ctx = any(w in pl for w in ("output", "contract", "deliver", "target", "result", "deck_path", "pptx_path")) or "/output/" in vl
         if is_out_ctx and vl.endswith(".pptx"):
-            deck_name = Path(v).name
+            deck_name = deck_name or Path(v).name
         elif is_out_ctx and vl.endswith(".json") and "case" not in Path(v).name.lower():
-            result_name = Path(v).name
-    return deck_name, result_name
+            result_name = result_name or Path(v).name
+    if (not deck_name or not result_name) and task_md_path and task_md_path.exists():
+        t_txt = task_md_path.read_text(encoding="utf-8", errors="ignore")
+        if not deck_name:
+            mp = re.search(r"(?:/app/output/|output/)([A-Za-z0-9_.\-]+\.pptx)", t_txt)
+            if mp:
+                deck_name = mp.group(1)
+        if not result_name:
+            mj = re.search(r"(?:/app/output/|output/)([A-Za-z0-9_.\-]+\.json)", t_txt)
+            if mj and "case" not in mj.group(1).lower():
+                result_name = mj.group(1)
+    return deck_name or "talk.pptx", result_name or "result.json"
 
 
 def extract_extra_pdf_text(pdf_path: Path) -> str:
@@ -463,9 +473,9 @@ def write_reading_map(work: Path, ptxt: Path, outline: dict, paper_tables: list,
         tmd_txt = tmd_p.read_text(encoding="utf-8", errors="ignore").strip() if tmd_p.exists() else str(inspect.get("task_md_preview") or "").strip()
         if tmd_txt:
             lines.append("## Task Instructions (`task.md`)")
-            lines.append(tmd_txt[:3200])
-            if len(tmd_txt) > 3200:
-                lines.append(f"> *[task.md truncated at 3200/{len(tmd_txt)} chars — read `{tmd_p}` for remaining lines]*")
+            lines.append(tmd_txt[:6000])
+            if len(tmd_txt) > 6000:
+                lines.append(f"> *[task.md truncated at 6000/{len(tmd_txt)} chars — read `{tmd_p}` for remaining lines]*")
             lines.append("")
     if total_chars <= 22000:
         lines.append(f"> `paper.txt` is compact ({total_chars} chars, {total_pages} pages) — read it directly in full before designing `deck_spec.json`.")
@@ -544,6 +554,41 @@ def write_reading_map(work: Path, ptxt: Path, outline: dict, paper_tables: list,
                 lines.append(f"  - `{tc.get('label')}` (p.{tc.get('page')}): {str(tc.get('caption',''))[:90]}")
         lines.append("")
 
+    # 3) Verbatim Key Source Anchors for Long Papers (>10 KB): Abstract, Quantitative Results & Buried Limitations (with exact line numbers)
+    if total_chars > 10000:
+        cur_p = 1
+        quant_anchors, lim_anchors = [], []
+        QUANT_RE = re.compile(r"(?:outperform|improv|reduc|achiev|speedup|faster|lower|higher|accuracy|f1|auc|rmse|mae|ble?u|gain|优于|提升|降低|达到|加速|超越)", re.I)
+        LIM_RE = re.compile(r"(?:\blimitation|\bthreat|\bcaveat|\bdrawback|\bfailure\s+mode|\bfails?\s+when|\bfuture\s+work|\brestrict|\bassumes?\s+(?:static|fixed)|\boverhead|\bdoes\s+not\s+support|局限|不足|失效|边界|未来工作|尚未支持)", re.I)
+        seen_q, seen_l = set(), set()
+        for lno, ltxt in enumerate(raw_lines, 1):
+            st = ltxt.strip()
+            mp = re.match(r"^--- PAGE (\d+)(?: \([^)]+\))? ---$", st)
+            if mp:
+                cur_p = int(mp.group(1))
+                continue
+            if len(st) < 28 or len(st) > 220 or st.startswith("---"):
+                continue
+            if len(quant_anchors) < 6 and QUANT_RE.search(st) and re.search(r"\d+(?:\.\d+)?\s*(?:%|x\b|×|ms|s\b|GB|MB|pt|pp|倍)", st, re.I):
+                key = st[:42].lower()
+                if key not in seen_q:
+                    seen_q.add(key)
+                    quant_anchors.append(f"- `[p.{cur_p} L{lno}]` {st[:165]}")
+            if len(lim_anchors) < 4 and LIM_RE.search(st) and cur_p >= max(1, total_pages // 2):
+                key = st[:42].lower()
+                if key not in seen_l:
+                    seen_l.add(key)
+                    lim_anchors.append(f"- `[p.{cur_p} L{lno}]` {st[:165]}")
+        if quant_anchors or lim_anchors:
+            lines.append("## 2b. Verbatim Navigation Anchors (read full `paper.txt` lines around these pointers)")
+            if quant_anchors:
+                lines.append("- **Key Quantitative Lines**:")
+                lines.extend(quant_anchors)
+            if lim_anchors:
+                lines.append("- **Limitations / Boundary Lines**:")
+                lines.extend(lim_anchors)
+            lines.append("")
+
     # 3) Audience Budget & Q&A Hooks
     if page_budget or qa_hooks:
         lines.append("## 3. Audience Budget & Q&A Hooks (`qa_hooks.json`)")
@@ -589,7 +634,7 @@ def main():
     case = json.loads(cpath.read_text(encoding="utf-8"))
     inspect = json.loads((work / "inspect.json").read_text(encoding="utf-8"))
     mode, starting_deck, template = resolve_pptx_roles(case, inspect, cpath.parent)
-    deck_name, result_name = resolve_output_names(case)
+    deck_name, result_name = resolve_output_names(case, cpath.parent / "task.md")
 
     # 2) S1 extract_figs on primary PDF (+ append secondary PDFs if any) or non-PDF fallback
     src_pdf = (inspect.get("source_pdf") or {}).get("path")

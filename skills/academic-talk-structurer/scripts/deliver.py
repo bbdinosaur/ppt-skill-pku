@@ -571,6 +571,58 @@ def main():
     ren = run_py("export_notes.py", en_args)
     print("  " + (ren.stdout or ren.stderr).strip().replace("\n", "\n  "))
 
+    # 4b) Deterministic rendered-pixel + semantic quality audit & real revision provenance (changes.json)
+    raud = run_py("audit_talk.py", ["--work", str(work), "--out-dir", str(out_dir), "--spec", str(spec_path), "--out", str(work / "quality_audit.json")])
+    audit_out = (raud.stdout or "").strip()
+    try:
+        cur_plan = json.loads((work / "slide_plan.json").read_text(encoding="utf-8")) if (work / "slide_plan.json").exists() else {}
+        cur_slides = cur_plan.get("slides") or []
+        cur_sig = [
+            (s.get("pptx_slide"), s.get("role"), s.get("title"), s.get("claim"), s.get("visuals"), s.get("notes_chars"))
+            for s in cur_slides
+        ]
+        prev_p = work / "_prev_plan_sig.json"
+        chg_p = work / "changes.json"
+        chg_list = []
+        if chg_p.exists():
+            try:
+                loaded_c = json.loads(chg_p.read_text(encoding="utf-8"))
+                if isinstance(loaded_c, list):
+                    chg_list = loaded_c
+            except Exception:
+                chg_list = []
+        prev_sig = None
+        if prev_p.exists():
+            try:
+                prev_sig = json.loads(prev_p.read_text(encoding="utf-8"))
+            except Exception:
+                prev_sig = None
+        qa_aud = json.loads((work / "quality_audit.json").read_text(encoding="utf-8")) if (work / "quality_audit.json").exists() else {}
+        vis_d = (qa_aud.get("editorial_audit") or {}).get("visual_diversity_pct", "?")
+        mode_tag = (cur_plan.get("meta") or {}).get("mode") or "build"
+        if prev_sig is None or not chg_list:
+            entry = f"v1: initial {mode_tag} build ({len(cur_slides)} slides, gates_failed={gate_fail}, visual_div={vis_d}%)"
+            chg_list = [entry]
+        elif prev_sig == cur_sig:
+            # Re-run on identical spec: refresh status on latest entry without duplicating history
+            v_idx = len(chg_list)
+            base_lbl = "initial" if v_idx == 1 else "refined"
+            chg_list[-1] = f"v{v_idx}: {base_lbl} {mode_tag} build ({len(cur_slides)} slides, gates_failed={gate_fail}, visual_div={vis_d}%)"
+        else:
+            changed_s = []
+            max_n = max(len(prev_sig), len(cur_sig))
+            for si_c in range(max_n):
+                if si_c >= len(prev_sig) or si_c >= len(cur_sig) or prev_sig[si_c] != cur_sig[si_c]:
+                    changed_s.append(si_c + 1)
+            v_idx = len(chg_list) + 1
+            chg_list.append(
+                f"v{v_idx}: refined {mode_tag} deck ({len(cur_slides)} slides, modified slides {changed_s[:10]}, gates_failed={gate_fail}, visual_div={vis_d}%)"
+            )
+        chg_p.write_text(json.dumps(chg_list[-8:], ensure_ascii=False, indent=1), encoding="utf-8")
+        prev_p.write_text(json.dumps(cur_sig, ensure_ascii=False), encoding="utf-8")
+    except Exception:
+        pass
+
     # 5) Assemble result.json
     print("== [5/5] result.json ==")
     res_args = ["--case", str(cpath), "--work", str(work), "--out", str(result_out)]
@@ -596,6 +648,8 @@ def main():
             print(f"  [qa-advisory] qa_prep has {qi.get('total',0)} item(s)" + (f", missing categories: {', '.join(miss_q)}" if miss_q else "") + "; aim for >=4 covering mechanism/data/baseline/limitation")
     except Exception:
         pass
+    if audit_out:
+        print("  " + audit_out.replace("\n", "\n  "))
 
     if fix_hints:
         print("== NEXT FIX ==")
