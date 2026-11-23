@@ -14,11 +14,66 @@ All underlying scripts remain standalone CLIs in the same directory.
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 SCRIPTS_DIR = Path(__file__).resolve().parent
+
+HARD_EV_TYPES = {"image_ref_mismatch", "generic_section_title", "missing_notes"}
+HARD_LAY_TYPES = {"template_placeholder_remnant"}
+POLISH_EV_TYPES = {
+    "number_absent_from_paper", "missing_limitations_slide", "notes_duplicate_slide_text",
+    "schematic_unlabeled", "schematic_unmarked", "unattributed_comparison",
+    "missing_quote_on_slide", "cover_title_mismatch_paper",
+}
+POLISH_LAY_TYPES = {"text_overflow", "overlap", "table_overflow", "too_dense"}
+
+
+def _detect_label_discrepancy(cr, ctx):
+    """Detect whether case.json domain/topic/title metadata contradicts the actual extracted paper.
+    Only compares same-script labels to avoid false alarms on bilingual tasks."""
+    labels = cr.get("case_labels") or {}
+    if not labels or not isinstance(ctx, dict):
+        return None
+    pages = ctx.get("pages") or []
+    p12 = " ".join((pg.get("text") or "") for pg in pages[:2])
+    title_g = ctx.get("title_guess") or ""
+    blob = (title_g + "\n" + p12).lower()
+    if len(blob.strip()) < 120:
+        return None
+    blob_cjk = sum(1 for ch in blob if "\u4e00" <= ch <= "\u9fff") > 30
+    stop_en = {
+        "study", "paper", "research", "analysis", "report", "academic", "slides",
+        "presentation", "science", "scientific", "review", "method", "model", "data",
+        "system", "approach", "based", "using", "toward", "towards", "task", "case",
+        "deck", "general", "other", "misc", "unknown", "demo", "test",
+    }
+    mismatches = []
+    for k, raw_v in labels.items():
+        v = str(raw_v or "").strip()
+        if len(v) < 4:
+            continue
+        v_cjk = sum(1 for ch in v if "\u4e00" <= ch <= "\u9fff") >= 2
+        if v_cjk != blob_cjk:
+            continue
+        if v_cjk:
+            runs = re.findall(r"[\u4e00-\u9fff]{2,}", v)
+            grams = list(dict.fromkeys(r[i:i + 2] for r in runs for i in range(max(0, len(r) - 1))))
+            if len(grams) >= 2 and not any(g in blob for g in grams):
+                mismatches.append(f"{k}='{v[:60]}'")
+        else:
+            toks = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", v) if w.lower() not in stop_en]
+            toks = list(dict.fromkeys(toks))
+            if len(toks) >= 2 and not any(w in blob for w in toks):
+                mismatches.append(f"{k}='{v[:60]}'")
+    if not mismatches:
+        return None
+    return (
+        f"case.json label(s) [{', '.join(mismatches)}] do not appear in actual paper pages 1-2 "
+        f"(paper title_guess='{title_g[:80]}'); STRICTLY ground slides in the actual paper file, NOT the case label."
+    )
 
 
 def _run_py(script_name, args, timeout=240):
@@ -167,18 +222,27 @@ def _build_reading_pack(work, cr, ctx, idx_path, extra_materials):
             pass
     lim_pages = (ctx or {}).get("limitations_pages") or []
     ocr_pages = (ctx or {}).get("ocr_pages") or []
+    unext_figs = (ctx or {}).get("unextracted_figures") or []
+    img_form_pages = (ctx or {}).get("image_formula_pages") or []
     n_figs = len((ctx or {}).get("figures") or [])
     n_tbls = len((ctx or {}).get("tables") or [])
     cons = cr.get("constraints") or {}
+    eff_mode = (cr.get("effective_template_mode")
+                or (cr.get("template_info") or {}).get("recommended_mode")
+                or ("layouts" if cr.get("template_pptx") else "blank"))
     hdr_lines = [
         "## 1. Case, Ground-Truth Integrity & Constraints",
-        f"- case_id: `{cr.get('case_id')}` | template_mode: `{(cr.get('template_info') or {}).get('recommended_mode') or ('layouts' if cr.get('template_pptx') else 'blank')}`",
+        f"- case_id: `{cr.get('case_id')}` | template_mode: `{eff_mode}`",
         f"- constraints: `{json.dumps(cons, ensure_ascii=False)}`",
         f"- grounding_summary: pages={(ctx or {}).get('n_pages', 0)}, extracted_figures={n_figs}, extracted_tables={n_tbls}, limitations_pages={lim_pages}"
         + (f", ocr_pages={ocr_pages}" if ocr_pages else "")
+        + (f", image_formula_pages={img_form_pages}" if img_form_pages else "")
+        + (f", unextracted_figures={unext_figs[:6]}" if unext_figs else "")
         + (" [REQUIRED: include a Limitations slide]" if lim_pages else ""),
         "- ground_truth_rule: ALWAYS derive claims/numbers/authors strictly from actual paper/material files below; if any case label contradicts the paper, trust the paper and log discrepancy in gaps_and_uncertainty.",
     ]
+    if cr.get("label_discrepancy"):
+        hdr_lines.append(f"- **CRITICAL LABEL MISMATCH WARNING**: {cr['label_discrepancy']}")
     if cr.get("missing"):
         hdr_lines.append(f"- missing_inputs: `{json.dumps(cr.get('missing'), ensure_ascii=False)}`")
     if cr.get("output_contract"):
@@ -332,8 +396,12 @@ def cmd_prep(a):
         "template_pptx": cr.get("template_pptx"),
         "starting_deck": cr.get("starting_deck"),
         "starting_deck_dump_md": cr.get("starting_deck_dump_md"),
-        "n_existing_slides": tinfo.get("n_existing_slides", 0),
-        "template_mode": tinfo.get("recommended_mode")
+        "n_existing_slides": max(
+            tinfo.get("n_existing_slides", 0),
+            (cr.get("starting_deck_info") or {}).get("n_existing_slides", 0),
+        ),
+        "template_mode": cr.get("effective_template_mode")
+                         or tinfo.get("recommended_mode")
                          or ("layouts" if cr.get("template_pptx") else "blank"),
         "constraints": cr.get("constraints") or {},
         "output_contract": cr.get("output_contract"),
@@ -369,6 +437,19 @@ def cmd_prep(a):
         summary["title_guess"] = ctx.get("title_guess") or ""
         if ctx.get("limits"):
             summary["extract_limits"] = ctx["limits"]
+        if ctx.get("unextracted_figures"):
+            summary["unextracted_figures"] = ctx["unextracted_figures"]
+        if ctx.get("image_formula_pages"):
+            summary["image_formula_pages"] = ctx["image_formula_pages"]
+        lbl_disc = _detect_label_discrepancy(cr, ctx)
+        if lbl_disc:
+            cr["label_discrepancy"] = lbl_disc
+            summary["label_discrepancy"] = lbl_disc
+            try:
+                with open(cr_path, "w", encoding="utf-8") as cf:
+                    json.dump(cr, cf, ensure_ascii=False, indent=1)
+            except Exception:
+                pass
         if rc1 != 0:
             summary["extract_error"] = err1 or out1
             summary["ok"] = False
@@ -438,9 +519,9 @@ def cmd_build(a):
     cr = _load_json(cr_path) or {}
     meta = slides_spec.get("meta") or {}
 
-    # Resolve template and reuse mode cleanly
+    # Resolve template and reuse mode cleanly (honoring dual-PPTX effective_template_mode)
     tinfo = cr.get("template_info") or {}
-    rec_mode = tinfo.get("recommended_mode")
+    rec_mode = cr.get("effective_template_mode") or tinfo.get("recommended_mode")
     if a.reuse:
         use_reuse = True
     elif a.layouts:
@@ -524,10 +605,39 @@ def cmd_build(a):
     rrec = res.get("render_record") or {}
     blank_slides = checks.get("visual_blank_slides") or []
     tofu_slides = checks.get("visual_tofu_slides") or []
-    action_required = (lay_fail > 0) or (ev_err > 0) or bool(blank_slides)
+
+    # Track build attempts per work dir so the 1-pass rubric polish gate never infinite-loops
+    att_file = os.path.join(work, ".build_attempts.json")
+    att_state = _load_json(att_file) or {}
+    attempt = int(att_state.get("count", 0)) + 1
+    try:
+        with open(att_file, "w", encoding="utf-8") as af:
+            json.dump({"count": attempt}, af)
+    except Exception:
+        pass
+
+    hard_ev_warns = [i for i in ((ev or {}).get("issues") or [])
+                     if i.get("sev") == "warn" and i.get("type") in HARD_EV_TYPES]
+    hard_lay_warns = [i for i in (lay.get("issues") or [])
+                      if i.get("sev") == "warn" and i.get("type") in HARD_LAY_TYPES]
+    polish_ev = [i for i in ((ev or {}).get("issues") or [])
+                 if i.get("sev") == "warn" and i.get("type") in POLISH_EV_TYPES]
+    polish_lay = [i for i in (lay.get("issues") or [])
+                  if i.get("sev") == "warn" and i.get("type") in POLISH_LAY_TYPES]
+
+    render_broken = (checks.get("pdf_pages_match") is False) or (checks.get("render_text_ok") is False)
+    hard_action = (
+        (lay_fail > 0) or (ev_err > 0) or bool(blank_slides) or bool(tofu_slides)
+        or render_broken or bool(hard_ev_warns) or bool(hard_lay_warns)
+    )
+    polish_items = polish_ev + polish_lay
+    polish_gate = (attempt == 1) and bool(polish_items)
+    # Hard cap at attempt <= 2 so the agent never wastes budget looping on edge warnings
+    action_required = (hard_action or polish_gate) if attempt <= 2 else False
 
     summary = {
         "stage": "build",
+        "attempt": attempt,
         "ok": rc_f == 0 and not action_required,
         "status": res.get("status", "unknown"),
         "result_json": os.path.join(out_dir, "result.json"),
@@ -545,6 +655,7 @@ def cmd_build(a):
         "evidence_errors": ev_err,
         "evidence_warns": ev_warn,
         "action_required": action_required,
+        "polish_recommended": bool(polish_items),
         "inspect_previews": _pick_preview_samples(slides_spec, previews),
     }
     if fail_items:
@@ -556,9 +667,13 @@ def cmd_build(a):
     if ev_warn_items:
         summary["evidence_warn_details"] = ev_warn_items
     if action_required:
+        checklist = []
+        for it in (fail_items + ev_err_items + hard_ev_warns + hard_lay_warns + polish_items)[:12]:
+            checklist.append(f"S{it.get('slide', 0)} [{it.get('type')}]: {it.get('detail', '')}")
+        summary["polish_checklist"] = checklist
         summary["fix_instruction"] = (
-            f"MANDATORY: fix {lay_fail} layout fail(s), {ev_err} evidence error(s), "
-            f"blank={blank_slides} in slides.json, then re-run: "
+            f"SURGICAL FIX PASS (attempt {attempt}/2): resolve the {len(checklist)} high-impact item(s) in "
+            f"polish_checklist inside {slides_json} in ONE edit, then re-run: "
             f"python3 ${{SKILL_DIR:-/skills/weekly-skill}}/scripts/run_pipeline.py build {slides_json} --work {work} --out-dir {out_dir}"
         )
     else:

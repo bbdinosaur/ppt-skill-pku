@@ -112,6 +112,12 @@ def main():
 
     cr_path = a.case_resolved or os.path.join(a.work, "case_resolved.json")
     case_res = load_json_opt(cr_path) or {}
+    if case_res.get("label_discrepancy"):
+        advisory_gaps.append(f"label_discrepancy: {case_res['label_discrepancy']}")
+    paper_ctx = load_json_opt(os.path.join(a.work, "paper", "paper_context.json")) or {}
+    for lim_msg in (paper_ctx.get("limits") or [])[:6]:
+        if isinstance(lim_msg, str) and lim_msg.strip():
+            advisory_gaps.append(f"extract_limit: {lim_msg.strip()}")
     case_id = a.case_id or case_res.get("case_id")
     template_path = a.template or case_res.get("template_pptx")
 
@@ -302,6 +308,7 @@ def main():
                     "slide_line": ev.get("slide_line", ""),
                     "figure_file": sld.get("image") or (sld.get("images") or [None])[0],
                     "has_table": bool(sld.get("table")),
+                    "has_chart": bool(sld.get("chart")),
                     "has_kpis": bool(sld.get("kpis") or sld.get("metrics")),
                     "two_column": bool(sld.get("right_bullets")),
                     "notes_present": bool(sld.get("notes")),
@@ -541,6 +548,7 @@ def main():
         "figure_table_grounding": {
             "n_figures_embedded": sum(1 for e in evidence_map if e.get("figure_file")),
             "n_tables_embedded": sum(1 for e in evidence_map if e.get("has_table")),
+            "n_charts_embedded": sum(1 for e in evidence_map if e.get("has_chart")),
             "content_slides_with_refs": sum(1 for e in content_em if e.get("paper_refs")),
             "content_slides_with_quotes": sum(
                 1 for e in content_em
@@ -595,6 +603,7 @@ def main():
             "template_mode": render_record["template_mode"],
             "n_figures_embedded": sum(1 for e in evidence_map if e.get("figure_file")),
             "n_tables_embedded": sum(1 for e in evidence_map if e.get("has_table")),
+            "n_charts_embedded": sum(1 for e in evidence_map if e.get("has_chart")),
             "notes_complete": notes_ok,
             "notes_missing_slides": notes_missing,
         },

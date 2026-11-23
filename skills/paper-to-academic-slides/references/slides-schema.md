@@ -22,10 +22,14 @@
 | right_bullets | 否 | list | 纯文本对比/局限页可选右栏要点（同 `bullets` 格式），自动双栏+竖分隔线排版 |
 | left_heading / right_heading | 否 | str | 双栏对比页可选左/右栏主题色小标题 |
 | kpis | 否 | list | 主结果/总结页可选 2–4 张指标卡 `[{"value":"89.1%","label":"Top-1 Acc (Table 2)"}]`，数值须逐字出自论文 |
-| takeaway | 否 | str | 内容页底部可选单行左饰条要点总结（≤18词/28字），支持 `**bold**`，自动避让正文/图/表/页脚 |\n| source_slide | 否 | int | `--reuse` 模式下可选 1-based 起始 deck 页码，用于精准挑选/重排起始页版式（留空则按需新建页） |\n| keep_existing_media | 否 | bool | `--reuse` 模式下设为 `true` 保留起始 deck 当前页原有原生图表/组合图/图片 |\n| image | 否 | str | 图片绝对路径（`figs/*.png`、补充图或 `starting_deck_figs/*.png`） |
+| takeaway | 否 | str | 内容页底部可选单行左饰条要点总结（≤18词/28字），支持 `**bold**`，自动避让正文/图/表/页脚 |
+| source_slide | 否 | int | `--reuse` 模式下可选 1-based 起始 deck 页码，用于精准挑选/重排起始页版式（留空则按需新建页） |
+| keep_existing_media | 否 | bool | `--reuse` 模式下设为 `true` 保留起始 deck 当前页原有原生图表/组合图/图片，正文自动避让 |
+| image | 否 | str | 图片绝对路径（`figs/*.png`、补充图或 `starting_deck_figs/*.png`） |
 | images | 否 | list[str] | 多图并列：2 张在宽区域自动左右横排，3 张纵向堆叠 |
 | image_caption | 否 | str | 可选图注（10pt 居中紧贴图下），如 `"Fig. 1: 方法框架示意图（非实验数据）"`；多图也可用 `image_captions` 列表 |
-| keep_existing_media | 否 | bool | 仅 `--reuse` 模式有效：`true` 时保留起始 deck 该页原有原生图表/示意图，正文自动避让 |
+| table | 否 | obj | 原生三线学术表（`headers`/`rows`/`note`），与 `image`/`chart` 三选一 |
+| chart | 否 | obj | 可选原生可编辑 PowerPoint 图表（`type`: `column|bar|line`, `categories`, `series`, `title`, `unit`, `note`）；用于无图可抠或纯表数值对比，数值须逐字出自论文 |
 | notes | 建议必填 | str | 讲稿 60–150 字：过渡 + 强调点 + 追问补充证据；**不复述页面文字** |
 | evidence | 是 | obj | 见下 |
 

@@ -34,7 +34,7 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/run_pipeline.py prep --work /
 3. **归属与图类型**：对比/基线数据须显式标明基线名或作者；框架/流程/示意图须在 `image_caption` 或 `notes` 标明“示意图，非实验数据”。
 4. **必保局限页**：`limitations_pages` 非空且 `max_slides ≥ 7` 时**必留局限页**；超限时先裁背景与次要消融，必保封面/方法/主结果/结论。
 5. **页页可溯**：非封面页 `evidence.paper_refs` 必填 ≥1 条 `{"type":"figure|table|section|page|equation","id":"Fig. 3","page":5,"quote":"≤25词原文"}`（**必含原文 `quote`**）；`evidence.slide_line` 填页脚溯源（漏填自动合成）。
-6. **真图真表与视觉层次**：`image`/`images` 填 `figs/*.png`、补充图或 `starting_deck_figs/*.png`（多面板选 `composite_panels`，图号一致，**附居中 `image_caption`**；双图横排）；主表用 `table` 渲染三线学术表；结果/结论页可加 `kpis`（2–4 卡）或底部 `takeaway` 条；纯文对比/局限页可用 `right_bullets`+`left_heading`/`right_heading` 双栏；`--reuse` 支持 `"source_slide": N` 选页重排与 `"keep_existing_media": true`。
+6. **真图真表与视觉层次**：优先 `image`/`images` 填 `figs/*.png`、补充图或 `starting_deck_figs/*.png`（多面板选 `composite_panels`，图号一致，**附居中 `image_caption`**）；主表用 `table` 三线表，无图可抠的数值对比可用原生 `chart`；结果/结论页可加 `kpis` 或底部 `takeaway`；纯文对比用 `right_bullets` 双栏；`--reuse` 支持 `"source_slide": N` 重排与 `"keep_existing_media": true`。
 7. **讲稿分离与控时**：`notes` 写 `[~X.X min]` 控时 + 过渡 + 强调点及成立前提 + 追问补充证据，**严禁复述页面文字**。
 
 ### Step 3：一键构建 + 版面检 + S4.5 强校验 + 渲染导出（1 步）
@@ -47,7 +47,7 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/run_pipeline.py build /app/wo
 3. **`verify_evidence.py`（S4.5，必跑）** → `/app/work/evidence_report.json`（页数上限、必有证据与原文 `quote`、支持补充材料溯源、图存在与图号匹配、图注、全量数字与缺号分级、基线归属、讲稿查重、栏目词、局限页）
 4. `finalize_output.py` → `/app/output/{slides.pptx, slides.pdf, previews/slide-NN.png (100 DPI), evidence_map.json, evidence_map.md, speaker_notes.md, slides_outline.json, result.json}`（含六要素审计、PDF 字体审计、空白/豆腐块质检与 `output_contract` 镜像）
 
-**强制门控（严禁跳过）**：若 `action_required: true`（`layout_fail > 0` 或 `evidence_errors > 0` 或空白页），**必须改 `slides.json` 重跑 `build` 直至清零**（≤2 轮）；高优 `warn`（`number_absent_from_paper`、`number_not_on_cited_page`、`image_ref_mismatch`、`missing_quote_on_slide`、`unattributed_comparison`、`missing_limitations_slide`、`generic_section_title`）尽量修清或如实记入 `result.json`。
+**强制门控（严禁跳过）**：若 `action_required: true`，按返回的 **`polish_checklist`** 一次性改完 `slides.json` 重跑 `build` 直至清零（≤2 轮）；剩余低优 `warn` 诚实记入 `result.json`。
 - 分步/兜底：6 个脚本可独立调用；无 `soffice` 标 `pdf_exported:false`；无 `python-pptx` 交 `slides.json`+`evidence_map.json` 并标 `status=partial`。
 
 ### Step 4：渲染核验与交付确认（0 额外步，兼容纯文本模型）

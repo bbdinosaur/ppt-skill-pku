@@ -499,6 +499,46 @@ def main():
             check_texts.append(takeaway_txt)
         for row in (table_spec.get("rows") or []):
             check_texts.extend(str(c) for c in row)
+        chart_spec = sld.get("chart")
+        if isinstance(chart_spec, dict):
+            for ser in (chart_spec.get("series") or []):
+                if isinstance(ser, dict):
+                    for v in (ser.get("values") or []):
+                        check_texts.append(str(v))
+            if chart_spec.get("title"):
+                check_texts.append(str(chart_spec["title"]))
+            if chart_spec.get("note"):
+                check_texts.append(str(chart_spec["note"]))
+
+        # Guard against blindly copying a misleading case.json domain label onto the Cover title
+        if kind == "cover" and si == 1 and title and full_paper_norm:
+            p12_raw = clean_str(" ".join((pg.get("text") or "") for pg in (ctx.get("pages") or [])[:2])).lower()
+            p12_cjk = sum(1 for ch in p12_raw if "\u4e00" <= ch <= "\u9fff") > 30
+            t_cjk = sum(1 for ch in title if "\u4e00" <= ch <= "\u9fff") >= 4
+            if t_cjk == p12_cjk and len(p12_raw) >= 120:
+                stop_en = {"study", "paper", "research", "analysis", "report", "academic", "slides", "presentation",
+                           "review", "using", "based", "toward", "towards", "method", "model", "system", "approach"}
+                if t_cjk:
+                    toks_c = [w for w in re.findall(r"[\u4e00-\u9fff]{2,}", title) if len(w) >= 2]
+                    c_grams = []
+                    for w in toks_c:
+                        for gi in range(0, len(w) - 1):
+                            c_grams.append(w[gi:gi + 2])
+                    c_grams = list(dict.fromkeys(c_grams))
+                    if len(c_grams) >= 3 and not any(g in p12_raw for g in c_grams):
+                        issues.append({
+                            "slide": si, "sev": "warn", "type": "cover_title_mismatch_paper",
+                            "detail": "cover title shares no key terms with actual paper pages 1-2; verify ground-truth paper title",
+                        })
+                else:
+                    toks_e = [w.lower() for w in re.findall(r"[A-Za-z][A-Za-z0-9\-]{3,}", title)
+                              if w.lower() not in stop_en]
+                    toks_e = list(dict.fromkeys(toks_e))
+                    if len(toks_e) >= 3 and not any(w in p12_raw for w in toks_e):
+                        issues.append({
+                            "slide": si, "sev": "warn", "type": "cover_title_mismatch_paper",
+                            "detail": "cover title shares no key terms with actual paper pages 1-2; verify ground-truth paper title",
+                        })
         seen_miss = set()
         for txt in check_texts:
             cleaned_t = _strip_num_commas(ID_NUM_STRIP_RE.sub(" ", clean_str(txt)))

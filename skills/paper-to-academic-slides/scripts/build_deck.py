@@ -153,6 +153,31 @@ def _apply_blank_font(run, text, is_blank):
             pass
 
 
+def _clear_shape_shadow(shape):
+    """Strip PowerPoint's default theme drop-shadow (effectRef idx=2) so flat accent rules,
+    KPI cards, and takeaway bars render crisp and modern in LibreOffice and PowerPoint."""
+    try:
+        shape.shadow.inherit = False
+    except Exception:
+        pass
+    try:
+        from pptx.oxml.ns import qn
+        from pptx.oxml import parse_xml
+        el = shape._element
+        style = el.find(qn("p:style"))
+        if style is not None:
+            eref = style.find(qn("a:effectRef"))
+            if eref is not None:
+                eref.set("idx", "0")
+        spPr = el.find(qn("p:spPr"))
+        if spPr is not None:
+            for old in list(spPr.findall(qn("a:effectLst"))):
+                spPr.remove(old)
+            spPr.append(parse_xml('<a:effectLst xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"/>'))
+    except Exception:
+        pass
+
+
 def glue_num_units(text):
     """Replace breaking space between a number and its scientific unit with NBSP
     so '53.8 m' or '14.2 meV/A' never splits across lines."""
@@ -676,6 +701,7 @@ def set_title(slide, text, prs=None, max_pt=30, is_blank=False, is_cover=False, 
                 bar.fill.solid()
                 bar.fill.fore_color.rgb = RGBColor(*BLANK_ACCENT)
                 bar.line.fill.background()
+                _clear_shape_shadow(bar)
             except Exception:
                 pass
     elif orig_rgb is not None:
@@ -771,14 +797,19 @@ def fill_body(ph, bullets, base_pt=18, slide=None, prs=None, is_blank=False, no_
 
     # Adaptive vertical rhythm: generous breathing room when bullets have vertical slack
     relaxed = (not no_bullets) and (chosen >= 14) and (chosen_est_h < inner_h * 0.65)
+    very_relaxed = relaxed and (len(bullets) <= 4) and (chosen_est_h < inner_h * 0.45)
     tf.clear()
     first = True
     for lv, text in bullets:
         para = tf.paragraphs[0] if first else tf.add_paragraph()
         first = False
         para.level = min(max(int(lv), 0), 4)
-        if relaxed:
-            para.space_after = Pt(8 if para.level == 0 else 4)
+        if very_relaxed:
+            para.space_after = Pt(12 if para.level == 0 else 6)
+            para.line_spacing = 1.18
+        elif relaxed:
+            para.space_after = Pt(9 if para.level == 0 else 5)
+            para.line_spacing = 1.14
         elif chosen <= 11:
             para.space_after = Pt(1.5)
         else:
@@ -896,20 +927,20 @@ def footer_safe_top(slide, prs):
     return ev_top
 
 
-def add_evidence_line(slide, prs, text, reserve_right_in=0.0):
+def add_evidence_line(slide, prs, text, reserve_right_in=0.0, is_blank=False, left_in=0.35):
     if not text:
         return
     ev_top, ev_max_w, _cb = footer_layout_info(slide, prs)
-    if reserve_right_in > 0:
-        SW = prs.slide_width / EMU_IN
-        ev_max_w = min(ev_max_w, max(3.2, SW - 0.35 - reserve_right_in))
+    SW = prs.slide_width / EMU_IN
+    left_x = max(0.35, min(float(left_in), 2.0))
+    ev_max_w = min(ev_max_w - max(0.0, left_x - 0.35), max(3.2, SW - left_x - max(0.35, reserve_right_in)))
     # Trim gracefully to fit available horizontal width without clipping/overlapping right footer
     trimmed = text[:160].strip()
     if est_text_width(trimmed, 10) > ev_max_w - 0.08:
         while len(trimmed) > 12 and est_text_width(trimmed + "…", 10) > ev_max_w - 0.08:
             trimmed = trimmed[:-1]
         trimmed = trimmed.rstrip(" ;,，") + "…"
-    box = slide.shapes.add_textbox(Inches(0.35), Inches(ev_top),
+    box = slide.shapes.add_textbox(Inches(left_x), Inches(ev_top),
                                    Inches(ev_max_w), Inches(0.28))
     box.name = "EvidenceLine"
     tf = box.text_frame
@@ -918,6 +949,7 @@ def add_evidence_line(slide, prs, text, reserve_right_in=0.0):
     run = tf.paragraphs[0].add_run()
     run.text = trimmed
     run.font.size = Pt(10)
+    _apply_blank_font(run, trimmed, is_blank)
     fg = LIGHT_GRAY if is_dark_slide_bg(slide, prs) else GRAY
     run.font.color.rgb = RGBColor(*fg)
 
@@ -937,6 +969,7 @@ def add_blank_slide_number(slide, prs, idx, total):
     run = p.add_run()
     run.text = f"{idx} / {total}"
     run.font.size = Pt(10)
+    _apply_blank_font(run, run.text, True)
     run.font.color.rgb = RGBColor(*GRAY)
 
 
@@ -949,7 +982,10 @@ def synthesize_slide_line(paper_refs):
         rid = str(r.get("id") or "").strip()
         pg = r.get("page")
         if rid and pg:
-            parts.append(f"{rid} (p.{pg})")
+            if re.match(r"^(?:p\.?|page\s*)\s*\d+$", rid, re.I):
+                parts.append(f"p.{pg}")
+            else:
+                parts.append(f"{rid} (p.{pg})")
         elif rid:
             parts.append(rid)
         elif pg:
@@ -984,7 +1020,7 @@ def _style_cell_booktabs(cell, bot_hex=None, bot_pt=0.75, top_hex=None, top_pt=0
         pass
 
 
-def add_kpi_strip(slide, prs, kpis, left_in, top_in, width_in, theme_accent=None):
+def add_kpi_strip(slide, prs, kpis, left_in, top_in, width_in, theme_accent=None, is_blank=False):
     """Render 2-4 crisp headline metric cards (value + short label) right below title.
     Returns bottom Y (in inches) of the strip."""
     items = [k for k in (kpis or []) if isinstance(k, dict) and str(k.get("value", "")).strip()][:4]
@@ -1014,6 +1050,7 @@ def add_kpi_strip(slide, prs, kpis, left_in, top_in, width_in, theme_accent=None
         card.fill.fore_color.rgb = RGBColor(*card_bg)
         card.line.color.rgb = RGBColor(*card_border)
         card.line.width = Pt(0.75)
+        _clear_shape_shadow(card)
         tf = card.text_frame
         tf.word_wrap = True
         tf.margin_left = Inches(0.12)
@@ -1033,6 +1070,7 @@ def add_kpi_strip(slide, prs, kpis, left_in, top_in, width_in, theme_accent=None
         r0.font.size = Pt(v_pt)
         r0.font.bold = True
         r0.font.color.rgb = RGBColor(*val_fg)
+        _apply_blank_font(r0, val_txt, is_blank)
         if lbl_txt:
             l_pt = 9.5
             v_h = 1.25 * v_pt / 72.0
@@ -1047,12 +1085,14 @@ def add_kpi_strip(slide, prs, kpis, left_in, top_in, width_in, theme_accent=None
             r1.text = lbl_txt
             r1.font.size = Pt(l_pt)
             r1.font.color.rgb = RGBColor(*lbl_fg)
+            _apply_blank_font(r1, lbl_txt, is_blank)
         # Sleek thin accent bar on top edge of each card
         bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, Inches(cx), Inches(top_in), Inches(cw), Inches(0.045))
         bar.name = f"KPIBar_{idx + 1}"
         bar.fill.solid()
         bar.fill.fore_color.rgb = RGBColor(*bar_rgb)
         bar.line.fill.background()
+        _clear_shape_shadow(bar)
     return top_in + ch
 
 
@@ -1086,6 +1126,7 @@ def add_takeaway_bar(slide, prs, text, left_in, top_in, width_in, theme_accent=N
     box.fill.fore_color.rgb = RGBColor(*bg_rgb)
     box.line.color.rgb = RGBColor(*bdr_rgb)
     box.line.width = Pt(0.65)
+    _clear_shape_shadow(box)
     tf = box.text_frame
     tf.word_wrap = True
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
@@ -1113,6 +1154,7 @@ def add_takeaway_bar(slide, prs, text, left_in, top_in, width_in, theme_accent=N
     stripe.fill.solid()
     stripe.fill.fore_color.rgb = RGBColor(*bar_rgb)
     stripe.line.fill.background()
+    _clear_shape_shadow(stripe)
     return top_in + bar_h
 
 
@@ -1176,7 +1218,10 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
         shrink = avail_h / tot_rh
         row_heights = [max(0.26, rh * shrink) for rh in row_heights]
     tbl_h = min(avail_h, sum(row_heights))
-    gfx = slide.shapes.add_table(n_rows, n_cols, Inches(left_in), Inches(top_in),
+    # Gentle optical vertical centering when the table sits in a spacious vertical slot
+    slack_h = avail_h - tbl_h
+    tbl_top = top_in + (min(slack_h * 0.22, 0.45) if slack_h > 0.55 else 0.0)
+    gfx = slide.shapes.add_table(n_rows, n_cols, Inches(left_in), Inches(tbl_top),
                                  Inches(sum(widths)), Inches(tbl_h))
     tbl = gfx.table
     for ci, w in enumerate(widths):
@@ -1233,7 +1278,7 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
             p = ctf.paragraphs[0]
             if col_numeric[ci]:
                 p.alignment = PP_ALIGN.CENTER
-            add_formatted_runs(p, glue_num_units(txt), cell_pt, color_rgb=hdr_rgb, force_bold=True)
+            add_formatted_runs(p, glue_num_units(txt), cell_pt, color_rgb=hdr_rgb, force_bold=True, is_blank=is_blank)
         ri = 1
     ours_re = re.compile(r"(?:\bours\b|\bproposed\b|\bthis\s+work\b|本文|本方法)", re.I)
     for r_i, row in enumerate(rows):
@@ -1264,10 +1309,10 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
             if col_numeric[ci]:
                 p.alignment = PP_ALIGN.CENTER
             cell_txt = row[ci] if ci < len(row) else ""
-            add_formatted_runs(p, glue_num_units(cell_txt), cell_pt, color_rgb=body_rgb, force_bold=is_ours)
+            add_formatted_runs(p, glue_num_units(cell_txt), cell_pt, color_rgb=body_rgb, force_bold=is_ours, is_blank=is_blank)
 
     if note_disp:
-        note_top = min(top_in + tbl_h + 0.05, safe_bot - note_h)
+        note_top = min(tbl_top + tbl_h + 0.05, safe_bot - note_h)
         box = slide.shapes.add_textbox(Inches(left_in), Inches(note_top),
                                        Inches(max_w_in), Inches(note_h))
         box.name = "TableNote"
@@ -1277,9 +1322,147 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
         run = tf.paragraphs[0].add_run()
         run.text = note_disp
         run.font.size = Pt(note_pt)
+        _apply_blank_font(run, note_disp, is_blank)
         fg = LIGHT_GRAY if dark_bg else GRAY
         run.font.color.rgb = RGBColor(*fg)
     return gfx
+
+
+def add_native_chart(slide, prs, chart_spec, left_in, top_in, max_w_in, max_h_in,
+                     is_blank=False, theme_accent=None, safe_bottom_override=None):
+    """Render an editable native PowerPoint chart (column/bar/line) harmonized with
+    the slide theme palette, with crisp data labels and optional caption note."""
+    if not isinstance(chart_spec, dict):
+        return None
+    cats = [str(c).strip() for c in (chart_spec.get("categories") or []) if str(c).strip()]
+    series_in = chart_spec.get("series") or []
+    valid_series = []
+    for s in series_in[:5]:
+        if not isinstance(s, dict):
+            continue
+        vals_raw = s.get("values") or []
+        vals = []
+        for v in vals_raw[:len(cats)]:
+            try:
+                vals.append(float(v))
+            except Exception:
+                vals.append(0.0)
+        if len(vals) == len(cats) and vals:
+            valid_series.append((str(s.get("name") or "Series").strip(), vals))
+    if not cats or not valid_series:
+        return None
+
+    from pptx.chart.data import CategoryChartData
+    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+
+    ctype_str = str(chart_spec.get("type") or "column").strip().lower()
+    ctype = {
+        "bar": XL_CHART_TYPE.BAR_CLUSTERED,
+        "hbar": XL_CHART_TYPE.BAR_CLUSTERED,
+        "line": XL_CHART_TYPE.LINE_MARKERS,
+        "column": XL_CHART_TYPE.COLUMN_CLUSTERED,
+    }.get(ctype_str, XL_CHART_TYPE.COLUMN_CLUSTERED)
+
+    safe_bot = safe_bottom_override if safe_bottom_override is not None else footer_safe_top(slide, prs) - 0.08
+    note = (chart_spec.get("note") or "").strip()
+    note_disp = glue_num_units(note[:140]) if note else ""
+    note_h = 0.28 if note_disp else 0.0
+    note_res = (note_h + 0.06) if note_disp else 0.0
+    ch_h = min(max_h_in - note_res, max(safe_bot - top_in - note_res, 1.8))
+    ch_h = max(ch_h, 1.8)
+    ch_w = max(max_w_in, 2.8)
+
+    data = CategoryChartData()
+    data.categories = cats
+    for sname, svals in valid_series:
+        data.add_series(sname, svals)
+
+    g_shape = slide.shapes.add_chart(ctype, Inches(left_in), Inches(top_in), Inches(ch_w), Inches(ch_h), data)
+    g_shape.name = "NativeChart"
+    chart = g_shape.chart
+    dark_bg = is_dark_slide_bg(slide, prs)
+    accent = theme_accent or BLANK_NAVY
+    palette = [
+        accent,
+        (0x3B, 0x82, 0xF6),
+        (0x0D, 0x94, 0x88),
+        (0xD9, 0x77, 0x06),
+        (0x64, 0x74, 0x8B),
+    ]
+    if dark_bg:
+        palette[0] = (min(255, accent[0] + 65), min(255, accent[1] + 75), min(255, accent[2] + 95))
+
+    txt_rgb = RGBColor(0xEA, 0xEE, 0xF5) if dark_bg else RGBColor(0x1E, 0x29, 0x3B)
+    ctitle = (chart_spec.get("title") or "").strip()
+    unit = (chart_spec.get("unit") or "").strip()
+    if ctitle:
+        chart.has_title = True
+        chart.chart_title.has_text_frame = True
+        p_t = chart.chart_title.text_frame.paragraphs[0]
+        p_t.text = f"{ctitle} ({unit})" if (unit and unit not in ctitle) else ctitle
+        for r in p_t.runs:
+            r.font.size = Pt(12)
+            r.font.bold = True
+            r.font.color.rgb = txt_rgb
+            _apply_blank_font(r, r.text, is_blank)
+    else:
+        chart.has_title = False
+
+    chart.has_legend = len(valid_series) > 1
+    if chart.has_legend:
+        chart.legend.position = XL_LEGEND_POSITION.BOTTOM
+        chart.legend.include_in_layout = False
+        try:
+            chart.legend.font.size = Pt(9.5)
+            chart.legend.font.color.rgb = txt_rgb
+        except Exception:
+            pass
+
+    plot = chart.plots[0]
+    plot.has_data_labels = True
+    try:
+        plot.data_labels.show_value = True
+        plot.data_labels.font.size = Pt(9.5)
+        plot.data_labels.font.color.rgb = txt_rgb
+    except Exception:
+        pass
+
+    for si_c, ser in enumerate(plot.series):
+        col_rgb = RGBColor(*palette[si_c % len(palette)])
+        try:
+            if ctype == XL_CHART_TYPE.LINE_MARKERS:
+                ser.format.line.color.rgb = col_rgb
+                ser.format.line.width = Pt(2.25)
+            else:
+                ser.format.fill.solid()
+                ser.format.fill.fore_color.rgb = col_rgb
+        except Exception:
+            pass
+
+    for ax_attr in ("category_axis", "value_axis"):
+        try:
+            ax = getattr(chart, ax_attr, None)
+            if ax is not None:
+                ax.tick_labels.font.size = Pt(9.5)
+                ax.tick_labels.font.color.rgb = txt_rgb
+        except Exception:
+            pass
+
+    if note_disp:
+        note_top = min(top_in + ch_h + 0.04, safe_bot - note_h)
+        box = slide.shapes.add_textbox(Inches(left_in), Inches(note_top), Inches(ch_w), Inches(note_h))
+        box.name = "ChartNote"
+        tf = box.text_frame
+        tf.word_wrap = True
+        tf.margin_top = tf.margin_bottom = tf.margin_left = tf.margin_right = 0
+        p_n = tf.paragraphs[0]
+        p_n.alignment = PP_ALIGN.CENTER
+        run = p_n.add_run()
+        run.text = note_disp
+        run.font.size = Pt(9.5)
+        _apply_blank_font(run, note_disp, is_blank)
+        run.font.color.rgb = RGBColor(*(LIGHT_GRAY if dark_bg else GRAY))
+    return g_shape
 
 
 def add_picture_fit(slide, img_path, left_in, top_in, max_w_in, max_h_in,
@@ -1300,7 +1483,7 @@ def add_picture_fit(slide, img_path, left_in, top_in, max_w_in, max_h_in,
     w, h = iw * scale, ih * scale
     left = left_in + (max_w_in - w) / 2.0
     if v_align == "top_bias":
-        top = top_in + min((max_h_in - h) * 0.25, 0.38)
+        top = top_in + min((max_h_in - h) * 0.30, 0.48)
     else:
         top = top_in + (max_h_in - h) / 2.0
     pic = slide.shapes.add_picture(img_path, Inches(left), Inches(top),
@@ -1445,9 +1628,9 @@ def clean_reused_slide(slide, keep_shapes, prs=None, keep_existing_media=False):
                     remove_shape(shp)
 
 
-def should_use_wide_stacked_layout(imgs, table_spec, bullets, is_cover, avail_h):
-    """Switch to Top-Bullets + Full-Width Media for wide tables (>=5 cols, or 4 wide cols)
-    or wide banner architecture diagrams (aspect >= 2.2) when bullets are concise."""
+def should_use_wide_stacked_layout(imgs, table_spec, bullets, is_cover, avail_h, chart_spec=None):
+    """Switch to Top-Bullets + Full-Width Media for wide tables (>=5 cols, or 4 wide cols),
+    wide native charts (>=5 categories), or wide banner diagrams (aspect >= 2.2) when bullets are concise."""
     if is_cover or not bullets or avail_h < 3.6:
         return False
     if table_spec:
@@ -1460,6 +1643,9 @@ def should_use_wide_stacked_layout(imgs, table_spec, bullets, is_cover, avail_h)
             hdr_w = sum(est_text_width(str(h).replace("**", ""), 12) for h in headers)
             if hdr_w >= 4.2:
                 return True
+    if chart_spec and isinstance(chart_spec, dict) and len(bullets) <= 3:
+        if len(chart_spec.get("categories") or []) >= 5:
+            return True
     if len(bullets) <= 3 and len(imgs) == 1 and os.path.isfile(imgs[0]):
         try:
             from PIL import Image
@@ -1517,7 +1703,7 @@ def main():
     font_audit = init_font_strategy(prs, is_blank=is_blank)
 
     def new_slide(sld):
-        has_media = bool(sld.get("image") or sld.get("images") or sld.get("table"))
+        has_media = bool(sld.get("image") or sld.get("images") or sld.get("table") or sld.get("chart"))
         has_bullets = bool(sld.get("bullets"))
         has_two_col = bool((has_media and has_bullets) or (sld.get("right_bullets") and not has_media))
         is_title = sld.get("kind", "") in ("title", "cover") or sld is slides[0]
@@ -1639,7 +1825,8 @@ def main():
         if sld.get("images") and len(imgs) < len(sld.get("images")):
             warnings.append(f"slide {si+1}: some images missing ({len(imgs)}/{len(sld['images'])})")
         table_spec = sld.get("table")
-        has_media = bool(imgs or table_spec)
+        chart_spec = sld.get("chart")
+        has_media = bool(imgs or table_spec or chart_spec)
 
         tph = placeholder_by_role(slide, "title")
         bodies = body_placeholders_sorted(slide, is_cover=is_cover)
@@ -1686,6 +1873,7 @@ def main():
                 ribbon.fill.solid()
                 ribbon.fill.fore_color.rgb = RGBColor(*BLANK_NAVY)
                 ribbon.line.fill.background()
+                _clear_shape_shadow(ribbon)
             except Exception:
                 pass
 
@@ -1704,6 +1892,21 @@ def main():
                 pass
         _ev_top, _ev_w, safe_bottom = footer_layout_info(slide, prs)
 
+        # Compute horizontal margins respecting template placeholders (never overlap left sidebars)
+        margin_l = 0.55
+        content_w = SW_in - 1.10
+        if not is_blank:
+            ref_ph = tph if tph is not None else body
+            if ref_ph is not None:
+                try:
+                    rl = ref_ph.left / EMU_IN
+                    rr = (ref_ph.left + ref_ph.width) / EMU_IN
+                    if 0.30 <= rl <= 1.60 and (rr - rl) >= SW_in * 0.55:
+                        margin_l = rl
+                        content_w = min(SW_in - margin_l - 0.45, max(rr - rl, SW_in * 0.65))
+                except Exception:
+                    pass
+
         # Optional bottom Key Takeaway callout bar (reserve clean vertical slot above footer)
         takeaway_txt = (sld.get("takeaway") or "").strip()
         takeaway_top = None
@@ -1716,7 +1919,8 @@ def main():
         kpi_items = sld.get("kpis") or sld.get("metrics") or []
         if (not is_cover and not keep_existing_media and isinstance(kpi_items, list) and
                 len(kpi_items) >= 2 and (safe_bottom - title_bottom) >= 3.4):
-            kpi_bot = add_kpi_strip(slide, prs, kpi_items, 0.55, title_bottom, SW_in - 1.10, theme_accent=theme_accent)
+            kpi_bot = add_kpi_strip(slide, prs, kpi_items, margin_l, title_bottom, content_w,
+                                    theme_accent=theme_accent, is_blank=is_blank)
             title_bottom = kpi_bot + 0.16
             # Push native placeholders cleanly below the KPI strip
             for ph_s in (body, right_ph, pic_ph):
@@ -1745,7 +1949,7 @@ def main():
         # Determine target media box (prefer native right_ph/pic_ph, or top-bullets + wide media for wide tables/banners)
         media_box = None
         two_col_text = (not has_media and not is_cover and not keep_existing_media and bool(right_bullets))
-        wide_stacked = has_media and should_use_wide_stacked_layout(imgs, table_spec, bullets, is_cover, avail_h)
+        wide_stacked = has_media and should_use_wide_stacked_layout(imgs, table_spec, bullets, is_cover, avail_h, chart_spec=chart_spec)
         if wide_stacked:
             if right_ph is not None:
                 remove_shape(right_ph)
@@ -1753,7 +1957,7 @@ def main():
             if pic_ph is not None:
                 remove_shape(pic_ph)
                 pic_ph = None
-            full_w = SW_in - 1.10
+            full_w = content_w
             # Estimate compact top bullets height at 15pt
             top_est = 0.0
             for lv, t in bullets:
@@ -1761,16 +1965,16 @@ def main():
                 top_est += nl * 1.28 * 15.0 / 72.0 + 0.07
             top_h = min(max(top_est + 0.20, 0.95), min(1.85, avail_h * 0.38))
             if body is not None:
-                set_placeholder_box(body, 0.55, title_bottom, full_w, top_h)
+                set_placeholder_box(body, margin_l, title_bottom, full_w, top_h)
             media_top = title_bottom + top_h + 0.14
-            media_box = (0.55, media_top, full_w, max(safe_bottom - media_top, 1.8))
+            media_box = (margin_l, media_top, full_w, max(safe_bottom - media_top, 1.8))
         elif two_col_text:
             if pic_ph is not None:
                 remove_shape(pic_ph)
                 pic_ph = None
             col_gap = 0.40
-            col_w = (SW_in - 1.10 - col_gap) / 2.0
-            left_x = 0.55
+            col_w = (content_w - col_gap) / 2.0
+            left_x = margin_l
             right_x = left_x + col_w + col_gap
             col_top = title_bottom
             if left_heading or right_heading:
@@ -1789,6 +1993,7 @@ def main():
                     hrun.text = glue_num_units(htxt.replace("**", ""))[:60]
                     hrun.font.size = Pt(15)
                     hrun.font.bold = True
+                    _apply_blank_font(hrun, hrun.text, is_blank)
                     hrun.font.color.rgb = hdr_col_rgb
                 col_top = title_bottom + 0.40
             col_h = max(safe_bottom - col_top, 1.8)
@@ -1802,6 +2007,7 @@ def main():
                 div.fill.solid()
                 div.fill.fore_color.rgb = RGBColor(*( (0x33, 0x41, 0x55) if is_dark_slide_bg(slide, prs) else (0xDC, 0xE1, 0xE8) ))
                 div.line.fill.background()
+                _clear_shape_shadow(div)
             except Exception:
                 pass
             if body is not None:
@@ -1940,9 +2146,13 @@ def main():
                 add_table(slide, prs, table_spec, ml, mt, mw, mh,
                           is_blank=is_blank, theme_accent=theme_accent,
                           safe_bottom_override=safe_bottom)
+            elif chart_spec:
+                add_native_chart(slide, prs, chart_spec, ml, mt, mw, mh,
+                                 is_blank=is_blank, theme_accent=theme_accent,
+                                 safe_bottom_override=safe_bottom)
 
         if takeaway_top is not None and takeaway_txt:
-            add_takeaway_bar(slide, prs, takeaway_txt, 0.55, takeaway_top, SW_in - 1.10,
+            add_takeaway_bar(slide, prs, takeaway_txt, margin_l, takeaway_top, content_w,
                              theme_accent=theme_accent, is_blank=is_blank)
 
         # End-of-slide sweep: remove any unfilled non-footer ghost placeholders (both newly added and --reuse)
@@ -1953,7 +2163,10 @@ def main():
         prune_empty_placeholders(slide, filled_els, keep_existing_media=keep_existing_media)
 
         if a.evidence_line and ev_text:
-            add_evidence_line(slide, prs, ev_text, reserve_right_in=(1.35 if (is_blank and not is_cover) else 0.0))
+            ev_left = margin_l if (not is_blank and margin_l >= 0.85) else 0.35
+            add_evidence_line(slide, prs, ev_text,
+                              reserve_right_in=(1.35 if (is_blank and not is_cover) else 0.0),
+                              is_blank=is_blank, left_in=ev_left)
         if is_blank and not is_cover:
             add_blank_slide_number(slide, prs, si + 1, len(slides))
 

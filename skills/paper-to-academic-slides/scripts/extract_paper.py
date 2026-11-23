@@ -619,6 +619,10 @@ def write_paper_index(ctx, outdir):
     ]
     if ctx.get("ocr_pages"):
         lines.append(f"- OCR-recovered scanned pages: {ctx['ocr_pages']}")
+    if ctx.get("image_formula_pages"):
+        lines.append(f"- Image-embedded formulas detected on pages: {ctx['image_formula_pages']} (cite by page; avoid fragile manual transcription)")
+    if ctx.get("unextracted_figures"):
+        lines.append(f"- Unextracted figure captions (no PNG cropped): {ctx['unextracted_figures']} (cite by figure/page or summarize via native table/chart; do NOT invent paths)")
     if ctx.get("limits"):
         lines.append(f"- Extraction limits: {'; '.join(ctx['limits'])}")
 
@@ -828,19 +832,24 @@ def main():
     except Exception as e:
         limits.append(f"pymupdf open failed: {e}; trying pdftotext fallback")
 
-    pages, captions, sections, figures, tables, limit_pages, ocr_pages = [], [], [], [], [], [], []
+    pages, captions, sections, figures, tables, limit_pages, ocr_pages, formula_img_pages = [], [], [], [], [], [], [], []
     title = ""
     ocr_lang = None
     ocr_checked = False
 
     if doc is not None:
+        pdf_locked = False
         if doc.needs_pass:
             try:
-                doc.authenticate("")
+                auth_ok = doc.authenticate("")
+                if not auth_ok and doc.is_encrypted:
+                    pdf_locked = True
+                    limits.append("PDF is password-encrypted and locked; text/images could not be extracted")
             except Exception:
+                pdf_locked = True
                 limits.append("PDF appears encrypted; text/images may be empty")
-        n = min(doc.page_count, a.max_pages)
-        if doc.page_count > a.max_pages:
+        n = 0 if pdf_locked else min(doc.page_count, a.max_pages)
+        if not pdf_locked and doc.page_count > a.max_pages:
             limits.append(f"page cap {a.max_pages} < {doc.page_count}; truncated")
 
         in_refs = False
@@ -1002,7 +1011,16 @@ def main():
 
             for j, info in enumerate(infos):
                 b = info.get("bbox")
-                if not b or (b[2] - b[0]) * (b[3] - b[1]) < 0.015 * parea:
+                if not b:
+                    continue
+                bw_i, bh_i = b[2] - b[0], b[3] - b[1]
+                # Detect rasterized equations / formula strips inside body text
+                if (55 <= bw_i <= pw_p * 0.88 and 12 <= bh_i <= 65
+                        and (bw_i / max(bh_i, 1.0)) >= 2.2
+                        and ph_p * 0.10 <= b[1] <= ph_p * 0.88):
+                    if (i + 1) not in formula_img_pages:
+                        formula_img_pages.append(i + 1)
+                if bw_i * bh_i < 0.015 * parea:
                     continue
                 best_c = _match_caption_for_bbox(b[0], b[1], b[2], b[3])
                 cap_y_lim = best_c["y"] if (best_c and best_c["y"] is not None and best_c["y"] >= b[3] - 20) else None
@@ -1128,6 +1146,16 @@ def main():
     if total_chars < 500:
         limits.append(f"low extracted text ({total_chars} chars); PDF may be scanned/image-only")
 
+    extracted_fig_norms = {fg.get("norm_id") for fg in figures if fg.get("norm_id")}
+    unextracted_figs = []
+    for c in captions:
+        if c.get("kind") == "figure" and c.get("norm_id") and c["norm_id"] not in extracted_fig_norms:
+            unextracted_figs.append(f"{c.get('id')} (p.{c.get('page')})")
+    if unextracted_figs:
+        limits.append(f"figure(s) could not be raster/vector cropped: {', '.join(unextracted_figs[:8])}")
+    if formula_img_pages:
+        limits.append(f"formula-like raster images detected on page(s): {formula_img_pages[:10]}")
+
     for fg in figures:
         fw, fh = fg.get("w") or 0, fg.get("h") or 0
         if fw and fh:
@@ -1144,6 +1172,8 @@ def main():
         "abstract_page": abstract_page,
         "limitations_pages": limit_pages,
         "ocr_pages": ocr_pages,
+        "image_formula_pages": formula_img_pages,
+        "unextracted_figures": unextracted_figs,
         "recommended_read_pages": rec_pages,
         "key_highlights": key_hls,
         "pages": pages,

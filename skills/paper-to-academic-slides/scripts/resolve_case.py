@@ -277,6 +277,9 @@ def main():
         "starting_deck": None,
         "starting_deck_dump_md": None,
         "template_info": None,
+        "starting_deck_info": None,
+        "effective_template_mode": "blank",
+        "case_labels": {},
         "constraints": {},
         "output_contract": None,
         "expected_outputs": {},
@@ -356,6 +359,10 @@ def main():
             return None
 
         resolved["case_id"] = grab(["case_id", "id", "caseid"])
+        for lbl_k in ("domain", "field", "subject", "discipline", "topic", "paper_title", "title", "category"):
+            lv = grab([lbl_k])
+            if isinstance(lv, str) and lv.strip():
+                resolved["case_labels"][lbl_k] = lv.strip()[:180]
         for key in PDF_KEYS:
             v = grab([key])
             if isinstance(v, str) and v.lower().endswith(".pdf"):
@@ -503,8 +510,24 @@ def main():
         resolved["template_pptx"] = None
     if resolved["starting_deck"] and os.path.isfile(resolved["starting_deck"]):
         if not resolved["template_pptx"] or os.path.abspath(resolved["starting_deck"]) != os.path.abspath(resolved["template_pptx"]):
-            resolved["starting_deck_info"] = inspect_pptx(resolved["starting_deck"], case_raw_text)
+            sinfo = inspect_pptx(resolved["starting_deck"], case_raw_text)
+            resolved["starting_deck_info"] = sinfo
             resolved["notes"].append("both template_pptx and starting_deck present; inspect starting_deck_info if task requires editing existing slides")
+
+    # Compute effective_template_mode honoring starting_deck when both PPTX files are supplied
+    s_info = resolved.get("starting_deck_info") or {}
+    t_info = resolved.get("template_info") or {}
+    if resolved.get("starting_deck") and os.path.isfile(resolved["starting_deck"]):
+        if s_info.get("recommended_mode") == "reuse" or t_info.get("recommended_mode") == "reuse":
+            resolved["effective_template_mode"] = "reuse"
+        elif s_info.get("n_existing_slides", 0) >= 2:
+            resolved["effective_template_mode"] = "reuse"
+        else:
+            resolved["effective_template_mode"] = t_info.get("recommended_mode") or "layouts"
+    elif resolved.get("template_pptx"):
+        resolved["effective_template_mode"] = t_info.get("recommended_mode") or "layouts"
+    else:
+        resolved["effective_template_mode"] = "blank"
 
     out = a.out or os.path.join(os.environ.get("PPT_WORK", "/app/work"), "case_resolved.json")
     work_dir = os.path.dirname(os.path.abspath(out)) or "."

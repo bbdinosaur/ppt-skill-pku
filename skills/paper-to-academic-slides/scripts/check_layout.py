@@ -143,8 +143,9 @@ def main():
             name = getattr(shape, "name", "?")
             has_tf = getattr(shape, "has_text_frame", False)
             has_tbl = getattr(shape, "has_table", False)
+            has_cht = getattr(shape, "has_chart", False)
             stype = "pic" if shape.shape_type == 13 else (
-                "table" if has_tbl else ("text" if has_tf else str(shape.shape_type)))
+                "table" if has_tbl else ("chart" if has_cht else ("text" if has_tf else str(shape.shape_type))))
 
             # 1 bounds
             if bb[0] < -TOL or bb[1] < -TOL or bb[2] > SW + TOL or bb[3] > SH + TOL:
@@ -207,11 +208,11 @@ def main():
                     issues.append({"slide": si, "sev": "fail", "type": "font_too_small",
                                    "shape": name, "detail": f"table cell {min_pt}pt"})
 
-            if stype in ("pic", "table") or (stype == "text" and has_text):
+            if stype in ("pic", "table", "chart") or (stype == "text" and has_text):
                 boxes.append((bb, stype, name))
 
-        # 3 picture/table vs non-empty text overlap (severe >25% -> fail)
-        media = [b for b in boxes if b[1] in ("pic", "table")]
+        # 3 picture/table/chart vs non-empty text overlap (severe >25% -> fail)
+        media = [b for b in boxes if b[1] in ("pic", "table", "chart")]
         texts = [b for b in boxes if b[1] == "text"]
         for mb in media:
             for tb in texts:
