@@ -52,6 +52,7 @@ def main() -> int:
     ap.add_argument("--case-dir", default="/input")
     ap.add_argument("--work", default="/app/work")
     ap.add_argument("--deck", default="/app/output/presentation.pptx")
+    ap.add_argument("--plan", default=None)
     ap.add_argument("--status", default="auto", choices=("auto", "ok", "partial", "failed"))
     ap.add_argument("--pass-num", type=int, default=1)
     args = ap.parse_args()
@@ -62,7 +63,8 @@ def main() -> int:
     content_map = read_json(work / "content_map.json", {}) or {}
     checks = read_json(work / "checks.json", {}) or {}
     export = read_json(work / "export_report.json", {}) or {}
-    plan = read_json(work / "slides_plan.json", {}) or {}
+    plan_src = Path(args.plan) if args.plan else (work / "slides_plan.json")
+    plan = read_json(plan_src, {}) or read_json(work / "slides_plan.json", {}) or {}
 
     deck = Path(args.deck)
     pdf = Path(export.get("pdf") or (deck.parent / (deck.stem + ".pdf")))
@@ -218,6 +220,8 @@ def main() -> int:
             "slide_count": len(cm_slides),
             "audience": wo.get("audience"),
             "language": wo.get("language"),
+            "duration": wo.get("duration"),
+            "source_preservation": wo.get("source_preservation"),
             "slides": cm_slides,
         },
         "compliance_checks": {
@@ -351,6 +355,13 @@ def main() -> int:
         q.append(f"- editable_source: `{result['editable_source']}`")
         q.append(f"- export_artifact: `{result['export_artifact']}`")
         q.append(f"- duration estimate: ~{est_min} min (workorder: {wo_dur})")
+        if wo.get("audience") or wo.get("language") or wo.get("source_preservation"):
+            q.append(
+                f"- constraints: audience=`{wo.get('audience') or 'general'}` | "
+                f"language=`{wo.get('language') or 'auto'}`"
+                + (f" | source_preservation=`{_md_esc(wo.get('source_preservation'))[:100]}`"
+                   if wo.get("source_preservation") else "")
+            )
         if result.get("slide_diff"):
             q.append("- per-slide diff: `slide_diff.md`")
         q.append("")

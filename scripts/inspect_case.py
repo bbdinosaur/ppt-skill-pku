@@ -184,6 +184,7 @@ def extract_pdf(pdf_path: Path, work: Path):
             chunks.append(f"\n\n<!-- PDF page {pno + 1} -->\n" + page.get_text("text"))
             # Detect figure & table caption blocks with coordinates
             fig_caps = []
+            page_tbl_caps = []
             page_has_tbl = False
             try:
                 for b in page.get_text("dict").get("blocks", []):
@@ -226,6 +227,7 @@ def extract_pdf(pdf_path: Path, work: Path):
                             mt = TBL_CAP_RE.match(btxt)
                             if mt:
                                 page_has_tbl = True
+                                page_tbl_caps.append(btxt[:180])
                                 tbl_index_lines.append(f"- p{pno + 1}: {btxt[:140]}")
                                 out["tables_index"].append({"page": pno + 1, "id": mt.group(1), "caption": btxt[:180]})
             except Exception:
@@ -233,10 +235,11 @@ def extract_pdf(pdf_path: Path, work: Path):
 
             # Extract structured PDF tables via PyMuPDF find_tables() using cell-clip text
             # Strictly gated on actual Table caption blocks on this page (<0.25s on 25p PDFs!)
+            # Falls back to vertical_strategy="text" for borderless LaTeX booktabs academic tables
             if len(out["tables_extracted"]) < 8 and page_has_tbl and hasattr(page, "find_tables"):
-                try:
-                    tf = page.find_tables()
-                    for tb in (getattr(tf, "tables", None) or []):
+                def _extract_tbl_list(tf_obj):
+                    found = []
+                    for tb in (getattr(tf_obj, "tables", None) or []):
                         clean_rows = []
                         tb_rows = getattr(tb, "rows", None) or []
                         for row in tb_rows[:12]:
@@ -250,9 +253,26 @@ def extract_pdf(pdf_path: Path, work: Path):
                             if any(cr):
                                 clean_rows.append(cr)
                         if len(clean_rows) >= 2 and len(clean_rows[0]) >= 2:
-                            out["tables_extracted"].append({"page": pno + 1, "rows": clean_rows})
-                            if len(out["tables_extracted"]) >= 8:
-                                break
+                            # Reject prose false positives: require >=2 non-empty cells in >=2 rows
+                            dense_rows = sum(1 for r in clean_rows if sum(1 for c in r if c) >= 2)
+                            if dense_rows >= 2:
+                                found.append(clean_rows)
+                    return found
+
+                try:
+                    found_tbls = _extract_tbl_list(page.find_tables())
+                    if not found_tbls:
+                        try:
+                            found_tbls = _extract_tbl_list(
+                                page.find_tables(vertical_strategy="text", horizontal_strategy="lines")
+                            )
+                        except Exception:
+                            found_tbls = []
+                    for ti_p, clean_rows in enumerate(found_tbls):
+                        t_cap = page_tbl_caps[ti_p] if ti_p < len(page_tbl_caps) else (page_tbl_caps[0] if page_tbl_caps else "")
+                        out["tables_extracted"].append({"page": pno + 1, "caption": t_cap, "rows": clean_rows})
+                        if len(out["tables_extracted"]) >= 8:
+                            break
                 except Exception:
                     pass
 
@@ -387,11 +407,29 @@ def normalize_workorder(wo: dict):
                 return v
         return default
     mode = g("mode", "task_type", "operation", "deck_mode", default="")
-    m = str(mode).lower()
-    if any(k in m for k in ("edit", "adapt", "revise", "modify", "更新", "修改", "编辑")):
-        out["mode"] = "edit"
-    elif any(k in m for k in ("create", "generate", "build", "new", "生成", "创建", "制作")):
+    # Normalize separators so word boundaries work on snake_case / kebab-case / paths
+    m = re.sub(r"[-_/]+", " ", str(mode).lower()).strip()
+    # Strip benign non-edit phrases before keyword matching (e.g. "generate_editable_slides",
+    # "editable_pptx", "template_adaptation", "adapt_paper_to_slides", "生成可编辑PPT")
+    m = re.sub(r"\beditable\b", " ", m)
+    m = re.sub(
+        r"\b(?:(?:template|paper|manuscript|article)\s+adapt\w*"
+        r"|adapt\w*(?:\s+(?:to|for|from|with|a|the))*\s+(?:template|paper|manuscript|article))\b",
+        " ", m,
+    )
+    m = re.sub(r"(?:可编辑|模板适配|适配模板)", " ", m)
+    is_create = (
+        bool(re.search(r"\b(?:create|creating|created|creation|generate|generating|generated|generation|build|building|built|new)\b", m))
+        or any(k in m for k in ("生成", "创建", "制作", "新建"))
+    )
+    is_edit = (
+        bool(re.search(r"\b(?:edit|edits|editing|edited|revise|revising|revised|revision|modify|modifying|modified|modification|adapt|adapting|adapted|adaptation|update|updating|updated)\b", m))
+        or any(k in m for k in ("更新", "修改", "编辑", "修订"))
+    )
+    if is_create and not is_edit:
         out["mode"] = "create"
+    elif is_edit and not is_create:
+        out["mode"] = "edit"
     else:
         out["mode"] = "auto"
     for keys, dst in (
@@ -434,7 +472,9 @@ def dump_start_deck(start_path: Path, out_md: Path) -> str | None:
         return None
     try:
         prs = Presentation(str(start_path))
-        lines = [f"# Starting Deck Dump: `{start_path.name}` ({len(prs.slides)} slides)", ""]
+        n_slides = len(prs.slides)
+        note_cap = 180 if n_slides > 10 else 420
+        lines = [f"# Starting Deck Dump: `{start_path.name}` ({n_slides} slides)", ""]
         for i, slide in enumerate(prs.slides, 1):
             snap = deckutil.extract_slide_snapshot(slide, prs)
             lines.append(f"## Slide {i} [{snap['layout']}]")
@@ -452,7 +492,8 @@ def dump_start_deck(start_path: Path, out_md: Path) -> str | None:
             if snap["images"]:
                 lines.append(f"- **Images**: {snap['images']}")
             if snap["notes"]:
-                lines.append(f"- **Notes**: {snap['notes']}")
+                nt = snap["notes"]
+                lines.append(f"- **Notes**: {nt[:note_cap]}" + (" ..." if len(nt) > note_cap else ""))
             lines.append("")
         out_md.write_text("\n".join(lines), encoding="utf-8")
         return str(out_md)
@@ -504,6 +545,60 @@ def extract_pdfs(pdf_paths, work: Path):
     return merged
 
 
+def _extract_xlsx_md(xlsx_path: Path, max_sheets: int = 6, max_rows: int = 30, max_cols: int = 12) -> str:
+    """Zero-dependency stdlib XLSX sheet-to-Markdown extractor for benchmark/data tables."""
+    import xml.etree.ElementTree as ET
+    out_lines: list[str] = []
+    try:
+        with zipfile.ZipFile(xlsx_path) as z:
+            shared: list[str] = []
+            if "xl/sharedStrings.xml" in z.namelist():
+                root_s = ET.fromstring(z.read("xl/sharedStrings.xml"))
+                for si in root_s.iter():
+                    if si.tag.endswith("}si") or si.tag == "si":
+                        txt = "".join(t.text or "" for t in si.iter() if t.tag.endswith("}t") or t.tag == "t")
+                        shared.append(txt.strip())
+            sheets = sorted(n for n in z.namelist() if re.match(r"xl/worksheets/sheet\d+\.xml$", n))[:max_sheets]
+            for sname in sheets:
+                root = ET.fromstring(z.read(sname))
+                rows_out: list[list[str]] = []
+                for row in root.iter():
+                    if not (row.tag.endswith("}row") or row.tag == "row"):
+                        continue
+                    vals: list[str] = []
+                    for c in list(row)[:max_cols]:
+                        if not (c.tag.endswith("}c") or c.tag == "c"):
+                            continue
+                        ct = c.attrib.get("t", "")
+                        val = ""
+                        if ct == "inlineStr":
+                            val = "".join(t.text or "" for t in c.iter() if t.tag.endswith("}t") or t.tag == "t").strip()
+                        else:
+                            v_el = next((ch for ch in c if ch.tag.endswith("}v") or ch.tag == "v"), None)
+                            if v_el is not None and v_el.text is not None:
+                                raw_v = v_el.text.strip()
+                                if ct == "s" and raw_v.isdigit() and int(raw_v) < len(shared):
+                                    val = shared[int(raw_v)]
+                                else:
+                                    val = raw_v
+                        vals.append(re.sub(r"\s+", " ", val).replace("|", "/"))
+                    if any(vals):
+                        rows_out.append(vals)
+                    if len(rows_out) >= max_rows:
+                        break
+                if rows_out:
+                    out_lines.append(f"### {xlsx_path.name} ({Path(sname).stem})")
+                    ncols = max(len(r) for r in rows_out)
+                    for ri, r in enumerate(rows_out):
+                        r_pad = r + [""] * (ncols - len(r))
+                        out_lines.append("| " + " | ".join(r_pad) + " |")
+                        if ri == 0:
+                            out_lines.append("| " + " | ".join("---" for _ in range(ncols)) + " |")
+    except Exception:
+        return ""
+    return "\n".join(out_lines)
+
+
 def _skip_path(p: Path, case_dir: Path, work: Path) -> bool:
     """Exclude work/ and output/ subdirectories when scanning case_dir."""
     try:
@@ -552,7 +647,7 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
         lines.extend(figs)
         lines.append("")
 
-    # 2b. Extracted structured PDF tables (exact cell values for zero-typo slides)
+    # 2b. Extracted structured PDF tables (exact cell values + matched caption for zero-typo slides)
     ext_tables = pdf_ex.get("tables_extracted") or []
     if ext_tables:
         lines.append("## Extracted PDF Tables")
@@ -560,7 +655,9 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
             rows = tb.get("rows") or []
             if not rows:
                 continue
-            lines.append(f"### PDF Table {ti} (p.{tb.get('page')})")
+            t_cap = str(tb.get("caption") or "").strip()
+            hdr_lbl = f"### PDF Table {ti} (p.{tb.get('page')})" + (f" — {t_cap[:120]}" if t_cap else "")
+            lines.append(hdr_lbl)
             lines.append("| " + " | ".join(rows[0]) + " |")
             lines.append("|" + "|".join(["---"] * len(rows[0])) + "|")
             for r in rows[1:13]:
@@ -616,24 +713,29 @@ def write_material_digest(inv: dict, work: Path) -> str | None:
             except Exception:
                 continue
 
-    # 3. Full structured material.json (verbatim up to 9.5KB; rich per-key preview if larger)
+    # 3. Full structured material.json (dynamic anti-starvation budget: <=4.8KB verbatim when PDF
+    #    is also present so PDF Abstract/Captions/Key Sentences NEVER get clipped out of Step 1 stdout;
+    #    <=9.5KB verbatim when no PDF is present)
     mat = inv.get("material") or {}
     mat_chars = 0
     mat_truncated = False
+    mat_verbatim_cap = 4800 if len(mt_raw) > 2000 else 9500
     if mat:
         lines.append("## material.json Full Content")
         mat_str = json.dumps(mat, ensure_ascii=False, indent=1)
         mat_chars = len(mat_str)
-        if mat_chars <= 9500:
+        if mat_chars <= mat_verbatim_cap:
             lines.append("```json\n" + mat_str + "\n```")
         else:
             mat_truncated = True
+            per_hi = 950 if len(mt_raw) > 2000 else 1600
+            per_lo = 360 if len(mt_raw) > 2000 else 600
             for k, v in list(mat.items())[:24]:
                 vs = json.dumps(v, ensure_ascii=False)
-                cap_k = 1600 if k.lower() in (
+                cap_k = per_hi if k.lower() in (
                     "tables", "figures", "key_numbers", "results", "claims",
                     "metrics", "limitations", "sections", "abstract", "method", "methods"
-                ) else 600
+                ) else per_lo
                 lines.append(f"- **{k}**: {vs[:cap_k]}" + (" ..." if len(vs) > cap_k else ""))
         lines.append("")
 
@@ -852,7 +954,9 @@ def main() -> int:
             start_deck = others[0]
     if start_deck is None and wo_mode == "edit" and pptx_files:
         non_tmpl = [p for p in pptx_files if template is None or p.resolve() != template.resolve()]
-        start_deck = non_tmpl[0] if non_tmpl else pptx_files[0]
+        # Never coerce a lone identified template.pptx into start_deck when no independent deck exists
+        if non_tmpl:
+            start_deck = non_tmpl[0]
 
     inv["template"] = describe_pptx(template) if template else None
     inv["start_deck"] = describe_pptx(start_deck) if start_deck else None
@@ -923,8 +1027,8 @@ def main() -> int:
             except Exception as e:
                 inv["anomalies"].append(f"material text extract failed: {e}")
 
-    # ---- supplementary text/data files (CSV/TSV/MD/TXT/extra JSON alongside PDFs)
-    supp_exts = (".csv", ".tsv", ".md", ".txt", ".json")
+    # ---- supplementary text/data files (CSV/TSV/MD/TXT/TEX/BIB/extra JSON/XLSX alongside PDFs)
+    supp_exts = (".csv", ".tsv", ".md", ".txt", ".tex", ".bib", ".json")
     skip_names = {"case.json", "task.md", "slide-workorder.json", "workorder.json",
                   "material.json", "materials.json", "content.json"}
     inv["extra_text_files"] = [
@@ -933,6 +1037,16 @@ def main() -> int:
         and p.name not in skip_names and not _skip_path(p, case_dir, work)
         and p.stat().st_size <= 2_000_000
     ][:20]
+    xlsx_files = [
+        p for p in sorted(case_dir.rglob("*.xlsx"))
+        if p.is_file() and not _skip_path(p, case_dir, work) and p.stat().st_size <= 5_000_000
+    ][:4]
+    if xlsx_files:
+        x_chunks = [md for xp in xlsx_files if (md := _extract_xlsx_md(xp))]
+        if x_chunks:
+            x_md_path = work / "xlsx_tables.md"
+            x_md_path.write_text("\n\n".join(x_chunks), encoding="utf-8")
+            inv["extra_text_files"].append(str(x_md_path))
 
     # ---- figure images shipped with the case
     img_exts = (".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".svg", ".emf")

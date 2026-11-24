@@ -70,7 +70,9 @@ def shrink_shape(sh, default_pt, min_pt=11.0, compact_spacing_pt=None):
 
 
 def shrink_title(prs, slide, tph, min_pt=17.0, is_cover: bool = False):
-    """Step title font down (1pt steps) until estimated height fits cleanly above the accent divider."""
+    """Step title font down (1pt steps) until estimated height fits cleanly above the accent divider.
+    On content slides, also avoid awkward 1-word orphan wraps by stepping down gently (to >=22pt)
+    when a moderate single-paragraph title can sit on one crisp line."""
     try:
         _, _, tw, th = du.ph_geom(prs, slide, tph)
         if not (tw and th):
@@ -79,6 +81,16 @@ def shrink_title(prs, slide, tph, min_pt=17.0, is_cover: bool = False):
         # Cap oversized 44pt blank-default titles on content slides so claim titles stay crisp and never touch the divider
         new = min(size, 32.0) if (not is_cover and size > 34.0) else size
         avail_w_pt = max(tw.pt - 18.0, 120.0)
+        # Prefer a clean single-line claim title if a gentle shrink (>=22pt) eliminates orphan line wraps
+        if not is_cover and len(tph.text_frame.paragraphs) == 1:
+            t_txt = (tph.text_frame.text or "").strip()
+            if 0 < du.em_width(t_txt) <= 46.0 and du.est_lines(t_txt, new, avail_w_pt) > 1:
+                one_line_floor = max(min_pt, 22.0)
+                cand = new
+                while cand > one_line_floor and du.est_lines(t_txt, cand, avail_w_pt) > 1:
+                    cand -= 1.0
+                if du.est_lines(t_txt, cand, avail_w_pt) == 1:
+                    new = cand
         while new > min_pt and du.tf_text_height_pt(tph.text_frame, avail_w_pt, new) > th.pt * 0.80:
             new -= 1.0
         if new < size - 0.5:
@@ -151,17 +163,40 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
 
     title = du.strip_md(str(spec.get("title", "")))
     tph = du.slide_title_ph(slide)
+    SW = int(prs.slide_width)
+    needs_light_ink = du.dark_slide_needs_light_ink(prs, slide)
     if title:
         if tph is not None:
-            tph.text_frame.text = title
+            # Widen 4:3-stuck-on-16:9 narrow title placeholders (e.g. 9.0" on 13.33" canvas)
+            # so titles align cleanly across the 16:9 slide & avoid off-center / 1-word orphan wraps
+            tl0, tt0, tw0, th0 = du.ph_geom(prs, slide, tph)
+            if du.ph_ok(tw0) and du.ph_ok(th0) and int(tw0) < int(SW * 0.72) and (int(tl0 or 0) < int(SW * 0.15)):
+                if role in ("title", "section", "qa"):
+                    du.set_ph_rect(prs, slide, tph, left=int(SW * 0.08), top=tt0, width=int(SW * 0.84), height=th0)
+                else:
+                    du.set_ph_rect(prs, slide, tph, left=int(SW * 0.065), top=tt0, width=int(SW * 0.87), height=th0)
+            tph.text_frame.text = du.glue_num_units(title)
             shrink_title(prs, slide, tph, min_pt=t_min_pt, is_cover=(role in ("title", "section", "qa")))
+            if needs_light_ink:
+                du.ensure_readable_tf_color(tph.text_frame)
         else:
-            SW = int(prs.slide_width)
-            du.fit_textbox(slide, (int(SW * 0.065), int(prs.slide_height * 0.05),
-                                   int(SW * 0.87), int(prs.slide_height * 0.12)),
-                           title, size_pt=du.DEFAULT_TITLE_PT, bold=True)
+            tb_t = du.fit_textbox(slide, (int(SW * 0.065), int(prs.slide_height * 0.05),
+                                          int(SW * 0.87), int(prs.slide_height * 0.12)),
+                                  title, size_pt=du.DEFAULT_TITLE_PT, bold=True,
+                                  color="#F1F5F9" if needs_light_ink else None)
+            shrink_shape(tb_t, du.DEFAULT_TITLE_PT, min_pt=t_min_pt)
     subtitle_txt = du.strip_md(str(spec.get("subtitle", "")))
+    if subtitle_txt.strip() and role in ("title", "section", "qa"):
+        sub_ph0 = du.get_ph(slide, du.SUBTITLE_TYPES)
+        if sub_ph0 is not None:
+            sl0, st0, sw0, sh0 = du.ph_geom(prs, slide, sub_ph0)
+            if du.ph_ok(sw0) and du.ph_ok(sh0) and int(sw0) < int(SW * 0.72) and (int(sl0 or 0) < int(SW * 0.22)):
+                du.set_ph_rect(prs, slide, sub_ph0, left=int(SW * 0.10), top=st0, width=int(SW * 0.80), height=sh0)
     du.fill_subtitle(slide, subtitle_txt, prs)
+    if needs_light_ink and subtitle_txt.strip():
+        sub_ph = du.get_ph(slide, du.SUBTITLE_TYPES)
+        if sub_ph is not None and sub_ph.has_text_frame:
+            du.ensure_readable_tf_color(sub_ph.text_frame, (0xCB, 0xD5, 0xE1))
 
     if role not in ("title", "qa") and accent:
         du.accent_bar(slide, prs, accent)
@@ -306,6 +341,8 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
             for ph in body_phs[:2]:
                 _style_sparse_tc(ph.text_frame)
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
+                if needs_light_ink:
+                    du.ensure_readable_tf_color(ph.text_frame)
             # Subtle vertical center divider hairline (<0.08" wide -> pure decorative shape)
             if not highlights and not steps:
                 try:
@@ -330,6 +367,8 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                 _cap_body_pt(prs, ph, left_b, min(tc_cap, 20.0 if is_sparse_tc else 17.0))
                 _style_sparse_tc(ph.text_frame)
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
+                if needs_light_ink:
+                    du.ensure_readable_tf_color(ph.text_frame)
             colw = int(rw * 0.50)
             tx = du.fit_textbox(slide, (rl + rw - colw, ct, colw, ch_avail), "")
             du.fill_bullets_tf(tx.text_frame, right_b, accent_rgb=col_hdr_rgb)
@@ -341,6 +380,8 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                     r.font.size = Pt(pt_left)
             _style_sparse_tc(tx.text_frame)
             shrink_shape(tx, pt_left, min_pt=b_min_pt, compact_spacing_pt=c_space)
+            if needs_light_ink:
+                du.ensure_readable_tf_color(tx.text_frame)
     elif bullets:
         rendered_cards = False
         # Preserve native template BODY placeholder slot filling on regular content slides;
@@ -391,6 +432,8 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                         except Exception:
                             pass
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
+                if needs_light_ink:
+                    du.ensure_readable_tf_color(ph.text_frame)
             else:
                 colw = int(rw * left_frac) if has_split else rw
                 tx = du.fit_textbox(slide, (rl, ct, colw, ch_avail), "")
@@ -404,6 +447,8 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                         except Exception:
                             pass
                 shrink_shape(tx, min(b_cap, du.DEFAULT_BODY_PT), min_pt=b_min_pt, compact_spacing_pt=c_space)
+                if needs_light_ink:
+                    du.ensure_readable_tf_color(tx.text_frame)
 
     # --- guaranteed non-overlapping visual slots (handles 1, 2, or 3 visuals cleanly!)
     active_vis = [k for k, on in (("table", has_table), ("chart", has_chart), ("image", has_img)) if on]
@@ -624,12 +669,14 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
         if op == "set_title" and 0 <= sidx < len(prs.slides):
             slide = prs.slides[sidx]
             du.fix_degenerate_placeholders(prs, slide)
-            new_title = du.strip_md(str(e.get("text") if e.get("text") is not None else (e.get("title") or "")))
+            new_title = du.glue_num_units(du.strip_md(str(e.get("text") if e.get("text") is not None else (e.get("title") or ""))))
             tsh = du.find_slide_title_shape(slide, prs)
             if tsh is not None and tsh.has_text_frame:
                 du.set_text_preserving_style(tsh.text_frame, new_title)
                 if tsh.is_placeholder:
                     shrink_title(prs, slide, tsh)
+                else:
+                    shrink_shape(tsh, du.effective_pt(tsh, du.DEFAULT_TITLE_PT), min_pt=16.0)
             _rec_src(id(slide._element), e.get("sources"))
             cm_changes.append({"op": "set_title", "slide": sidx + 1, "to": new_title,
                                "sources": e.get("sources") or []})
@@ -723,13 +770,32 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                     _style_et(tx_e.text_frame)
                 shrink_shape(tx1, et_cap)
                 shrink_shape(tx2, et_cap)
+                try:
+                    from pptx.enum.shapes import MSO_SHAPE
+                    div_x = rl + cw + (gap // 2)
+                    div_h = max(int(Inches(1.6)), ch_h - int(Inches(0.35)))
+                    vdiv = slide.shapes.add_shape(
+                        MSO_SHAPE.RECTANGLE, Emu(div_x), Emu(rt + int(Inches(0.06))),
+                        Emu(int(Inches(0.014))), Emu(div_h),
+                    )
+                    vdiv.fill.solid()
+                    vdiv.fill.fore_color.rgb = _RGBColor(0x33, 0x4E, 0x73) if du.slide_is_dark(slide) else _RGBColor(0xD8, 0xE1, 0xEC)
+                    vdiv.line.fill.background()
+                    du._flat_shape(vdiv)
+                except Exception:
+                    pass
             _rec_src(id(slide._element), e.get("sources"))
             cm_changes.append({"op": "set_two_col", "slide": sidx + 1,
                                "sources": e.get("sources") or []})
 
         elif op == "replace_text":
             old_t, new_t = str(e.get("old", "")), str(e.get("new", ""))
-            targets = list(range(len(prs.slides))) if (str(sraw).lower() == "all" or sidx < 0) else [sidx]
+            if isinstance(sraw, list):
+                targets = [int(x) - 1 for x in sraw if (isinstance(x, int) or str(x).isdigit()) and 0 <= int(x) - 1 < len(prs.slides)]
+            elif str(sraw).lower() == "all" or sidx < 0:
+                targets = list(range(len(prs.slides)))
+            else:
+                targets = [sidx]
             total_hits = 0
             for ti in targets:
                 if 0 <= ti < len(prs.slides):
@@ -786,9 +852,42 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                 existing_tbl = next((sh for sh in slide.shapes if getattr(sh, "has_table", False)), None)
                 nrows, ncols = len(rows), max(len(r) for r in rows)
                 if existing_tbl is not None and len(existing_tbl.table.rows) == nrows and len(existing_tbl.table.columns) == ncols:
+                    tbl_e = existing_tbl.table
                     for ri, row in enumerate(rows):
                         for ci, val in enumerate(row):
-                            du.set_text_preserving_style(existing_tbl.table.cell(ri, ci).text_frame, val)
+                            clean_v = du.glue_num_units(du.strip_md(val))
+                            du.set_text_preserving_style(tbl_e.cell(ri, ci).text_frame, clean_v)
+                    # Guard against lengthened cell text overflowing the existing table frame
+                    try:
+                        col_ws_pt = [c.width.pt for c in tbl_e.columns]
+                        h_pt_e = existing_tbl.height.pt if existing_tbl.height else 0
+                        if h_pt_e > 20:
+                            def _cur_tbl_est():
+                                tot_p = 0.0
+                                for r_o in tbl_e.rows:
+                                    ml_o, rpt_o = 1, 0.0
+                                    for ci_o, c_o in enumerate(r_o.cells):
+                                        sz_o = 12.0
+                                        for p_o in c_o.text_frame.paragraphs:
+                                            for rn_o in p_o.runs:
+                                                if rn_o.font.size is not None:
+                                                    sz_o = rn_o.font.size.pt
+                                                    break
+                                        rpt_o = max(rpt_o, sz_o)
+                                        ml_o = max(ml_o, du.est_lines(c_o.text, sz_o, max(col_ws_pt[ci_o] - 12, 10)))
+                                    tot_p += ml_o * (rpt_o or 12.0) * 1.28 + 4
+                                return tot_p
+                            for step_pt in (11.5, 10.5, 10.0):
+                                if _cur_tbl_est() <= h_pt_e * 1.15 + 4:
+                                    break
+                                for r_o in tbl_e.rows:
+                                    for c_o in r_o.cells:
+                                        for p_o in c_o.text_frame.paragraphs:
+                                            for rn_o in p_o.runs:
+                                                if rn_o.font.size is None or rn_o.font.size.pt > step_pt:
+                                                    rn_o.font.size = Pt(step_pt)
+                    except Exception:
+                        pass
                 else:
                     rl, rt, rw, rh = du.content_region(prs, slide)
                     if existing_tbl is not None and existing_tbl.width and existing_tbl.height:
@@ -1129,26 +1228,38 @@ def main() -> int:
             eid = id(slide._element)
             spec = specs_by_eid.get(eid) or {}
             snap = du.extract_slide_snapshot(slide, prs)
-            spec_bullets = [b.get("t") if isinstance(b, dict) else str(b)
-                            for b in (spec.get("bullets") or [])]
-            tbl_cm = spec.get("table") or {}
-            if not tbl_cm and snap.get("tables"):
-                tbl_cm = {"rows": snap["tables"][0].get("all_rows") or snap["tables"][0].get("preview") or []}
-            ch_cm = spec.get("chart") or {}
-            if not ch_cm and snap.get("charts"):
-                ch_cm = snap["charts"][0]
+            # Prefer live post-edit snapshot bullets so replace_text / set_two_col / set_body
+            # changes are always reflected accurately in content_map & number_fidelity checks.
+            spec_bullets = []
+            tc_sp = spec.get("two_col") or {}
+            if tc_sp:
+                if tc_sp.get("left_title"):
+                    spec_bullets.append(str(tc_sp["left_title"]))
+                spec_bullets.extend(b.get("t") if isinstance(b, dict) else str(b) for b in (tc_sp.get("left_bullets") or []))
+                if tc_sp.get("right_title"):
+                    spec_bullets.append(str(tc_sp["right_title"]))
+                spec_bullets.extend(b.get("t") if isinstance(b, dict) else str(b) for b in (tc_sp.get("right_bullets") or []))
+            spec_bullets.extend(b.get("t") if isinstance(b, dict) else str(b)
+                                for b in (spec.get("bullets") or []))
+            snap_tables = [{"rows": t.get("all_rows") or t.get("preview") or []} for t in (snap.get("tables") or [])]
+            tbl_cm = spec.get("table") or (snap_tables[0] if snap_tables else {})
+            snap_charts = list(snap.get("charts") or [])
+            ch_cm = spec.get("chart") or (snap_charts[0] if snap_charts else {})
             cm.append({
                 "slide": i,
                 "role": spec.get("role", "existing"),
                 "layout": snap["layout"],
                 "title": snap["title"],
                 "subtitle": spec.get("subtitle", ""),
-                "bullets": spec_bullets if spec_bullets else snap["bullets"],
+                "bullets": snap["bullets"] if snap["bullets"] else spec_bullets,
                 "notes": snap["notes"],
                 "sources": (spec.get("sources") or []) + sources_by_eid.get(eid, []),
                 "image": spec.get("image") or {},
+                "images": spec.get("images") or [],
                 "table": tbl_cm,
+                "tables": snap_tables[1:] if len(snap_tables) > 1 else [],
                 "chart": ch_cm,
+                "charts": snap_charts[1:] if len(snap_charts) > 1 else [],
                 "highlights": spec.get("highlights") or [],
                 "steps": spec.get("steps") or [],
                 "takeaway": spec.get("takeaway") or "",

@@ -138,7 +138,8 @@ def tf_text_height_pt(tf, shape_w_pt: float, default_pt: float) -> float:
 
 
 def load_master_styles(prs, template_path=None):
-    """Parse master txStyles (title/body lvl1 sizes, pt) into prs._master_styles."""
+    """Parse master txStyles (title/body lvl1 sizes, pt) and inherited text brightness
+    (clrMap tx1 / titleStyle / bodyStyle srgbClr) into prs._master_styles (read-only XML)."""
     styles = {}
     path = template_path
     try:
@@ -158,6 +159,24 @@ def load_master_styles(prs, template_path=None):
         m = _re.search(r"<a:bodyStyle>\s*<a:lvl1pPr>.*?<a:defRPr[^>]*sz=\"(\d{3,5})\"", xml, _re.S)
         if m:
             styles["body"] = int(m.group(1)) / 100.0
+        # Detect whether master explicitly maps text (tx1) to light ink (lt1/lt2) or light srgbClr
+        text_light = False
+        cm = _re.search(r"<p:clrMap\b[^>]*\btx1=\"(lt1|lt2|dk1|dk2)\"", xml)
+        if cm and cm.group(1) in ("lt1", "lt2"):
+            text_light = True
+        if not text_light:
+            for tag in ("titleStyle", "bodyStyle"):
+                mb = _re.search(rf"<a:{tag}>(.*?)</a:{tag}>", xml, _re.S)
+                if mb:
+                    cs = _re.search(r"<a:solidFill>\s*<a:srgbClr val=\"([0-9A-Fa-f]{6})\"", mb.group(1))
+                    if cs and _rel_luminance(_parse_hex(cs.group(1))) >= 0.45:
+                        text_light = True
+                        break
+                    sc = _re.search(r"<a:solidFill>\s*<a:schemeClr val=\"(lt1|lt2|bg1)\"", mb.group(1))
+                    if sc:
+                        text_light = True
+                        break
+        styles["text_is_light"] = text_light
     except Exception:
         pass
     try:
@@ -165,6 +184,34 @@ def load_master_styles(prs, template_path=None):
     except Exception:
         pass
     return styles
+
+
+def dark_slide_needs_light_ink(prs, slide) -> bool:
+    """True when a slide has a dark background AND the master did not map default text to light ink
+    (prevents unreadable black-on-navy text without ever modifying master or font.name)."""
+    if not slide_is_dark(slide):
+        return False
+    ms = getattr(prs, "_master_styles", None) or {}
+    return not bool(ms.get("text_is_light"))
+
+
+def ensure_readable_tf_color(tf, rgb_tuple: tuple[int, int, int] = (0xF1, 0xF5, 0xF9)) -> None:
+    """Apply readable foreground color to runs lacking explicit color (never sets font.name)."""
+    try:
+        from pptx.dml.color import RGBColor
+        c_rgb = RGBColor(*rgb_tuple)
+        for p in tf.paragraphs:
+            for r in p.runs:
+                has_explicit = False
+                try:
+                    if r.font.color is not None and r.font.color.type is not None:
+                        has_explicit = True
+                except Exception:
+                    pass
+                if not has_explicit:
+                    r.font.color.rgb = c_rgb
+    except Exception:
+        pass
 
 
 def ph_inherited_pt(slide_ph, fallback: float, master_styles=None) -> float:
@@ -571,7 +618,7 @@ def fit_textbox(slide, rect, text, size_pt=None, bold=False, italic=False, align
     tb = slide.shapes.add_textbox(Emu(int(l)), Emu(int(t)), Emu(int(w)), Emu(int(h)))
     tf = tb.text_frame
     tf.word_wrap = True
-    tf.text = str(text)
+    tf.text = glue_num_units(str(text))
     p = tf.paragraphs[0]
     if align is not None:
         p.alignment = align
@@ -643,6 +690,22 @@ def clean_academic_math(text: str) -> str:
     return s
 
 
+_NUM_UNIT_RE = re.compile(
+    r"(?<=[\d⁰¹²³⁴⁵⁶⁷⁸⁹]) (?=(?:ms|us|μs|µs|ns|ps|fs|s|Hz|kHz|MHz|GHz|THz|KB|MB|GB|TB|PB|"
+    r"nm|μm|µm|mm|cm|km|m|K|mK|μK|dB|W|mW|kW|MW|V|mV|kV|A|mA|eV|keV|MeV|GeV|TeV|"
+    r"Pa|kPa|MPa|GPa|mol|mmol|mg|kg|g|L|mL|万|亿|倍|%)(?![A-Za-z0-9]))"
+)
+
+
+def glue_num_units(text: str) -> str:
+    """Bind numeric values to short following units with non-breaking space (\\u00a0)
+    so rendered lines never orphan units like '8.4\\nms' or '1.2\\n万'."""
+    s = str(text or "")
+    if " " not in s:
+        return s
+    return _NUM_UNIT_RE.sub("\u00a0", s)
+
+
 def strip_md(text: str) -> str:
     """Strip inline Markdown **bold** and `code` ticks and format academic LaTeX math cleanly."""
     s = str(text or "")
@@ -669,7 +732,7 @@ def add_rich_runs(p, text: str, base_bold: bool = False, size_pt: float | None =
                   color_rgb=None) -> None:
     """Append runs to paragraph `p`, converting Markdown **bold** into native bold runs,
     stripping `code` ticks, and formatting academic math while NEVER overriding font.name."""
-    raw = clean_academic_math(_MD_CODE_RE.sub(r"\1", str(text or "")))
+    raw = glue_num_units(clean_academic_math(_MD_CODE_RE.sub(r"\1", str(text or ""))))
     pos = 0
     emitted = False
     for m in _MD_BOLD_RE.finditer(raw):
@@ -742,6 +805,10 @@ def _norm_slide_spec(spec: dict) -> dict:
     tc = s.get("two_col")
     if isinstance(tc, dict):
         ntc = dict(tc)
+        if "left_bullets" not in ntc and "left" in ntc:
+            ntc["left_bullets"] = ntc.get("left")
+        if "right_bullets" not in ntc and "right" in ntc:
+            ntc["right_bullets"] = ntc.get("right")
         if "left_bullets" in ntc:
             ntc["left_bullets"] = _norm_bullets_list(ntc.get("left_bullets"))
         if "right_bullets" in ntc:
@@ -788,6 +855,8 @@ def _norm_slide_spec(spec: dict) -> dict:
     tbl = s.get("table")
     if isinstance(tbl, dict):
         ntbl = dict(tbl)
+        if not ntbl.get("rows") and isinstance(ntbl.get("data"), list):
+            ntbl["rows"] = ntbl.get("data")
         hdrs = ntbl.get("headers") or ntbl.get("columns")
         rows = list(ntbl.get("rows") or [])
         if isinstance(hdrs, list) and hdrs:
@@ -796,12 +865,21 @@ def _norm_slide_spec(spec: dict) -> dict:
                 rows = [hdr_strs] + rows
             ntbl["rows"] = rows
         s["table"] = ntbl
+    ch = s.get("chart")
+    if isinstance(ch, dict):
+        nch = dict(ch)
+        if not nch.get("categories") and isinstance(nch.get("labels"), list):
+            nch["categories"] = nch.get("labels")
+        if not nch.get("series") and isinstance(nch.get("data"), list):
+            nch["series"] = nch.get("data")
+        s["chart"] = nch
     return s
 
 
 def normalize_plan(plan: dict) -> dict:
     """Deterministically normalize common LLM schema aliases (single-dict sources,
-    bullets[].text, table.headers, highlights[].metric, steps[].label) without altering facts."""
+    bullets[].text, two_col.left/right, table.headers/data, chart.labels/data,
+    highlights[].metric, steps[].label) without altering facts."""
     if not isinstance(plan, dict):
         return {}
     out = dict(plan)
@@ -817,6 +895,15 @@ def normalize_plan(plan: dict) -> dict:
                 ne["sources"] = _norm_sources_list(ne.get("sources"))
             if "bullets" in ne:
                 ne["bullets"] = _norm_bullets_list(ne.get("bullets"))
+            if isinstance(ne.get("two_col"), dict):
+                tc_e = _norm_slide_spec({"two_col": ne["two_col"]}).get("two_col") or {}
+                for k_tc in ("left_title", "right_title", "left_bullets", "right_bullets"):
+                    if k_tc not in ne and k_tc in tc_e:
+                        ne[k_tc] = tc_e[k_tc]
+            if "left_bullets" not in ne and "left" in ne:
+                ne["left_bullets"] = ne.get("left")
+            if "right_bullets" not in ne and "right" in ne:
+                ne["right_bullets"] = ne.get("right")
             if "left_bullets" in ne:
                 ne["left_bullets"] = _norm_bullets_list(ne.get("left_bullets"))
             if "right_bullets" in ne:
@@ -825,9 +912,13 @@ def normalize_plan(plan: dict) -> dict:
                 ne["table"] = _norm_slide_spec({"table": ne["table"]}).get("table")
             elif isinstance(ne.get("headers"), list) and ne.get("headers"):
                 hdr_strs = [str(c) for c in ne["headers"]]
-                rows = list(ne.get("rows") or [])
+                rows = list(ne.get("rows") or ne.get("data") or [])
                 if not rows or [str(c) for c in rows[0]] != hdr_strs:
                     ne["rows"] = [hdr_strs] + rows
+            if isinstance(ne.get("chart"), dict):
+                ne["chart"] = _norm_slide_spec({"chart": ne["chart"]}).get("chart")
+            elif not ne.get("categories") and isinstance(ne.get("labels"), list):
+                ne["categories"] = ne.get("labels")
             if isinstance(ne.get("slide_spec"), dict):
                 ne["slide_spec"] = _norm_slide_spec(ne["slide_spec"])
             nedits.append(ne)
@@ -1018,7 +1109,7 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                  ref, caption, title, data_labels}. Returns the graphic frame."""
     from pptx.chart.data import CategoryChartData
     from pptx.dml.color import RGBColor
-    from pptx.enum.chart import XL_CHART_TYPE, XL_LEGEND_POSITION
+    from pptx.enum.chart import XL_CHART_TYPE, XL_LABEL_POSITION, XL_LEGEND_POSITION
     from pptx.util import Emu
 
     ctype = {"bar": XL_CHART_TYPE.COLUMN_CLUSTERED,
@@ -1070,18 +1161,42 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
         default_dl = (total_pts <= 12) if (ctype == XL_CHART_TYPE.LINE_MARKERS) else (total_pts <= 16)
         show_labels = chart_spec.get("data_labels", default_dl)
         dark_bg = slide_is_dark(slide)
+        any_frac = False
+        for sr_d in (chart_spec.get("series") or []):
+            for rv in (sr_d.get("values") or []):
+                fv, _ = parse_chart_num(rv)
+                if abs(fv - round(fv)) > 1e-6:
+                    any_frac = True
+                    break
         if show_labels and chart.plots:
             plot = chart.plots[0]
             plot.has_data_labels = True
             dl = plot.data_labels
-            dl.font.size = Pt(11.0)
+            dl.font.size = Pt(10.5 if n_series > 1 else 11.0)
             dl.font.bold = True
-            if any_pct:
+            try:
+                if ctype == XL_CHART_TYPE.LINE_MARKERS:
+                    dl.position = XL_LABEL_POSITION.ABOVE
+                elif ctype in (XL_CHART_TYPE.COLUMN_CLUSTERED, XL_CHART_TYPE.BAR_CLUSTERED):
+                    dl.position = XL_LABEL_POSITION.OUTSIDE_END
+                elif ctype in (XL_CHART_TYPE.COLUMN_STACKED, XL_CHART_TYPE.BAR_STACKED):
+                    dl.position = XL_LABEL_POSITION.CENTER
+                elif ctype == XL_CHART_TYPE.PIE:
+                    dl.show_percentage = True
+                    dl.show_category_name = True
+                    dl.show_value = bool(chart_spec.get("show_value", False))
+                    dl.position = XL_LABEL_POSITION.BEST_FIT
+                    # Prevent PowerPoint/LibreOffice default '0%' integer rounding on fractional shares
+                    if any_pct or any_frac:
+                        dl.number_format = "0.0%"
+            except Exception:
+                pass
+            if any_pct and ctype != XL_CHART_TYPE.PIE:
                 try:
                     dl.number_format = '0.0"%"'
                 except Exception:
                     pass
-            if dark_bg:
+            if dark_bg and ctype not in (XL_CHART_TYPE.COLUMN_STACKED, XL_CHART_TYPE.BAR_STACKED):
                 dl.font.color.rgb = RGBColor(0xE2, 0xE8, 0xF0)
         # Apply theme palette to series (never sets font.name)
         cols = palette or ["#1F4E79", "#2E75B6", "#ED7D31", "#70AD47", "#5B9BD5"]
@@ -1089,19 +1204,28 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
             try:
                 if chart.series:
                     sr0 = chart.series[0]
+                    lums = []
                     for pi in range(len(cats)):
                         c_hex = cols[pi % len(cols)].lstrip("#")
-                        c_rgb = RGBColor(*_safe_accent_for_dark_bg(c_hex)) if dark_bg else RGBColor.from_string(c_hex)
+                        rgb_t = _safe_accent_for_dark_bg(c_hex) if dark_bg else _parse_hex(c_hex)
+                        c_rgb = RGBColor(*rgb_t)
+                        lums.append(_rel_luminance(rgb_t))
                         pt = sr0.points[pi]
                         pt.format.fill.solid()
                         pt.format.fill.fore_color.rgb = c_rgb
+                    if show_labels and chart.plots and lums:
+                        avg_lum = sum(lums) / len(lums)
+                        chart.plots[0].data_labels.font.color.rgb = (
+                            RGBColor(0xFF, 0xFF, 0xFF) if avg_lum < 0.30 else RGBColor(0x1A, 0x20, 0x2C)
+                        )
             except Exception:
                 pass
         else:
             for idx, sr in enumerate(chart.series):
                 c_hex = cols[idx % len(cols)].lstrip("#")
                 try:
-                    c_rgb = RGBColor(*_safe_accent_for_dark_bg(c_hex)) if dark_bg else RGBColor.from_string(c_hex)
+                    rgb_t = _safe_accent_for_dark_bg(c_hex) if dark_bg else _parse_hex(c_hex)
+                    c_rgb = RGBColor(*rgb_t)
                     if ctype == XL_CHART_TYPE.LINE_MARKERS:
                         sr.format.line.color.rgb = c_rgb
                         sr.format.line.width = Pt(2.4)
@@ -1114,6 +1238,23 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                     else:
                         sr.format.fill.solid()
                         sr.format.fill.fore_color.rgb = c_rgb
+                        # Contrast-adaptive CENTER data label ink per series on stacked bars
+                        if show_labels and ctype in (XL_CHART_TYPE.COLUMN_STACKED, XL_CHART_TYPE.BAR_STACKED):
+                            try:
+                                sr.has_data_labels = True
+                                sdl = sr.data_labels
+                                sdl.show_value = True
+                                sdl.position = XL_LABEL_POSITION.CENTER
+                                sdl.font.size = Pt(10.5 if n_series > 1 else 11.0)
+                                sdl.font.bold = True
+                                if any_pct:
+                                    sdl.number_format = '0.0"%"'
+                                sdl.font.color.rgb = (
+                                    RGBColor(0xFF, 0xFF, 0xFF) if _rel_luminance(rgb_t) < 0.42
+                                    else RGBColor(0x1A, 0x20, 0x2C)
+                                )
+                            except Exception:
+                                pass
                         # Optional highlight_last on single-series bar/hbar: mute baselines, pop final bar
                         if n_series == 1 and chart_spec.get("highlight_last") and len(cats) >= 2 and ctype in (
                             XL_CHART_TYPE.COLUMN_CLUSTERED, XL_CHART_TYPE.BAR_CLUSTERED
@@ -1170,7 +1311,7 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
 
 
 def format_caption(ref: str | None, caption: str | None) -> str:
-    """Join figure/table ref and caption without duplicating an existing prefix (e.g. 'Fig. 1 Fig. 1:')."""
+    """Join figure/table ref and caption cleanly with academic separator without duplicating prefix."""
     r = strip_md(str(ref or "")).strip()
     c = strip_md(str(caption or "")).strip()
     if not r:
@@ -1181,7 +1322,10 @@ def format_caption(ref: str | None, caption: str | None) -> str:
     c_low = c.lower()
     if r_low and (c_low.startswith(r_low + " ") or c_low.startswith(r_low + ":") or c_low.startswith(r_low + "：") or c_low.startswith(r_low + ".") or c_low == r_low):
         return c
-    return f"{r} {c}"
+    if r[-1] in (":", "：", ".", "—", "–", "-"):
+        return f"{r} {c}"
+    sep = "：" if any("\u4e00" <= ch <= "\u9fff" for ch in r) else ": "
+    return f"{r}{sep}{c}"
 
 
 def caption_height_emu(cap_text: str | None, width_emu: int, cap_pt: float = 11.0) -> int:
@@ -1248,7 +1392,15 @@ def _is_numeric_cell(txt: str) -> bool:
     s = (txt or "").strip()
     if not s:
         return False
-    return bool(_re.match(r"^[+-±≈~<>≤≥]?\s*\d[\d,\.]*\s*(%|ms|s|GB|MB|KB|x|×|h|min)?(\s*\([^)]*\))?$", s))
+    if s.upper() in ("N/A", "NA", "—", "–", "-", "--"):
+        return True
+    return bool(_re.match(
+        r"^[+-±≈~<>≤≥$€¥]?\s*\d[\d,\.]*"
+        r"(?:\s*(?:[×xX]\s*10[⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻\^\-+0-9]+|[eE][+-]?\d+|±\s*\d[\d,\.]*))?"
+        r"\s*(%|ms|us|μs|µs|ns|s|Hz|kHz|MHz|GHz|GB|MB|KB|TB|K|mK|dB|x|×|h|min|k|M|B|万|亿|倍)?"
+        r"(\s*\([^)]*\))?$",
+        s,
+    ))
 
 
 def _parse_hex(color: str | None, default: str = "1F4E79") -> tuple[int, int, int]:
@@ -1767,10 +1919,11 @@ def add_agenda_rows(slide, rect, bullets, accent=None):
 
 def set_text_preserving_style(tf, text: str) -> None:
     """Update a text frame's text while preserving the first run's formatting (edit mode)."""
+    clean_t = glue_num_units(strip_md(str(text)))
     try:
         if tf.paragraphs and tf.paragraphs[0].runs:
             p0 = tf.paragraphs[0]
-            p0.runs[0].text = str(text)
+            p0.runs[0].text = clean_t
             for r in p0.runs[1:]:
                 r.text = ""
             # Remove extra paragraphs if any
@@ -1780,7 +1933,7 @@ def set_text_preserving_style(tf, text: str) -> None:
             return
     except Exception:
         pass
-    tf.text = str(text)
+    tf.text = clean_t
 
 
 def find_slide_title_shape(slide, prs=None):
@@ -1847,6 +2000,7 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
     chart titles/axis titles & notes, preserving formatting (with smart-punctuation & whitespace fallbacks)."""
     if not old:
         return 0
+    new_clean = glue_num_units(strip_md(new)) if any(ch in new for ch in ("**", "`", "$", "\\", "^", "_")) else glue_num_units(new)
     old_norm = old.translate(_PUNCT_NORM)
     old_ws = re.sub(r"\s+", " ", old_norm).strip()
     count = 0
@@ -1859,7 +2013,7 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
             for r in p.runs:
                 if old in r.text:
                     c = r.text.count(old)
-                    r.text = r.text.replace(old, new)
+                    r.text = r.text.replace(old, new_clean)
                     count += c
                     hit_run = True
             if hit_run:
@@ -1868,7 +2022,7 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
             full = "".join(r.text for r in p.runs)
             if old in full and p.runs:
                 count += full.count(old)
-                p.runs[0].text = full.replace(old, new)
+                p.runs[0].text = full.replace(old, new_clean)
                 for r in p.runs[1:]:
                     r.text = ""
                 continue
@@ -1876,7 +2030,7 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
             full_n = full.translate(_PUNCT_NORM)
             if old_norm and old_norm in full_n and p.runs:
                 count += full_n.count(old_norm)
-                p.runs[0].text = full_n.replace(old_norm, new)
+                p.runs[0].text = full_n.replace(old_norm, new_clean)
                 for r in p.runs[1:]:
                     r.text = ""
                 continue
@@ -1884,7 +2038,7 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
             full_ws = re.sub(r"\s+", " ", full_n)
             if old_ws and old_ws in full_ws and p.runs:
                 count += full_ws.count(old_ws)
-                p.runs[0].text = full_ws.replace(old_ws, new)
+                p.runs[0].text = full_ws.replace(old_ws, new_clean)
                 for r in p.runs[1:]:
                     r.text = ""
 

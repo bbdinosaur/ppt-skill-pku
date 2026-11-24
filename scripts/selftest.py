@@ -213,6 +213,65 @@ def run_pipeline(root: Path, tag: str) -> list:
     return failures
 
 
+def test_mode_routing(root: Path) -> list:
+    """Verify workorder mode normalization & lone-template start_deck guard."""
+    failures = []
+    if str(SCRIPTS) not in sys.path:
+        sys.path.insert(0, str(SCRIPTS))
+    import inspect_case as ic
+
+    mode_cases = [
+        ({"task_type": "generate_editable_slides"}, "create"),
+        ({"operation": "editable_pptx"}, "auto"),
+        ({"task_type": "template_adaptation"}, "auto"),
+        ({"operation": "adapt_to_template"}, "auto"),
+        ({"task_type": "生成可编辑PPT"}, "create"),
+        ({"task_type": "credit_risk_slides"}, "auto"),
+        ({"task_type": "create_or_edit"}, "auto"),
+        ({"task_type": "edit_deck"}, "edit"),
+        ({"operation": "revise_slides"}, "edit"),
+        ({"task_type": "adapt_deck"}, "edit"),
+        ({"task_type": "修改现有PPT"}, "edit"),
+    ]
+    for wo_in, expect in mode_cases:
+        got = ic.normalize_workorder(wo_in).get("mode")
+        if got != expect:
+            failures.append((f"mode_norm:{wo_in}", f"expected {expect!r}, got {got!r}"))
+
+    # End-to-end inspect_case.py routing guards
+    e2e_cases = [
+        ("gen_editable_lone_tmpl", {"task_type": "generate_editable_slides"}, "template.pptx", "create", False),
+        ("tmpl_adapt_lone_tmpl", {"operation": "template_adaptation"}, "target-template.pptx", "auto", False),
+        ("edit_lone_tmpl_no_coerce", {"mode": "edit"}, "template.pptx", "edit", False),
+        ("edit_lone_nontmpl_ok", {"mode": "edit"}, "existing_talk.pptx", "edit", True),
+    ]
+    for tag, wo_obj, pptx_name, exp_mode, exp_has_start in e2e_cases:
+        cdir = root / "routing" / tag
+        (cdir / "inputs").mkdir(parents=True, exist_ok=True)
+        (cdir / "artifacts").mkdir(parents=True, exist_ok=True)
+        (cdir / "work").mkdir(parents=True, exist_ok=True)
+        if exp_has_start:
+            make_starting_deck(cdir / "inputs" / pptx_name)
+        else:
+            make_template(cdir / "inputs" / pptx_name)
+        (cdir / "case.json").write_text(json.dumps({"case_id": f"ROUTE-{tag}"}), encoding="utf-8")
+        (cdir / "artifacts" / "slide-workorder.json").write_text(
+            json.dumps(wo_obj, ensure_ascii=False), encoding="utf-8")
+        r = run("inspect_case.py", ["--case-dir", str(cdir), "--work", str(cdir / "work")])
+        if r.returncode != 0:
+            failures.append((f"routing:{tag}", f"rc={r.returncode} {r.stderr[:160]}"))
+            continue
+        inv = json.loads((cdir / "work" / "inventory.json").read_text(encoding="utf-8"))
+        got_mode = (inv.get("workorder") or {}).get("mode")
+        has_start = inv.get("start_deck") is not None
+        if got_mode != exp_mode or has_start != exp_has_start:
+            failures.append((
+                f"routing:{tag}",
+                f"mode={got_mode!r}(exp {exp_mode!r}) has_start={has_start}(exp {exp_has_start})",
+            ))
+    return failures
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--keep", action="store_true", help="keep temp dir for inspection")
@@ -221,12 +280,12 @@ def main() -> int:
     c_root, e_root = root / "create", root / "edit"
     build_create_case(c_root)
     build_edit_case(e_root)
-    failures = run_pipeline(c_root, "create") + run_pipeline(e_root, "edit")
+    failures = test_mode_routing(root) + run_pipeline(c_root, "create") + run_pipeline(e_root, "edit")
     print(f"[selftest] temp dir: {root}" + (" (kept)" if args.keep else ""))
     if failures:
         print("SELFTEST_FAIL " + json.dumps(failures, ensure_ascii=False))
         return 1
-    print("SELFTEST_OK create + edit pipelines green, result.json & slide_diff contracts complete")
+    print("SELFTEST_OK create + edit pipelines + mode routing guards green, result.json & slide_diff contracts complete")
     if not args.keep:
         shutil.rmtree(root, ignore_errors=True)
     return 0

@@ -415,6 +415,7 @@ def _expand_sup(s: str) -> str:
 
 _SCI_E_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[eE]\s*([+-]?\d+)(?!\d)")
 _SCI_X10_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*[×xX\*]\s*10\^\s*[\(\{]?([+-]?\d+)[\)\}]?")
+_BARE_POW10_RE = re.compile(r"(?<![A-Za-z0-9.])10\^\s*[\(\{]?([+-]?\d+)[\)\}]?(?!\d)")
 _CORPUS_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*(?:([kKMB])(?![A-Za-z0-9])|([万亿]))")
 _SLIDE_SUFFIX_RE = re.compile(r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)(?:([kKMB])(?![A-Za-z0-9])|([万亿]))")
 _LEAD_DOT_RE = re.compile(r"(?<![A-Za-z0-9.])(\.\d+)(?!\d)")
@@ -428,7 +429,7 @@ _UNIT_EXP_RE = re.compile(r"(?:(?<![A-Za-z0-9.])10\^\s*[\(\{]?([+-]?\d+)[\)\}]?|
 
 
 def _extract_special_corpus_vals(raw_corpus: str) -> tuple[set[float], set[int]]:
-    """Parse explicit scientific notation (1.2e-4, 3.5×10^-5, 10^{-6}), unit exponents,
+    """Parse explicit scientific notation (1.2e-4, 3.5×10^-5, 10^{-6}, bare 10^-3), unit exponents,
     and suffixed magnitudes (1.2k, 3.4M, 2.5B, 1.2万, 3.5亿) from raw whitespace-preserving corpus."""
     vals: set[float] = set()
     exps: set[int] = set()
@@ -441,6 +442,14 @@ def _extract_special_corpus_vals(raw_corpus: str) -> tuple[set[float], set[int]]
                 exps.add(ev)
             except Exception:
                 pass
+    for m in _BARE_POW10_RE.finditer(c_sup):
+        try:
+            ev = int(m.group(1))
+            if -30 <= ev <= 30:
+                vals.add(10.0 ** ev)
+                exps.add(ev)
+        except Exception:
+            pass
     for m in _UNIT_EXP_RE.finditer(c_sup):
         try:
             exps.add(int(m.group(1) or m.group(2)))
@@ -502,25 +511,39 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                 texts.extend(str(st.get(k, "")) for k in ("title", "desc", "detail"))
             elif isinstance(st, str):
                 texts.append(st)
-        tbl = s.get("table") or {}
-        if tbl.get("caption"):
-            texts.append(str(tbl["caption"]))
-        for row in (tbl.get("rows") or []):
-            texts.extend(str(c) for c in row)
+        tc = s.get("two_col") or {}
+        if isinstance(tc, dict):
+            for k_t in ("left_title", "right_title"):
+                if tc.get(k_t):
+                    texts.append(str(tc[k_t]))
+            for k_b in ("left_bullets", "right_bullets", "left", "right"):
+                for b in (tc.get(k_b) or []):
+                    texts.append(b if isinstance(b, str) else str(b.get("t", "")))
+        all_tbls = ([s["table"]] if isinstance(s.get("table"), dict) and s.get("table") else []) + [
+            t for t in (s.get("tables") or []) if isinstance(t, dict)
+        ]
+        for tbl in all_tbls:
+            if tbl.get("caption"):
+                texts.append(str(tbl["caption"]))
+            for row in (tbl.get("rows") or []):
+                texts.extend(str(c) for c in row)
         img = s.get("image") or {}
         if img.get("caption"):
             texts.append(img["caption"])
         for im in (s.get("images") or []):
             if isinstance(im, dict) and im.get("caption"):
                 texts.append(str(im["caption"]))
-        ch = s.get("chart") or {}
-        for ck in ("title", "caption", "x_title", "y_title"):
-            if ch.get(ck):
-                texts.append(str(ch[ck]))
-        texts.extend(str(c) for c in (ch.get("categories") or []))
-        for sr in (ch.get("series") or []):
-            texts.append(str(sr.get("name", "")))
-            texts.extend(str(v) for v in (sr.get("values") or []))
+        all_chs = ([s["chart"]] if isinstance(s.get("chart"), dict) and s.get("chart") else []) + [
+            c for c in (s.get("charts") or []) if isinstance(c, dict)
+        ]
+        for ch in all_chs:
+            for ck in ("title", "caption", "x_title", "y_title"):
+                if ch.get(ck):
+                    texts.append(str(ch[ck]))
+            texts.extend(str(c) for c in (ch.get("categories") or []))
+            for sr in (ch.get("series") or []):
+                texts.append(str(sr.get("name", "")))
+                texts.extend(str(v) for v in (sr.get("values") or []))
         seen = set()
         sec_tag_re = re.compile(
             r"(?:Sec(?:tion)?\.?|§|Fig(?:ure)?\.?|Table|Tab\.?|Eq(?:uation)?\.?|Alg\.?|Appendix|v|"
@@ -552,6 +575,24 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                         hint = _nearest_numbers(f"{sv:g}", corpus_nums)
                         issues.append(f"slide {s.get('slide')}: number '{tok}' not found in material{hint}")
                 t_clean = rx.sub(" ", t_clean)
+            # 1b) Check bare powers of 10 (e.g. p < 10^-3, 10^6) so fabricated bare exponents cannot bypass
+            for sm in _BARE_POW10_RE.finditer(t_clean):
+                tok = sm.group(0).strip()
+                if tok in seen:
+                    continue
+                seen.add(tok)
+                try:
+                    ev = int(sm.group(1))
+                    if ev in (0, 1) or abs(ev) > 30:
+                        continue
+                    sv = 10.0 ** ev
+                except Exception:
+                    continue
+                checked += 1
+                if not (_val_in_corpus_vals(sv, corpus_vals) or ev in corpus_exps):
+                    hint = _nearest_numbers(f"{sv:g}", corpus_nums)
+                    issues.append(f"slide {s.get('slide')}: number '{tok}' not found in material{hint}")
+            t_clean = _BARE_POW10_RE.sub(" ", t_clean)
             # 2) Check suffixed magnitudes (e.g. 2.4k, 1.8M, 2.5B, 1.2万, 3.5亿)
             for sm in _SLIDE_SUFFIX_RE.finditer(t_clean):
                 tok = sm.group(0).strip()

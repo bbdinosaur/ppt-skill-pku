@@ -501,7 +501,8 @@ def cmd_deliver(args) -> int:
     out.mkdir(parents=True, exist_ok=True)
     deck = Path(args.deck) if args.deck else (out / "presentation.pptx")
     pdf = out / (deck.stem + ".pdf")
-    active_plan = Path(args.plan)
+    orig_plan_path = Path(args.plan)
+    active_plan = orig_plan_path
     patched = _apply_plan_patches(active_plan, getattr(args, "patch_slide", None) or [], getattr(args, "patch_file", None))
 
     hroot = work / "history"
@@ -608,6 +609,17 @@ def cmd_deliver(args) -> int:
                     bp.unlink()
             except Exception:
                 pass
+        # Sync winning auto-repaired plan back to orig_plan_path so subsequent --patch-slide
+        # keeps pass-1 repairs and /app/output/plan.json 100% reproduces presentation.pptx
+        if auto_repaired and active_plan != orig_plan_path and active_plan.is_file():
+            try:
+                orig_bak = work / "slides_plan.orig.json"
+                if orig_plan_path.is_file() and not orig_bak.is_file():
+                    shutil.copy2(str(orig_plan_path), str(orig_bak))
+                shutil.copy2(str(active_plan), str(orig_plan_path))
+                du.log_change(work, "auto_repair", f"applied={','.join(auto_repaired)}")
+            except Exception:
+                pass
 
     rexp = _run("export_preview.py", [
         "--deck", str(deck), "--work", str(work),
@@ -615,7 +627,8 @@ def cmd_deliver(args) -> int:
     ], timeout=180)
     ra = _run("assemble_result.py", [
         "--case-dir", args.case_dir, "--work", str(work),
-        "--deck", str(deck), "--status", "auto", "--pass-num", str(ver_num),
+        "--deck", str(deck), "--plan", str(active_plan),
+        "--status", "auto", "--pass-num", str(ver_num),
     ], timeout=120)
 
     checks = _read_json(work / "checks.json", {}) or {}
@@ -679,6 +692,8 @@ def cmd_deliver(args) -> int:
         }
         if (out / "result.json").is_file() and isinstance(res, dict):
             res["version_history"] = version_meta
+            if auto_repaired:
+                res["auto_repairs"] = auto_repaired
             (out / "result.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")
     except Exception:
         pass
@@ -737,7 +752,7 @@ def cmd_deliver(args) -> int:
         cm_sl = ((res.get("content_map") or {}).get("slides")) or []
         if cm_sl:
             audit_lines = ["\n=== DECK AUDIT SUMMARY ==="]
-            dur_info = res.get("duration_estimate") or {}
+            dur_info = (res.get("compliance_checks") or {}).get("duration_estimate") or res.get("duration_estimate") or {}
             if dur_info:
                 audit_lines.append(
                     f"Slides: {len(cm_sl)} | Est. speech: {dur_info.get('estimated_speech_min')} min "
