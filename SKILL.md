@@ -7,7 +7,7 @@ description: "Turn a fixed paper/research material into an editable, template-in
 
 **触发**：输入 `/input/case.json`、`task.md`、`material.json`/PDF、`slide-workorder.json` 与 `target-template.pptx`/`starting-deck.pptx`，产出原生 PPTX、真 PDF 与页级证据映射。
 **严控预算（上限 900s / 64 步 → 目标 4–8 步 / <350s）**：
-- **严禁**单独 `ls /input`、通读 `scripts/*.py`、手写 `python-pptx`、用 `read` 读 `.png`/`.pdf`/`.pptx`（看 `export.visual_ok`），或整文件重写 `slides_plan.json`。
+- **严禁**单独 `ls /input`、读 `scripts/*.py`、手写 `python-pptx`、用 `read` 读 `.png`/`.pdf`/`.pptx`（看 `export.visual_ok`），或整文件重写 `slides_plan.json`。
 - **绝不盲猜原文**：Step 1 内联 `≤28 KB` 简报；仅 `read_more_hints` 非空时按页码补读 1–2 次核心段。
 
 ## 1. 高保真极速闭环（核心 4–6 步）
@@ -56,8 +56,8 @@ python3 "$RP" prepare --case-dir /input --work /app/work --out /app/output
   "uncertainty": []
 }
 ```
-（还支持 `hbar`/`stacked_bar`/`line`/`pie`、并排双图 `"images"`、双栏 `"two_col":{"left_title":"...","left_bullets":[...],"right_title":"...","right_bullets":[...]}`。）
-- **edit/adapt 模式**（原地修改，不重做无关页）：设 `"mode": "edit"`，用 `"edits"` 逐条映射任务指令：
+（支持 `hbar`/`stacked_bar`/`line`/`pie`、双图 `"images"`、双栏 `"two_col":{"left_title":"...","left_bullets":[...],"right_title":"...","right_bullets":[...]}`。）
+- **edit/adapt 模式**（原地改，不重做无关页）：设 `"mode":"edit"`，用 `"edits"` 映射指令：
   ```json
   {"mode": "edit", "rationale": "Apply requested edits in place", "edits": [
     {"op": "replace_text", "slide": 2, "old": "58.0%", "new": "58.4%", "sources": [{"ref": "Table 1", "locator": "p.1", "quote": "exact text"}]},
@@ -65,8 +65,8 @@ python3 "$RP" prepare --case-dir /input --work /app/work --out /app/output
     {"op": "replace_slide", "slide": 4, "slide_spec": {"role": "result", "title": "...", "bullets": [{"t": "..."}], "notes": "...", "sources": [...]}}
   ], "uncertainty": []}
   ```
-  其余 op：`set_title`/`set_body`/`set_two_col`/`set_chart`/`set_image`/`set_notes`/`set_source`/`insert_at`/`append`/`delete`/`move`（`replace_text` 支持 `"slide":"all"` 且覆盖组合图形/表/图轴/备注）。
-- **学术高分准则**：严守 `slide_count`/`min_slides`/`max_slides`、`audience`、`language`、`duration` 与 `source_preservation`。节奏：封面→问题→方法（`steps`/`image`）→主结果（`highlights`+`table`+`takeaway`）→**数据绑定原生 `chart`（含数表时至少 1 页优先重绘，与表/图交替）**→局限（`two_col`）→结论/Q&A。主张式标题（≤22 全角字，避 `→`/`·`）、每页 2–5 条要点、**贴合 `duration` 的 2–4 句自然演讲 `notes`（含动机→关键数值→衔接下页，拒敷衍短句）**；非封面/目录/Q&A 页写 ≥1 条 `sources[].{ref,locator,quote}`（逐字复制）；**绝不编造或取整数字**，缺图/仅位图/材料缺口如实写入 `uncertainty`。
+  其余 op：`set_title`/`set_body`/`set_two_col`/`set_chart`/`set_image`/`set_notes`/`set_source`/`insert_at`/`append`/`delete`/`move`（`replace_text` 支持 `"slide":"all"` 并覆盖组合图形/表/图轴/备注）。
+- **学术高分准则**：严守 `slide_count`/`min_slides`/`max_slides`、`audience`、`language`、`duration` 与 `source_preservation`。节奏：封面→问题→方法（`steps`/`image`）→主结果（`highlights`+`table`+`takeaway`）→**含数表时至少 1 页原生 `chart` 与表/图交替**→局限（`two_col`）→结论/Q&A。主张式标题（≤22 全角字，避 `→`/`·`）、每页 2–5 要点、**贴合 `duration` 的 2–4 句演讲 `notes`（动机→数值→衔接）**；非封面/目录/Q&A 页写 ≥1 条 `sources[].{ref,locator,quote}`（逐字复制）；**绝不编造或取整数字**，缺图/位图/缺口如实入 `uncertainty`。
 
 ### Step 3 一键构建 + 内置自修 + 导出 + 终版 `result.json`（1 步）
 ```bash
@@ -76,7 +76,7 @@ python3 "${RP:-/skills/weekly-skill/scripts/run_pipeline.py}" deliver \
 自动完成：`build_deck` → `check_deck`（13–14 项含洁净/零命中）→ ≤2 轮自动修补（紧缩/限高/引文对齐/补源与备注，绝不改数字）→ `export_preview`（隔离 `.lohome` **110s** 导出真 PDF，超时降级 `reportlab` + 100 DPI PNG + Pillow `visual_ok`）→ `assemble_result --status auto`。
 
 ### Step 4 局部热修与停机（**最多重跑 1 次，严禁整文件重写**）
-- **`DELIVER_OK` 且 `missing_fields:[]` 且 `export.visual_ok:true`**：**立即停止并汇报交付摘要**。
+- **`DELIVER_OK` 且 `missing_fields:[]` 且 `export.visual_ok:true`**：**立即停止并汇报摘要**。
 - **`DELIVER_ISSUES`**：仅修报错 1–2 页，用 `--patch-slide` 热修重跑（<15s）：
   ```bash
   python3 "${RP:-/skills/weekly-skill/scripts/run_pipeline.py}" deliver --case-dir /input --work /app/work \
@@ -86,5 +86,5 @@ python3 "${RP:-/skills/weekly-skill/scripts/run_pipeline.py}" deliver \
   **最多重跑 1 次**（第 2 次残余启发式边缘诚实记入 `exceptions`），随后**立即停止**。
 
 ## 2. 无脚本兜底与交付红线
-- **降级**：无 `run_pipeline.py` 时，先写 `slides_plan.json` 与 `partial` `result.json`，再用内联 `python-pptx` 继承模板 `add_slide`（不设 `font.name`、等比插图、写备注）→ `soffice`/`reportlab` + `pdftoppm -r 100`；工具全缺失则输出含页级证据的 `status=partial` `result.json` 并写 `exceptions`。
-- **红线**：不改母版/主题；不设 `font.name`；图片等比；LibreOffice 缓存放 `/app/work/.lohome`；页面实质数字必可回查，绝不虚报 `status=ok`。
+- **降级**：无脚本时先写 `slides_plan.json` 与 `partial` `result.json`，用内联 `python-pptx` 继承模板 `add_slide`（不设 `font.name`、等比插图、写备注）→ `soffice`/`reportlab` + `pdftoppm -r 100`；工具全缺失则输出含页级证据的 `status=partial` `result.json` 与 `exceptions`。
+- **红线**：不改母版/主题、不设 `font.name`、图片等比、LibreOffice 缓存放 `/app/work/.lohome`、数字必可回查，绝不虚报 `ok`。

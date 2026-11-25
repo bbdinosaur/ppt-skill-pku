@@ -166,6 +166,8 @@ def _crop_vector_figure(page, cap_bbox, fitz, fig_path: Path):
 def extract_pdf(pdf_path: Path, work: Path):
     """Extract per-page text, embedded raster images, vector figure crops (by caption),
     structured PDF tables (via PyMuPDF find_tables), and a structured Paper Map."""
+    import time as _time
+    work.mkdir(parents=True, exist_ok=True)
     out = {"path": str(pdf_path), "pages": 0, "text_file": None, "figures": [],
            "tables_index": [], "tables_extracted": [], "anomalies": []}
     try:
@@ -179,6 +181,7 @@ def extract_pdf(pdf_path: Path, work: Path):
         fig_index_lines = []
         tbl_index_lines = []
         figdir = work / "figs"
+        tbl_elapsed = 0.0
         for pno in range(doc.page_count):
             page = doc[pno]
             chunks.append(f"\n\n<!-- PDF page {pno + 1} -->\n" + page.get_text("text"))
@@ -236,7 +239,7 @@ def extract_pdf(pdf_path: Path, work: Path):
             # Extract structured PDF tables via PyMuPDF find_tables() using cell-clip text
             # Strictly gated on actual Table caption blocks on this page (<0.25s on 25p PDFs!)
             # Falls back to vertical_strategy="text" for borderless LaTeX booktabs academic tables
-            if len(out["tables_extracted"]) < 8 and page_has_tbl and hasattr(page, "find_tables"):
+            if len(out["tables_extracted"]) < 8 and page_has_tbl and tbl_elapsed < 8.0 and hasattr(page, "find_tables"):
                 def _extract_tbl_list(tf_obj):
                     found = []
                     for tb in (getattr(tf_obj, "tables", None) or []):
@@ -260,12 +263,16 @@ def extract_pdf(pdf_path: Path, work: Path):
                     return found
 
                 try:
+                    t_ft0 = _time.monotonic()
                     found_tbls = _extract_tbl_list(page.find_tables())
-                    if not found_tbls:
+                    tbl_elapsed += _time.monotonic() - t_ft0
+                    if not found_tbls and tbl_elapsed < 6.0:
                         try:
+                            t_ft1 = _time.monotonic()
                             found_tbls = _extract_tbl_list(
                                 page.find_tables(vertical_strategy="text", horizontal_strategy="lines")
                             )
+                            tbl_elapsed += _time.monotonic() - t_ft1
                         except Exception:
                             found_tbls = []
                     for ti_p, clean_rows in enumerate(found_tbls):

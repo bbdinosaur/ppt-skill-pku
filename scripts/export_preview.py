@@ -23,8 +23,6 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deckutil as du  # noqa: E402
 
-from pptx import Presentation  # noqa: E402
-
 
 def reportlab_pdf(deck: Path, out_pdf: Path, content_map_path: Path | None):
     """Render a REAL PDF approximation of the deck with reportlab (no soffice needed).
@@ -362,7 +360,11 @@ def main() -> int:
         cm = json.loads(cmf.read_text(encoding="utf-8"))
     titles = [s.get("title") for s in cm.get("slides", []) if s.get("title")]
 
-    n_slides = len(Presentation(str(deck)).slides)
+    try:
+        from pptx import Presentation
+        n_slides = len(Presentation(str(deck)).slides)
+    except Exception:
+        n_slides = len(cm.get("slides", [])) or 0
     pdf = soffice_convert(deck, out_dir, work)
     report = {"deck": str(deck), "pdf": None, "previews_dir": str(previews), "method": None,
               "anomalies": []}
