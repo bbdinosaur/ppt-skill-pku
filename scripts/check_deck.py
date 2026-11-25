@@ -379,19 +379,35 @@ def _nearest_quote_line(quote: str, raw_lines: list[str]) -> str:
     return f" -> closest real line: '{best_ln[:90]}'" if best_sc >= 0.30 else ""
 
 
-def _number_in_corpus(m: str, corpus: str, corpus_nc: str, corpus_vals: set[float]) -> bool:
-    """Check whether number token `m` is faithfully present in corpus, allowing only
+_THOUSANDS_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:,\d{3})+)(?!\d)")
+_STANDALONE_NUM_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])")
+_INT_PCT_RE = re.compile(r"(?<![A-Za-z0-9.])(\d{1,2})\s*%(?!\d)")
+
+
+def _strip_thousands(s: str) -> str:
+    """Remove thousands-separator commas (e.g. 1,240 -> 1240) without corrupting CSV lists like 92.1,24.5,7.90."""
+    return _THOUSANDS_RE.sub(lambda m: m.group(1).replace(",", ""), str(s or ""))
+
+
+def _number_in_corpus(m: str, raw_nc: str, raw_orig: str, corpus_vals: set[float]) -> bool:
+    """Check whether number token `m` is faithfully present in corpus using strict numeric
+    boundaries (catches silent truncation like 94.23->94.2 or 18542->854), allowing only
     mathematically exact representation equivalences (trailing zeros, leading-zero .85,
     exact decimal<->percent 0.854<->85.4, exact k/M scale 1200<->1.2k)."""
-    if m in corpus or m in corpus_nc:
+    pat = rf"(?<![\d.]){re.escape(m)}(?![\d.])"
+    if re.search(pat, raw_nc) or re.search(pat, raw_orig):
         return True
     if "." in m:
         stripped = m.rstrip("0").rstrip(".")
-        if stripped and (stripped in corpus_nc) and re.search(rf"(?<![\d.]){re.escape(stripped)}(?![\d.])", corpus_nc):
-            return True
+        if stripped:
+            pats = rf"(?<![\d.]){re.escape(stripped)}(?![\d.])"
+            if re.search(pats, raw_nc) or re.search(pats, raw_orig):
+                return True
         # Leading-zero stat convention: paper '.85' <-> slide '0.85'
-        if m.startswith("0.") and m[1:] in corpus_nc:
-            return True
+        if m.startswith("0."):
+            patd = rf"(?<![\d.]){re.escape(m[1:])}(?![\d.])"
+            if re.search(patd, raw_nc) or re.search(patd, raw_orig):
+                return True
     try:
         v = float(m)
     except Exception:
@@ -433,7 +449,7 @@ def _extract_special_corpus_vals(raw_corpus: str) -> tuple[set[float], set[int]]
     and suffixed magnitudes (1.2k, 3.4M, 2.5B, 1.2万, 3.5亿) from raw whitespace-preserving corpus."""
     vals: set[float] = set()
     exps: set[int] = set()
-    c_sup = re.sub(r"(?<=\d),(?=\d)", "", _expand_sup(raw_corpus))
+    c_sup = _strip_thousands(_expand_sup(raw_corpus))
     for rx in (_SCI_E_RE, _SCI_X10_RE):
         for m in rx.finditer(c_sup):
             try:
@@ -478,19 +494,38 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
     if not corpus:
         return issues, checked
     corpus_nums = []
-    raw_nc = re.sub(r"(?<=\d),(?=\d)", "", raw_corpus)
+    raw_nc = _strip_thousands(raw_corpus)
     corpus_vals, corpus_exps = _extract_special_corpus_vals(raw_corpus)
-    for num_s in set(NUM_RE.findall(raw_nc)) | set(NUM_RE.findall(corpus_nc)):
+    for num_s in set(NUM_RE.findall(raw_nc)) | set(NUM_RE.findall(raw_corpus)):
         try:
             fv = float(num_s)
             corpus_nums.append((fv, num_s))
             corpus_vals.add(fv)
         except Exception:
             pass
+    # Collect exact standalone numbers & non-integer decimals to catch impression-rounding (e.g. 58.4% -> 58%)
+    exact_pct_vals: set[float] = set()
+    dec_pct_vals: set[float] = set()
+    for ns in set(_STANDALONE_NUM_RE.findall(raw_nc)) | set(_STANDALONE_NUM_RE.findall(raw_corpus)):
+        try:
+            fv = float(ns)
+            exact_pct_vals.add(fv)
+            if "." in ns and abs(fv - round(fv)) > 1e-6:
+                dec_pct_vals.add(fv)
+                if 0 < fv < 1:
+                    dec_pct_vals.add(round(fv * 100.0, 6))
+            elif 0 < fv < 1:
+                exact_pct_vals.add(round(fv * 100.0, 6))
+        except Exception:
+            pass
     # Also collect leading-dot decimals like .854 in APA/stats tables
     for dm in set(re.findall(r"(?<!\d)\.\d+", raw_nc)):
         try:
-            corpus_vals.add(float("0" + dm))
+            fv = float("0" + dm)
+            corpus_vals.add(fv)
+            exact_pct_vals.add(round(fv * 100.0, 6))
+            if abs(fv * 100.0 - round(fv * 100.0)) > 1e-6:
+                dec_pct_vals.add(round(fv * 100.0, 6))
         except Exception:
             pass
     for s in (content_map.get("slides") or []):
@@ -552,7 +587,7 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
         )
         mults_s = {"k": 1e3, "K": 1e3, "M": 1e6, "B": 1e9, "万": 1e4, "亿": 1e8}
         for t in texts:
-            t_clean = sec_tag_re.sub(" ", _expand_sup(str(t)).replace(",", ""))
+            t_clean = sec_tag_re.sub(" ", _strip_thousands(_expand_sup(str(t))))
             # 1) Check full scientific-notation tokens first (catches 100x exponent hallucinations
             #    and allows exact bidirectional match: paper 0.00035 <-> slide 3.5×10^-4)
             for rx in (_SCI_E_RE, _SCI_X10_RE):
@@ -619,10 +654,28 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                     continue
                 seen.add(dm)
                 checked += 1
-                if not _number_in_corpus("0" + dm, corpus, corpus_nc, corpus_vals):
+                if not _number_in_corpus("0" + dm, raw_nc, raw_corpus, corpus_vals):
                     hint = _nearest_numbers("0" + dm, corpus_nums)
                     issues.append(f"slide {s.get('slide')}: number '{dm}' not found in material{hint}")
             t_clean = _LEAD_DOT_RE.sub(" ", t_clean)
+            # 3b) Catch impression-rounded integer percentages (e.g. paper 58.4% -> slide 58%)
+            for pm in _INT_PCT_RE.finditer(t_clean):
+                if re.match(r"\s*(?:CI\b|(?:confidence|prediction|credible)\s+(?:interval|level|bound)|置信区间|置信度)", t_clean[pm.end():], re.I):
+                    continue  # standard statistical interval label (e.g. 95% CI, 95% confidence level)
+                iv = int(pm.group(1))
+                tok_p = f"{iv}%"
+                if iv in (0, 100) or tok_p in seen:
+                    continue
+                seen.add(tok_p)
+                checked += 1
+                if any(abs(iv - ev) <= 1e-6 for ev in exact_pct_vals):
+                    continue
+                near_dec = sorted((abs(dv - iv), dv) for dv in dec_pct_vals if 1e-6 < abs(dv - iv) <= 0.5)
+                if near_dec:
+                    issues.append(
+                        f"slide {s.get('slide')}: rounded percentage '{tok_p}' loses precision "
+                        f"(exact in material: {near_dec[0][1]:g})"
+                    )
             # 4) Standard decimals and 3+ digit integers
             for m in NUM_RE.findall(t_clean):
                 if m in seen:
@@ -633,7 +686,7 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                     continue  # generic 100% scale ceiling
                 seen.add(m)
                 checked += 1
-                if _number_in_corpus(m, corpus, corpus_nc, corpus_vals):
+                if _number_in_corpus(m, raw_nc, raw_corpus, corpus_vals):
                     continue
                 hint = _nearest_numbers(m, corpus_nums)
                 issues.append(f"slide {s.get('slide')}: number '{m}' not found in material{hint}")
@@ -682,7 +735,8 @@ def check_quotes(content_map, material_text_file, fallback_corpus="", skip_slide
 
 _ARTIFACT_RE = re.compile(
     r"(\*\*[^*\n]{2,60}\*\*|\bLorem\s+ipsum\b|\bClick\s+to\s+add\s+(?:title|text|subtitle)\b|"
-    r"\[(?:TODO|TBD|INSERT\b[^\]]*)\]|10\^\{[+-]?\d+\}|\\(?:times|pm|alpha|beta|gamma|leq|geq|approx)\b)",
+    r"\[(?:TODO|TBD|PLACEHOLDER|INSERT\b[^\]]*)\]|\{\{[^{}\n]{1,30}\}\}|"
+    r"10\^\{[+-]?\d+\}|\\(?:times|pm|alpha|beta|gamma|leq|geq|approx)\b)",
     re.I,
 )
 
@@ -703,6 +757,22 @@ def check_placeholder_hygiene(prs, skip_slides: set[int] | None = None):
                     for row in sh.table.rows:
                         for cell in row.cells:
                             texts.append(cell.text_frame.text or "")
+            except Exception:
+                pass
+            try:
+                if getattr(sh, "has_chart", False):
+                    ch = sh.chart
+                    if getattr(ch, "has_title", False):
+                        texts.append(ch.chart_title.text_frame.text or "")
+                    for ax_attr in ("category_axis", "value_axis"):
+                        ax = getattr(ch, ax_attr, None)
+                        if ax is not None and getattr(ax, "has_title", False):
+                            texts.append(ax.axis_title.text_frame.text or "")
+                    if ch.plots:
+                        for c in ch.plots[0].categories:
+                            texts.append(str(c))
+                    for sr in ch.series:
+                        texts.append(str(sr.name or ""))
             except Exception:
                 pass
             for txt in texts:

@@ -73,11 +73,15 @@ def main() -> int:
     exceptions = []
     # figure-missing / bitmap-only dispositions from the build
     for s in (content_map.get("slides") or []):
-        img = s.get("image") or {}
-        if img.get("missing") and img.get("path"):
-            exceptions.append({"code": "FIGURE_MISSING",
-                               "detail": f"slide {s.get('slide')}: image file not found: {img.get('path')}",
-                               "disposition": "on-slide placeholder with ref+caption; no fabricated figure"})
+        all_imgs = ([s["image"]] if isinstance(s.get("image"), dict) and s.get("image") else []) + [
+            im for im in (s.get("images") or []) if isinstance(im, dict)
+        ]
+        for img in all_imgs:
+            if img.get("missing"):
+                lbl = img.get("path") or img.get("ref") or img.get("caption") or "unspecified"
+                exceptions.append({"code": "FIGURE_MISSING",
+                                   "detail": f"slide {s.get('slide')}: image file not found: {lbl}",
+                                   "disposition": "on-slide placeholder with ref+caption; no fabricated figure"})
     # input-level anomalies
     for a in inv.get("anomalies", []):
         if "not found" in a or "not identified" in a or "missing" in a or "unreadable" in a:
@@ -124,14 +128,28 @@ def main() -> int:
                 {"path": im.get("path"), "ref": im.get("ref"), "caption": im.get("caption")}
                 for im in (s.get("images") or []) if isinstance(im, dict)
             ],
-            "tables": ([{"rows": len((s.get("table") or {}).get("rows", [])),
-                         "ref": (s.get("table") or {}).get("ref"),
-                         "caption": (s.get("table") or {}).get("caption")}] if s.get("table") else []),
-            "charts": ([{"type": ch.get("type", "bar"), "ref": ch.get("ref"),
-                         "caption": ch.get("caption"),
-                         "categories": ch.get("categories", []),
-                         "series_count": len(ch.get("series") or [])}]
-                       if (ch.get("categories") or ch.get("series")) else []),
+            "tables": (
+                [{"rows": len((s.get("table") or {}).get("rows", [])),
+                  "ref": (s.get("table") or {}).get("ref"),
+                  "caption": (s.get("table") or {}).get("caption")}]
+                if s.get("table") else []
+            ) + [
+                {"rows": len(t.get("rows", [])), "ref": t.get("ref"), "caption": t.get("caption")}
+                for t in (s.get("tables") or []) if isinstance(t, dict) and t.get("rows")
+            ],
+            "charts": (
+                [{"type": ch.get("type", "bar"), "ref": ch.get("ref"),
+                  "caption": ch.get("caption"),
+                  "categories": ch.get("categories", []),
+                  "series_count": len(ch.get("series") or [])}]
+                if (ch.get("categories") or ch.get("series")) else []
+            ) + [
+                {"type": c.get("type", "bar"), "ref": c.get("ref"),
+                 "caption": c.get("caption"),
+                 "categories": c.get("categories", []),
+                 "series_count": len(c.get("series") or [])}
+                for c in (s.get("charts") or []) if isinstance(c, dict) and (c.get("categories") or c.get("series"))
+            ],
             "notes": s.get("notes", ""),
             "claim_sources": s.get("sources", []),
         })

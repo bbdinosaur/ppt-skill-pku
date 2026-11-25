@@ -129,17 +129,24 @@ def soffice_convert(deck: Path, outdir: Path, work: Path | None = None) -> Path 
     lo_home = ((work or outdir) / ".lohome").resolve()
     lo_home.mkdir(parents=True, exist_ok=True)
     env = {**os.environ, "HOME": str(lo_home)}
+    pdf = outdir / (deck.stem + ".pdf")
+    if pdf.is_file():
+        try:
+            pdf.unlink()  # never silently reuse a stale PDF if LibreOffice fails or times out
+        except Exception:
+            pass
     try:
-        subprocess.run(
+        r = subprocess.run(
             [soffice, "--headless", "--norestore", "--nofirststartwizard",
              f"-env:UserInstallation=file://{lo_home}",
              "--convert-to", "pdf", "--outdir", str(outdir), str(deck)],
             env=env, timeout=110,  # generous warm-up for CJK/chart templates before reportlab fallback
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False,
         )
+        if r.returncode != 0:
+            return None
     except Exception:
         return None
-    pdf = outdir / (deck.stem + ".pdf")
     return pdf if pdf.is_file() and pdf.stat().st_size > 500 else None
 
 

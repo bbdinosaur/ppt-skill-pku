@@ -108,7 +108,7 @@ def cmd_prepare(args) -> int:
     if task_info and task_info.get("truncated"):
         read_more_hints.append(f"task.md ({task_info['chars']} chars > 7.5k): read tail of {inv['task_md']}")
     if comp.get("material_json_truncated") and inv.get("material_json_path"):
-        read_more_hints.append(f"material.json ({comp.get('material_json_chars')} chars > 9.5k): read {inv['material_json_path']}")
+        read_more_hints.append(f"material.json ({comp.get('material_json_chars')} chars, truncated in digest): read {inv['material_json_path']}")
     if (comp.get("pdf_beyond_digest") or comp.get("digest_clipped") or digest_truncated) and pdf_ex.get("text_file"):
         read_more_hints.append(
             f"full paper text ({comp.get('pdf_text_chars')} chars): read relevant sections of {pdf_ex['text_file']} using page markers"
@@ -261,7 +261,8 @@ def _auto_repair_plan(plan: dict, fails: list[dict], work: Path, pass_idx: int) 
         for idx_e, e in enumerate(edits, 1):
             if not isinstance(e, dict):
                 continue
-            if str(e.get("op", "")).strip() in ("replace_slide", "append", "insert_at"):
+            eop = str(e.get("op", "")).strip()
+            if eop in ("replace_slide", "append", "insert_at", "set_body", "set_two_col", "set_table"):
                 target_spec = e.get("slide_spec") if isinstance(e.get("slide_spec"), dict) else e
                 cur_t = int(target_spec.get("_tighten", 0) or 0)
                 if cur_t < pass_idx:
@@ -778,8 +779,9 @@ def cmd_deliver(args) -> int:
                 src_n = len(s.get("claim_sources") or [])
                 b_n = len(s.get("claims") or [])
                 t_short = str(s.get("title") or "(no title)").replace("\n", " ")[:48]
+                n_flag = "!" if (n_len < 30 and s.get("role") not in ("title", "qa", "section")) else ""
                 audit_lines.append(
-                    f"S{s.get('slide')} [{s.get('role', '?')}] {t_short} | b:{b_n} | {vis_str} | notes:{n_len}c | src:{src_n}"
+                    f"S{s.get('slide')} [{s.get('role', '?')}] {t_short} | b:{b_n} | {vis_str} | notes:{n_len}c{n_flag} | src:{src_n}"
                 )
             print("\n".join(audit_lines)[:2600])
     except Exception:

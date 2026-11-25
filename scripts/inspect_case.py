@@ -599,6 +599,55 @@ def _extract_xlsx_md(xlsx_path: Path, max_sheets: int = 6, max_rows: int = 30, m
     return "\n".join(out_lines)
 
 
+def _extract_docx_md(docx_path: Path, max_paras: int = 400, max_tbl_rows: int = 30) -> str:
+    """Zero-dependency stdlib DOCX text + Markdown table extractor (works without python-docx)."""
+    import xml.etree.ElementTree as ET
+    out_lines: list[str] = []
+    try:
+        with zipfile.ZipFile(docx_path) as z:
+            if "word/document.xml" not in z.namelist():
+                return ""
+            root = ET.fromstring(z.read("word/document.xml"))
+            body = next((el for el in root.iter() if el.tag.endswith("}body") or el.tag == "body"), root)
+            n_p = 0
+            for child in list(body):
+                tag = child.tag.rsplit("}", 1)[-1]
+                if tag == "p" and n_p < max_paras:
+                    txt = "".join(t.text or "" for t in child.iter() if t.tag.endswith("}t") or t.tag == "t").strip()
+                    if txt:
+                        out_lines.append(txt)
+                        n_p += 1
+                elif tag == "tbl":
+                    rows_out: list[list[str]] = []
+                    for tr in child:
+                        if tr.tag.rsplit("}", 1)[-1] != "tr":
+                            continue
+                        vals: list[str] = []
+                        for tc in tr:
+                            if tc.tag.rsplit("}", 1)[-1] != "tc":
+                                continue
+                            ct = " ".join(
+                                "".join(t.text or "" for t in p.iter() if t.tag.endswith("}t") or t.tag == "t").strip()
+                                for p in tc if p.tag.rsplit("}", 1)[-1] == "p"
+                            ).strip()
+                            vals.append(re.sub(r"\s+", " ", ct).replace("|", "/"))
+                        if any(vals):
+                            rows_out.append(vals)
+                        if len(rows_out) >= max_tbl_rows:
+                            break
+                    if rows_out:
+                        ncols = max(len(r) for r in rows_out)
+                        for ri, r in enumerate(rows_out):
+                            r_pad = r + [""] * (ncols - len(r))
+                            out_lines.append("| " + " | ".join(r_pad) + " |")
+                            if ri == 0:
+                                out_lines.append("| " + " | ".join("---" for _ in range(ncols)) + " |")
+                        out_lines.append("")
+    except Exception:
+        return ""
+    return "\n".join(out_lines)
+
+
 def _skip_path(p: Path, case_dir: Path, work: Path) -> bool:
     """Exclude work/ and output/ subdirectories when scanning case_dir."""
     try:
@@ -997,6 +1046,7 @@ def main() -> int:
         inv["pdf_extract"] = extract_pdfs(pdfs, work)
 
     text_exts = (".txt", ".md")
+    primary_docx: Path | None = None
     if not inv.get("pdf_extract"):
         docx_p = next((p for p in sorted(case_dir.rglob("*.docx"))
                        if p.is_file() and not _skip_path(p, case_dir, work)), None)
@@ -1006,19 +1056,11 @@ def main() -> int:
         src = docx_p or txt_p
         if src is not None:
             try:
-                chunks = []
                 if docx_p is not None:
-                    import docx
-                    d = docx.Document(str(docx_p))
-                    for para in d.paragraphs:
-                        if para.text.strip():
-                            chunks.append(para.text)
-                    for i, tbl in enumerate(d.tables):
-                        for row in tbl.rows:
-                            chunks.append(" | ".join(c.text.strip() for c in row.cells))
+                    primary_docx = docx_p
+                    text = _extract_docx_md(docx_p)
                 else:
-                    chunks.append(src.read_text(encoding="utf-8", errors="replace"))
-                text = "\n".join(chunks)
+                    text = src.read_text(encoding="utf-8", errors="replace")
                 tfp = work / "material_text.md"
                 tfp.write_text(text, encoding="utf-8")
                 inv["pdf_extract"] = {"text_file": str(tfp), "pages": None,
@@ -1027,7 +1069,7 @@ def main() -> int:
             except Exception as e:
                 inv["anomalies"].append(f"material text extract failed: {e}")
 
-    # ---- supplementary text/data files (CSV/TSV/MD/TXT/TEX/BIB/extra JSON/XLSX alongside PDFs)
+    # ---- supplementary text/data files (CSV/TSV/MD/TXT/TEX/BIB/extra JSON/XLSX/DOCX alongside PDFs)
     supp_exts = (".csv", ".tsv", ".md", ".txt", ".tex", ".bib", ".json")
     skip_names = {"case.json", "task.md", "slide-workorder.json", "workorder.json",
                   "material.json", "materials.json", "content.json"}
@@ -1047,6 +1089,17 @@ def main() -> int:
             x_md_path = work / "xlsx_tables.md"
             x_md_path.write_text("\n\n".join(x_chunks), encoding="utf-8")
             inv["extra_text_files"].append(str(x_md_path))
+    supp_docx = [
+        p for p in sorted(case_dir.rglob("*.docx"))
+        if p.is_file() and not _skip_path(p, case_dir, work) and p.stat().st_size <= 5_000_000
+        and (primary_docx is None or p.resolve() != primary_docx.resolve())
+    ][:3]
+    if supp_docx:
+        d_chunks = [f"### {dp.name}\n" + md for dp in supp_docx if (md := _extract_docx_md(dp))]
+        if d_chunks:
+            d_md_path = work / "docx_text.md"
+            d_md_path.write_text("\n\n".join(d_chunks), encoding="utf-8")
+            inv["extra_text_files"].append(str(d_md_path))
 
     # ---- figure images shipped with the case
     img_exts = (".png", ".jpg", ".jpeg", ".gif", ".tif", ".tiff", ".bmp", ".svg", ".emf")

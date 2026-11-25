@@ -108,8 +108,9 @@ def est_lines(text: str, size_pt: float, avail_w_pt: float) -> int:
     return max(1, math.ceil(w_pt / avail_w_pt))
 
 
-def tf_text_height_pt(tf, shape_w_pt: float, default_pt: float) -> float:
-    """Estimate rendered text height (pt) of a text frame at given shape width."""
+def tf_text_height_pt(tf, shape_w_pt: float, default_pt: float, cap_pt: float | None = None) -> float:
+    """Estimate rendered text height (pt) of a text frame at given shape width.
+    If cap_pt is given, simulates clamping any larger run/paragraph font sizes to cap_pt."""
     try:
         ml = tf.margin_left.pt if tf.margin_left is not None else 7.2
         mr = tf.margin_right.pt if tf.margin_right is not None else 7.2
@@ -129,6 +130,8 @@ def tf_text_height_pt(tf, shape_w_pt: float, default_pt: float) -> float:
         else:
             if p.font.size is not None:
                 size = p.font.size.pt
+        if cap_pt is not None:
+            size = min(size, cap_pt)
         lvl = getattr(p, "level", 0) or 0
         avail = max(24.0, base_avail - lvl * 18.0)
         lines = est_lines(text, size, avail) if text else 1
@@ -768,7 +771,8 @@ def add_rich_runs(p, text: str, base_bold: bool = False, size_pt: float | None =
 
 def _norm_bullets_list(raw):
     if isinstance(raw, str):
-        return [{"t": raw, "lvl": 0}] if raw.strip() else []
+        lines = [re.sub(r"^\s*[-*•·▪]\s*", "", ln).strip() for ln in raw.splitlines() if ln.strip()]
+        return [{"t": ln, "lvl": 0} for ln in lines if ln]
     if not isinstance(raw, list):
         return []
     out = []
@@ -789,9 +793,55 @@ def _norm_bullets_list(raw):
 def _norm_sources_list(raw):
     if isinstance(raw, dict):
         return [raw]
+    if isinstance(raw, str) and raw.strip():
+        return [{"ref": "material", "locator": "material", "quote": raw.strip()}]
     if isinstance(raw, list):
-        return [x for x in raw if isinstance(x, dict)]
+        out = []
+        for x in raw:
+            if isinstance(x, dict):
+                out.append(x)
+            elif isinstance(x, str) and x.strip():
+                out.append({"ref": "material", "locator": "material", "quote": x.strip()})
+        return out
     return []
+
+
+def _norm_two_col(tc):
+    """Losslessly normalize dict, nested-dict, or 2-element-list two_col into canonical dict."""
+    if isinstance(tc, list):
+        cols = [c for c in tc if isinstance(c, (dict, list, str))][:2]
+        if not cols:
+            return {}
+        out = {}
+        for side, col in zip(("left", "right"), cols):
+            if isinstance(col, dict):
+                ttl = col.get("title") or col.get("heading") or col.get("header") or col.get("name") or col.get("label")
+                if ttl:
+                    out[f"{side}_title"] = str(ttl)
+                bl = col.get("bullets") or col.get("items") or col.get("points") or col.get("content") or col.get("body")
+                out[f"{side}_bullets"] = _norm_bullets_list(bl)
+            else:
+                out[f"{side}_bullets"] = _norm_bullets_list(col)
+        return out
+    if isinstance(tc, dict):
+        ntc = dict(tc)
+        for side in ("left", "right"):
+            raw_side = ntc.get(side)
+            if isinstance(raw_side, dict):
+                ttl = raw_side.get("title") or raw_side.get("heading") or raw_side.get("header") or raw_side.get("name")
+                if ttl and not ntc.get(f"{side}_title"):
+                    ntc[f"{side}_title"] = str(ttl)
+                if f"{side}_bullets" not in ntc:
+                    ntc[f"{side}_bullets"] = (
+                        raw_side.get("bullets") or raw_side.get("items")
+                        or raw_side.get("points") or raw_side.get("content") or []
+                    )
+            elif f"{side}_bullets" not in ntc and raw_side is not None:
+                ntc[f"{side}_bullets"] = raw_side
+            if f"{side}_bullets" in ntc:
+                ntc[f"{side}_bullets"] = _norm_bullets_list(ntc.get(f"{side}_bullets"))
+        return ntc
+    return {}
 
 
 def _norm_slide_spec(spec: dict) -> dict:
@@ -802,18 +852,19 @@ def _norm_slide_spec(spec: dict) -> dict:
         s["bullets"] = _norm_bullets_list(s.get("bullets"))
     if "sources" in s:
         s["sources"] = _norm_sources_list(s.get("sources"))
-    tc = s.get("two_col")
-    if isinstance(tc, dict):
-        ntc = dict(tc)
-        if "left_bullets" not in ntc and "left" in ntc:
-            ntc["left_bullets"] = ntc.get("left")
-        if "right_bullets" not in ntc and "right" in ntc:
-            ntc["right_bullets"] = ntc.get("right")
-        if "left_bullets" in ntc:
-            ntc["left_bullets"] = _norm_bullets_list(ntc.get("left_bullets"))
-        if "right_bullets" in ntc:
-            ntc["right_bullets"] = _norm_bullets_list(ntc.get("right_bullets"))
-        s["two_col"] = ntc
+    if isinstance(s.get("notes"), list):
+        n_parts = [str(x).strip() for x in s["notes"] if x is not None and str(x).strip()]
+        s["notes"] = " ".join(n_parts)
+    if s.get("two_col") is not None:
+        s["two_col"] = _norm_two_col(s.get("two_col"))
+    if isinstance(s.get("image"), str):
+        s["image"] = {"path": s["image"]} if s["image"].strip() else {}
+    if isinstance(s.get("images"), list):
+        s["images"] = [
+            im if isinstance(im, dict) else ({"path": str(im)} if im and str(im).strip() else {})
+            for im in s["images"]
+        ]
+        s["images"] = [im for im in s["images"] if isinstance(im, dict) and im]
     hi = s.get("highlights")
     if isinstance(hi, list):
         nhi = []
@@ -853,6 +904,8 @@ def _norm_slide_spec(spec: dict) -> dict:
                 nst.append(str(it))
         s["steps"] = nst
     tbl = s.get("table")
+    if isinstance(tbl, list) and tbl and all(isinstance(r, list) for r in tbl):
+        tbl = {"rows": tbl}
     if isinstance(tbl, dict):
         ntbl = dict(tbl)
         if not ntbl.get("rows") and isinstance(ntbl.get("data"), list):
@@ -872,14 +925,50 @@ def _norm_slide_spec(spec: dict) -> dict:
             nch["categories"] = nch.get("labels")
         if not nch.get("series") and isinstance(nch.get("data"), list):
             nch["series"] = nch.get("data")
+        if not nch.get("series") and isinstance(nch.get("values"), list):
+            nch["series"] = [{"name": str(nch.get("title") or nch.get("y_title") or "Value"),
+                              "values": nch.get("values")}]
+        if isinstance(nch.get("series"), dict):
+            s_dict = nch["series"]
+            if all(isinstance(v, list) for v in s_dict.values()):
+                nch["series"] = [{"name": str(k), "values": v} for k, v in s_dict.items()]
+            else:
+                if not nch.get("categories"):
+                    nch["categories"] = [str(k) for k in s_dict.keys()]
+                nch["series"] = [{"name": str(nch.get("title") or "Value"), "values": list(s_dict.values())}]
+        if isinstance(nch.get("series"), list):
+            nsers = []
+            for sr in nch["series"]:
+                if isinstance(sr, dict):
+                    nsr = dict(sr)
+                    if "values" not in nsr and isinstance(nsr.get("data"), list):
+                        nsr["values"] = nsr.get("data")
+                    nsers.append(nsr)
+            nch["series"] = nsers
         s["chart"] = nch
     return s
 
 
+_EDIT_OP_ALIASES = {
+    "update_text": "replace_text", "edit_text": "replace_text", "find_replace": "replace_text",
+    "update_title": "set_title", "edit_title": "set_title",
+    "update_body": "set_body", "set_bullets": "set_body", "update_bullets": "set_body",
+    "update_two_col": "set_two_col",
+    "update_table": "set_table", "replace_table": "set_table",
+    "update_chart": "set_chart", "replace_chart": "set_chart",
+    "update_image": "set_image", "replace_image": "set_image",
+    "update_notes": "set_notes", "edit_notes": "set_notes",
+    "update_source": "set_source", "add_source": "set_source",
+    "add_slide": "append", "insert_slide": "insert_at",
+    "remove_slide": "delete", "delete_slide": "delete",
+    "reorder": "move", "move_slide": "move",
+}
+
+
 def normalize_plan(plan: dict) -> dict:
-    """Deterministically normalize common LLM schema aliases (single-dict sources,
-    bullets[].text, two_col.left/right, table.headers/data, chart.labels/data,
-    highlights[].metric, steps[].label) without altering facts."""
+    """Deterministically normalize common LLM schema aliases (single-dict/string sources,
+    bullets[].text, list/nested-dict two_col, table.headers/data/2D-list, chart.labels/data/values,
+    highlights[].metric, steps[].label, list notes, edit op aliases) without altering facts."""
     if not isinstance(plan, dict):
         return {}
     out = dict(plan)
@@ -891,12 +980,17 @@ def normalize_plan(plan: dict) -> dict:
             if not isinstance(e, dict):
                 continue
             ne = dict(e)
+            raw_op = str(ne.get("op") or "").strip().lower()
+            if raw_op in _EDIT_OP_ALIASES:
+                ne["op"] = _EDIT_OP_ALIASES[raw_op]
             if "sources" in ne:
                 ne["sources"] = _norm_sources_list(ne.get("sources"))
             if "bullets" in ne:
                 ne["bullets"] = _norm_bullets_list(ne.get("bullets"))
-            if isinstance(ne.get("two_col"), dict):
-                tc_e = _norm_slide_spec({"two_col": ne["two_col"]}).get("two_col") or {}
+            if isinstance(ne.get("notes"), list):
+                ne["notes"] = " ".join(str(x).strip() for x in ne["notes"] if x is not None and str(x).strip())
+            if ne.get("two_col") is not None:
+                tc_e = _norm_two_col(ne.get("two_col"))
                 for k_tc in ("left_title", "right_title", "left_bullets", "right_bullets"):
                     if k_tc not in ne and k_tc in tc_e:
                         ne[k_tc] = tc_e[k_tc]
@@ -904,11 +998,16 @@ def normalize_plan(plan: dict) -> dict:
                 ne["left_bullets"] = ne.get("left")
             if "right_bullets" not in ne and "right" in ne:
                 ne["right_bullets"] = ne.get("right")
+            if isinstance(ne.get("left_bullets"), dict) or isinstance(ne.get("right_bullets"), dict):
+                tc_lr = _norm_two_col({"left": ne.get("left_bullets"), "right": ne.get("right_bullets")})
+                for k_tc in ("left_title", "right_title", "left_bullets", "right_bullets"):
+                    if k_tc in tc_lr and (k_tc.endswith("_bullets") or not ne.get(k_tc)):
+                        ne[k_tc] = tc_lr[k_tc]
             if "left_bullets" in ne:
                 ne["left_bullets"] = _norm_bullets_list(ne.get("left_bullets"))
             if "right_bullets" in ne:
                 ne["right_bullets"] = _norm_bullets_list(ne.get("right_bullets"))
-            if isinstance(ne.get("table"), dict):
+            if isinstance(ne.get("table"), (dict, list)):
                 ne["table"] = _norm_slide_spec({"table": ne["table"]}).get("table")
             elif isinstance(ne.get("headers"), list) and ne.get("headers"):
                 hdr_strs = [str(c) for c in ne["headers"]]
@@ -917,8 +1016,15 @@ def normalize_plan(plan: dict) -> dict:
                     ne["rows"] = [hdr_strs] + rows
             if isinstance(ne.get("chart"), dict):
                 ne["chart"] = _norm_slide_spec({"chart": ne["chart"]}).get("chart")
+            elif ne.get("op") == "set_chart":
+                c_norm = _norm_slide_spec({"chart": ne}).get("chart") or {}
+                for k_ch in ("categories", "series"):
+                    if k_ch in c_norm:
+                        ne[k_ch] = c_norm[k_ch]
             elif not ne.get("categories") and isinstance(ne.get("labels"), list):
                 ne["categories"] = ne.get("labels")
+            if isinstance(ne.get("image"), str):
+                ne["image"] = {"path": ne["image"]} if ne["image"].strip() else {}
             if isinstance(ne.get("slide_spec"), dict):
                 ne["slide_spec"] = _norm_slide_spec(ne["slide_spec"])
             nedits.append(ne)
@@ -1011,15 +1117,16 @@ def shrink_body_to_fit(tf, w_pt, h_pt, body_pt, min_pt=11.0, compact_spacing_pt=
             pass
     size = body_pt
     while size > min_pt:
-        est = tf_text_height_pt(tf, w_pt, size)
+        est = tf_text_height_pt(tf, w_pt, size, cap_pt=size)
         if est <= h_pt * 0.98:
             break
         step = 0.5 if size <= 13.0 else 1.0
         size = max(min_pt, size - step)
-    # apply explicit size when we had to shrink below inherited size
+    # apply explicit size cap when we had to shrink below initial/inherited size
     if size < body_pt - 0.3:
         for p in tf.paragraphs:
-            p.font.size = Pt(size)
+            if p.font.size is None or p.font.size.pt > size:
+                p.font.size = Pt(size)
             for r in p.runs:
                 if r.font.size is None or r.font.size.pt > size:
                     r.font.size = Pt(size)
@@ -1686,7 +1793,8 @@ def add_highlights(slide, rect, items, accent=None):
         tf.margin_top = Inches(0.05)
         tf.margin_bottom = Inches(0.05)
         val_txt = strip_md(str(it.get("value", "")))
-        val_pt = 20.0 if (n <= 3 and em_width(val_txt) <= 8) else 16.5
+        has_sub = bool(it.get("sub"))
+        val_pt = (22.0 if not has_sub else 19.5) if (n <= 3 and em_width(val_txt) <= 9) else 17.0
         p0 = tf.paragraphs[0]
         p0.alignment = PP_ALIGN.CENTER
         p0.space_before = Pt(0)
@@ -2074,6 +2182,7 @@ def replace_text_in_slide(slide, old: str, new: str) -> int:
 def extract_slide_snapshot(slide, prs=None) -> dict:
     """Extract structured text snapshot of a slide (including grouped shapes, table rows & chart data)."""
     tsh = find_slide_title_shape(slide, prs)
+    t_el = tsh._element if tsh is not None else None
     title = tsh.text_frame.text.strip() if (tsh is not None and tsh.has_text_frame) else ""
     bullets = []
     tables = []
@@ -2081,7 +2190,7 @@ def extract_slide_snapshot(slide, prs=None) -> dict:
     images = 0
     image_sigs = []
     for sh in _iter_all_shapes(slide.shapes):
-        if sh is tsh:
+        if t_el is not None and sh._element is t_el:
             continue
         if sh.is_placeholder and sh.placeholder_format.type in SKIP_TYPES:
             continue
@@ -2117,7 +2226,17 @@ def extract_slide_snapshot(slide, prs=None) -> dict:
                         sers.append({"name": str(sr.name), "values": vals})
                 except Exception:
                     pass
-                charts.append({"title": ct, "categories": cats, "series": sers})
+                ch_info = {"title": ct, "categories": cats, "series": sers}
+                for ax_attr, k_ax in (("category_axis", "x_title"), ("value_axis", "y_title")):
+                    try:
+                        ax = getattr(ch, ax_attr, None)
+                        if ax is not None and ax.has_title:
+                            at = ax.axis_title.text_frame.text.strip()
+                            if at:
+                                ch_info[k_ax] = at
+                    except Exception:
+                        pass
+                charts.append(ch_info)
                 continue
         except Exception:
             pass
