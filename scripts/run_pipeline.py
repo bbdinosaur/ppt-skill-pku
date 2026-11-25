@@ -39,7 +39,7 @@ def _run(script: str, args: list[str], timeout: int = 300) -> subprocess.Complet
 def _read_json(p: Path, default=None):
     if p.is_file():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            return json.loads(p.read_text(encoding="utf-8-sig"))
         except Exception:
             return default
     return default

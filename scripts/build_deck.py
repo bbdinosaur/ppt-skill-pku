@@ -1342,7 +1342,7 @@ def main() -> int:
     args = ap.parse_args()
 
     work = Path(args.work)
-    plan = du.normalize_plan(json.loads(Path(args.plan).read_text(encoding="utf-8")))
+    plan = du.normalize_plan(json.loads(Path(args.plan).read_text(encoding="utf-8-sig")))
     inv = du.load_inventory(work)
     images_base = Path(inv.get("case_dir") or Path(args.plan).resolve().parent)
 

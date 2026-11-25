@@ -934,7 +934,7 @@ def main() -> int:
     case_json = find_first(case_dir, ("case.json",), work)
     if case_json:
         try:
-            inv["case"] = json.loads(case_json.read_text(encoding="utf-8"))
+            inv["case"] = json.loads(case_json.read_text(encoding="utf-8-sig"))
         except Exception as e:
             inv["anomalies"].append(f"case.json unreadable: {e}")
             inv["case"] = {"raw_path": str(case_json)}
@@ -956,7 +956,7 @@ def main() -> int:
     wo_path = find_first(case_dir, ("slide-workorder.json", "workorder.json"), work)
     if wo_path:
         try:
-            inv["workorder_raw"] = json.loads(wo_path.read_text(encoding="utf-8"))
+            inv["workorder_raw"] = json.loads(wo_path.read_text(encoding="utf-8-sig"))
             wo_raw = inv["workorder_raw"]
             if isinstance(wo_raw, list) and wo_raw and isinstance(wo_raw[0], dict):
                 wo_raw = wo_raw[0]  # array-form workorder: use first object
@@ -1010,9 +1010,14 @@ def main() -> int:
             start_deck = others[0]
     if start_deck is None and wo_mode == "edit" and pptx_files:
         non_tmpl = [p for p in pptx_files if template is None or p.resolve() != template.resolve()]
-        # Never coerce a lone identified template.pptx into start_deck when no independent deck exists
+        # Never coerce a lone 0/1-slide blank template.pptx into start_deck; only treat a lone
+        # multi-slide (>=2) deck as start_deck when workorder explicitly requests edit mode.
         if non_tmpl:
             start_deck = non_tmpl[0]
+        elif len(pptx_files) == 1:
+            meta0 = describe_pptx(pptx_files[0])
+            if isinstance(meta0, dict) and len(meta0.get("slides") or []) >= 2:
+                start_deck = pptx_files[0]
 
     inv["template"] = describe_pptx(template) if template else None
     inv["start_deck"] = describe_pptx(start_deck) if start_deck else None
@@ -1036,7 +1041,7 @@ def main() -> int:
     inv["material_json_path"] = str(mat_json_path) if mat_json_path else None
     if mat_json_path:
         try:
-            inv["material"] = json.loads(mat_json_path.read_text(encoding="utf-8"))
+            inv["material"] = json.loads(mat_json_path.read_text(encoding="utf-8-sig"))
         except Exception as e:
             inv["anomalies"].append(f"material.json unreadable: {e}")
             inv["material"] = {}
