@@ -11,6 +11,7 @@ Usage:
 Never invents data: missing pieces are recorded as honest gaps.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -18,6 +19,19 @@ import shutil
 import subprocess
 import sys
 import unicodedata
+
+
+def _sha256_file(path):
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()[:16]
+    except Exception:
+        return None
 
 LIGATURES = {
     "\ufb00": "ff", "\ufb01": "fi", "\ufb02": "fl",
@@ -361,7 +375,9 @@ def main():
                 vis.append(f"`{os.path.basename(em['figure_file'])}`")
             if em.get("has_table"):
                 vis.append("Native Table")
-            if em.get("two_column") and not em.get("figure_file") and not em.get("has_table"):
+            if em.get("has_chart"):
+                vis.append("Native Chart")
+            if em.get("two_column") and not em.get("figure_file") and not em.get("has_table") and not em.get("has_chart"):
                 vis.append("2-Col")
             vis_s = " + ".join(vis) if vis else "Text"
             ref_parts = []
@@ -462,6 +478,24 @@ def main():
     tpl_mode = (build_rep.get("template_mode") if build_rep else
                 ("reuse" if deck_meta.get("reuse") else
                  ("layouts" if template_path else "blank")))
+    repro_parts = ["python3 scripts/build_deck.py", outline_json_out or (os.path.abspath(a.slides_json) if a.slides_json else "slides.json")]
+    if template_path:
+        repro_parts += ["--template", os.path.abspath(template_path)]
+    if tpl_mode == "reuse":
+        repro_parts.append("--reuse")
+    repro_parts += ["--out", deck_out]
+    input_hashes = {}
+    for hk, hp in (
+        ("paper_sha256_16", case_res.get("paper_source")),
+        ("template_sha256_16", template_path),
+        ("slides_outline_sha256_16", outline_json_out or a.slides_json),
+        ("output_pptx_sha256_16", deck_out),
+        ("output_pdf_sha256_16", pdf_out),
+    ):
+        hv = _sha256_file(hp)
+        if hv:
+            input_hashes[hk] = hv
+
     render_record = {
         "source_pptx": deck_out,
         "exported_pdf": pdf_out,
@@ -478,6 +512,8 @@ def main():
         "font_substitution_detected": font_sub_detected,
         "font_audit_note": font_audit_note,
         "tool_versions": tool_versions(),
+        "input_hashes": input_hashes,
+        "repro_command": " ".join(repro_parts),
         "pdf_pages_match": (n_pdf == n_slides) if pdf_out else None,
         "render_text_ok": render_text_ok,
         "visual_ink_ratios": visual_ink_ratios,
@@ -576,6 +612,7 @@ def main():
             "render_text_ok": render_text_ok,
             "visual_pixel_ok": (not visual_blank_slides) and (not tofu_slides) if previews else None,
             "font_substitution_detected": font_sub_detected,
+            "repro_ready": bool(render_record.get("repro_command") and render_record.get("input_hashes")),
         },
     }
 

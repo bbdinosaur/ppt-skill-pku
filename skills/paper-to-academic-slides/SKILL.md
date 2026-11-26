@@ -42,9 +42,9 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/run_pipeline.py prep --work /
 python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/run_pipeline.py build /app/work/slides.json --work /app/work --out-dir /app/output
 ```
 自动按 `case_resolved.json` 适配模板（纯模板清样例页重建 / 起始 deck `--reuse` 原地适配并保护角标 Logo、页眉页脚与记录逐页 diff / 无模板生成带页码的规范 16:9），依次执行：
-1. `build_deck.py` → `/app/work/deck.pptx`（只读 XML 保母版背景、三线学术表、KPI 指标卡、双栏对比、数字单位防断行、单行标题、深色反色、智能避让母版页脚与等比防裁切）
+1. `build_deck.py` → `/app/work/deck.pptx`（只读 XML 保母版背景、零投影扁平视觉、三线学术表、原生图表、KPI 指标卡、自动导语加粗、双栏对比、数字单位防断行、单行标题、深色反色、智能避让侧边栏/母版页脚与等比防裁切）
 2. `check_layout.py` → `/app/work/layout_report.json`（越界、字号、严重溢出/重叠与母版页脚碰撞升 `fail`、占位残留词）
-3. **`verify_evidence.py`（S4.5，必跑）** → `/app/work/evidence_report.json`（页数上限、必有证据与原文 `quote`、支持补充材料溯源、图存在与图号匹配、图注、全量数字与缺号分级、基线归属、讲稿查重、栏目词、局限页）
+3. **`verify_evidence.py`（S4.5，必跑）** → `/app/work/evidence_report.json`（页数上限、必有证据与原文 `quote`、支持补充材料溯源、图存在/图号匹配/防重图/图注、全量数字与**单位篡改检测**、基线归属、讲稿查重与控时、栏目词、局限页）
 4. `finalize_output.py` → `/app/output/{slides.pptx, slides.pdf, previews/slide-NN.png (100 DPI), evidence_map.json, evidence_map.md, speaker_notes.md, slides_outline.json, result.json}`（含六要素审计、PDF 字体审计、空白/豆腐块质检与 `output_contract` 镜像）
 
 **强制门控（严禁跳过）**：若 `action_required: true`，按返回的 **`polish_checklist`** 一次性改完 `slides.json` 重跑 `build` 直至清零（≤2 轮）；剩余低优 `warn` 诚实记入 `result.json`。

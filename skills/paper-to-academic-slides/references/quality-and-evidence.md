@@ -41,13 +41,13 @@
 - 页脚/页码/Logo 由模板自带，脚本不触碰；若模板占位符缺失自动落 textbox 并在 `deck_build_report.json` 记 warnings。
 
 ## 5. 可核验性交付（评分硬指标）
-- `evidence_map`（result.json 内）：每页 claim + paper_refs + slide_line，由 finalize_output 自动从 slides.json 汇总。
-- 渲染链路：PPTX（可编辑源）→ PDF（导出件）→ PNG（逐页预览），三者页数一致。
-- 版面检查报告 `layout_report.json` 随 result.json 引用；fail 必须清零后交付。
+- `evidence_map`（`result.json` + 独立 `evidence_map.json` / `evidence_map.md`）：每页 claim + paper_refs + quote + slide_line + 自动核验状态，由 `finalize_output.py` 自动汇总。
+- 渲染与复现链路：PPTX（可编辑源）→ PDF（导出件）→ PNG（100 DPI 逐页预览），三者页数一致，且 `render_record` 记录 `repro_command`、输入/输出 SHA-256 哈希、工具版本与 PDF 字体审计。
+- 版面检查报告 `layout_report.json` 与六要素审计 `six_element_audit` 随 `result.json` 输出；fail 必须清零后交付。
 
 ## 6. 字体与换机安全
-- 不设置具体字体名（继承模板主题字体），避免换机替换导致崩版；仅调字号/加粗。
-- 中文内容在无模板空白 deck 下默认主题字体；若模板指定了不覆盖的字体则尊重模板。
+- **模板模式**：绝不覆写母版主题字体；启动时经 `fc-list` 审计模板字体是否在本机安装，缺失时自动启用 `1.08x` 字符宽度安全补偿并在 `render_record.font_audit` 如实记录。
+- **空白模式**：自动绑定本机 `fc-list` 已安装的 Latin/CJK 安全字体（如 Liberation Sans / Noto Sans CJK），确保正文、表格、KPI 卡、页脚与原生图表导出 PDF 时零字体替换漂移。
 
 ## 7. 与裸跑 baseline 的差异自证（增益来源）
 加载本 Skill 后相对不加载的对照差异，逐条可核查：

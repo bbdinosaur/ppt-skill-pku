@@ -209,7 +209,10 @@ def main():
                                    "shape": name, "detail": f"table cell {min_pt}pt"})
 
             if stype in ("pic", "table", "chart") or (stype == "text" and has_text):
-                boxes.append((bb, stype, name))
+                # Exclude full-bleed background images (>=60% slide area) from overlap checks
+                is_bg_pic = (stype == "pic" and (bb[2] - bb[0]) * (bb[3] - bb[1]) >= 0.60 * SW * SH)
+                if not is_bg_pic:
+                    boxes.append((bb, stype, name))
 
         # 3 picture/table/chart vs non-empty text overlap (severe >25% -> fail)
         media = [b for b in boxes if b[1] in ("pic", "table", "chart")]
@@ -224,6 +227,19 @@ def main():
                     issues.append({"slide": si, "sev": ("fail" if ratio > 0.25 else "warn"),
                                    "type": "overlap",
                                    "detail": f"{mb[2]} x {tb[2]} ({ratio:.0%})"})
+
+        # 3b media vs media overlap (e.g., figure colliding with table/chart or another figure)
+        for mi in range(len(media)):
+            for mj in range(mi + 1, len(media)):
+                ma, mb = media[mi], media[mj]
+                ia = inter_area(ma[0], mb[0])
+                smaller = min((ma[0][2] - ma[0][0]) * (ma[0][3] - ma[0][1]),
+                              (mb[0][2] - mb[0][0]) * (mb[0][3] - mb[0][1]))
+                if smaller > 0 and ia / smaller > 0.08:
+                    ratio = ia / smaller
+                    issues.append({"slide": si, "sev": ("fail" if ratio > 0.20 else "warn"),
+                                   "type": "overlap",
+                                   "detail": f"{ma[2]} x {mb[2]} ({ratio:.0%})"})
 
         # 4 non-empty text vs non-empty text overlap (severe >35% -> fail)
         for ti in range(len(texts)):

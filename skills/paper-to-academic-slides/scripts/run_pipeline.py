@@ -24,11 +24,14 @@ SCRIPTS_DIR = Path(__file__).resolve().parent
 HARD_EV_TYPES = {"image_ref_mismatch", "generic_section_title", "missing_notes"}
 HARD_LAY_TYPES = {"template_placeholder_remnant"}
 POLISH_EV_TYPES = {
-    "number_absent_from_paper", "missing_limitations_slide", "notes_duplicate_slide_text",
-    "schematic_unlabeled", "schematic_unmarked", "unattributed_comparison",
-    "missing_quote_on_slide", "cover_title_mismatch_paper",
+    "number_absent_from_paper", "unit_mismatch_with_paper", "missing_limitations_slide",
+    "notes_duplicate_slide_text", "schematic_unlabeled", "schematic_unmarked",
+    "unattributed_comparison", "missing_quote_on_slide", "cover_title_mismatch_paper",
+    "duplicate_figure_across_slides", "image_missing_caption", "quote_page_mismatch",
+    "ref_page_mismatch", "pacing_budget_mismatch", "slide_line_ref_not_found",
+    "embedded_figure_uncited", "dual_media_crowded",
 }
-POLISH_LAY_TYPES = {"text_overflow", "overlap", "table_overflow", "too_dense"}
+POLISH_LAY_TYPES = {"text_overflow", "overlap", "text_overlap", "table_overflow", "too_dense", "master_footer_overlap"}
 
 
 def _detect_label_discrepancy(cr, ctx):
@@ -109,7 +112,7 @@ def _pick_preview_samples(slides_spec, previews):
     for i, s in enumerate(slides):
         if i == 0 or i >= n:
             continue
-        has_media = bool(s.get("table") or s.get("image") or s.get("images"))
+        has_media = bool(s.get("table") or s.get("image") or s.get("images") or s.get("chart"))
         if has_media and best_media is None:
             best_media = i
         b_len = sum(len((b.get("text", "") if isinstance(b, dict) else str(b)))
@@ -241,8 +244,19 @@ def _build_reading_pack(work, cr, ctx, idx_path, extra_materials):
         + (" [REQUIRED: include a Limitations slide]" if lim_pages else ""),
         "- ground_truth_rule: ALWAYS derive claims/numbers/authors strictly from actual paper/material files below; if any case label contradicts the paper, trust the paper and log discrepancy in gaps_and_uncertainty.",
     ]
+    ms_c = cons.get("max_slides")
+    dur_c = cons.get("duration_minutes") or cons.get("duration")
+    if ms_c or dur_c:
+        plan_bits = []
+        if ms_c:
+            plan_bits.append(f"<= {ms_c} slides total")
+        if dur_c:
+            plan_bits.append(f"~{dur_c} min total (allocate `[~X.X min]` per slide in `notes` summing to ~{dur_c} min)")
+        hdr_lines.append(f"- deck_pacing_target: {' | '.join(plan_bits)}")
     if cr.get("label_discrepancy"):
         hdr_lines.append(f"- **CRITICAL LABEL MISMATCH WARNING**: {cr['label_discrepancy']}")
+    if unext_figs:
+        hdr_lines.append(f"- unextracted_figures_note: `{unext_figs[:6]}` have no cropped PNG — do NOT invent image paths; cite in text/evidence or plot their verbatim table/text numbers via native `table` or `chart`.")
     if cr.get("missing"):
         hdr_lines.append(f"- missing_inputs: `{json.dumps(cr.get('missing'), ensure_ascii=False)}`")
     if cr.get("output_contract"):
@@ -372,6 +386,12 @@ def cmd_prep(a):
     out_dir = os.path.abspath(a.out_dir)
     os.makedirs(work, exist_ok=True)
     os.makedirs(out_dir, exist_ok=True)
+    att_file = os.path.join(work, ".build_attempts.json")
+    if os.path.isfile(att_file):
+        try:
+            os.remove(att_file)
+        except Exception:
+            pass
     cr_path = os.path.join(work, "case_resolved.json")
     paper_dir = os.path.join(work, "paper")
 
@@ -668,8 +688,17 @@ def cmd_build(a):
         summary["evidence_warn_details"] = ev_warn_items
     if action_required:
         checklist = []
+        for bs in blank_slides:
+            checklist.append(f"S{bs} [visual_blank_slide]: rendered preview appears nearly blank; verify content/background contrast")
+        for ts in tofu_slides:
+            checklist.append(f"S{ts} [visual_tofu_glyph]: missing glyph/tofu detected in rendered PDF text; check font/special symbols")
+        if checks.get("pdf_pages_match") is False:
+            checklist.append("S0 [pdf_pages_match]: exported PDF page count differs from PPTX slide count")
+        if checks.get("render_text_ok") is False:
+            checklist.append("S0 [render_text_ok]: rendered PDF text missing slide titles/content")
         for it in (fail_items + ev_err_items + hard_ev_warns + hard_lay_warns + polish_items)[:12]:
             checklist.append(f"S{it.get('slide', 0)} [{it.get('type')}]: {it.get('detail', '')}")
+        checklist = checklist[:12]
         summary["polish_checklist"] = checklist
         summary["fix_instruction"] = (
             f"SURGICAL FIX PASS (attempt {attempt}/2): resolve the {len(checklist)} high-impact item(s) in "

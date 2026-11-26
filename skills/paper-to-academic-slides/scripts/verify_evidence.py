@@ -187,6 +187,80 @@ SCHEMATIC_LABEL_RE = re.compile(
     r"|(?:示意|非实验|概念图|架构图|流程图|原理图|框架图)",
     re.IGNORECASE,
 )
+UNIT_PAIR_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(\d+(?:\.\d+)?)\s*"
+    r"(%|ms|msec|μs|us|ns|secs?|s(?![A-Za-z0-9])|mins?|hrs?|h(?![A-Za-z0-9])|"
+    r"gb|mb|kb|tb|gib|mib|kib|ev|mev|kev|kcal/mol|kj/mol|"
+    r"db|khz|mhz|ghz|hz|nm|μm|um|mm|cm|km|mw|kw|w(?![A-Za-z0-9])|"
+    r"gflops|tflops|mflops|flops|tok/s|fps|mev/a|mev/å)",
+    re.IGNORECASE,
+)
+UNIT_ALIAS_MAP = {
+    "msec": "ms", "sec": "s", "secs": "s", "mins": "min", "hrs": "hr", "h": "hr",
+    "μs": "us", "μm": "um", "gib": "gb", "mib": "mb", "kib": "kb", "mev/å": "mev/a",
+}
+STRICT_SCI_UNITS = {
+    "%", "ms", "us", "ns", "gb", "mb", "kb", "tb", "ev", "mev", "kev",
+    "kcal/mol", "kj/mol", "db", "hz", "khz", "mhz", "ghz", "nm", "um",
+    "mm", "cm", "km", "gflops", "tflops", "mflops", "flops", "tok/s", "fps", "mev/a",
+}
+UNIT_DIM_MAP = {
+    "ns": "time", "us": "time", "ms": "time", "s": "time", "min": "time", "hr": "time",
+    "kb": "mem", "mb": "mem", "gb": "mem", "tb": "mem",
+    "mev": "energy", "ev": "energy", "kev": "energy", "kcal/mol": "energy", "kj/mol": "energy",
+    "nm": "len", "um": "len", "mm": "len", "cm": "len", "km": "len",
+    "hz": "freq", "khz": "freq", "mhz": "freq", "ghz": "freq",
+    "mw": "power", "w": "power", "kw": "power",
+    "flops": "compute", "mflops": "compute", "gflops": "compute", "tflops": "compute",
+}
+COVER_META_NUM_RE = re.compile(
+    r"(?:\b20\d{2}[-/.]\d{1,2}(?:[-/.]\d{1,2})?\b|\d{4}年\d{1,2}月(?:\d{1,2}日)?|"
+    r"\b\d{1,2}\s*[-–]?\s*(?:min(?:ute)?s?|slides?|pages?)\b|\d{1,2}\s*(?:分钟|页|张))",
+    re.IGNORECASE,
+)
+PACE_TAG_RE = re.compile(
+    r"(?:\[\s*~?(\d+(?:\.\d+)?)\s*(?:min(?:ute)?s?|m|分钟)\s*\]|~(\d+(?:\.\d+)?)\s*(?:min|分钟))",
+    re.IGNORECASE,
+)
+
+
+HDR_UNIT_RE = re.compile(
+    r"[\(\[（【/]\s*"
+    r"(%|ms|msec|μs|us|ns|secs?|s|mins?|hrs?|h|"
+    r"gb|mb|kb|tb|gib|mib|kib|ev|mev|kev|kcal/mol|kj/mol|"
+    r"db|khz|mhz|ghz|hz|nm|μm|um|mm|cm|km|mw|kw|w|"
+    r"gflops|tflops|mflops|flops|tok/s|fps|mev/a|mev/å)"
+    r"\s*[\)\]）】]?",
+    re.IGNORECASE,
+)
+
+
+def _canon_unit(raw_u):
+    u = (raw_u or "").strip().lower()
+    return UNIT_ALIAS_MAP.get(u, u)
+
+
+def _extract_header_unit(hdr):
+    """Extract canonical unit declared in a table column header like 'Latency (ms)' or 'Acc (%)'."""
+    if not hdr:
+        return None
+    m = HDR_UNIT_RE.search(clean_str(str(hdr)))
+    if not m:
+        return None
+    return _canon_unit(m.group(1)), m.group(1)
+
+
+def _extract_num_units(text):
+    out = []
+    if not text:
+        return out
+    cleaned = _strip_num_commas(ID_NUM_STRIP_RE.sub(" ", clean_str(text)))
+    for m in UNIT_PAIR_RE.finditer(cleaned):
+        num = m.group(1)
+        raw_u = m.group(2)
+        cu = _canon_unit(raw_u)
+        out.append((num, cu, raw_u))
+    return out
 
 
 def main():
@@ -228,10 +302,12 @@ def main():
 
     # Load supplemental text/csv/json materials if provided via --case-resolved
     extra_text_blob = ""
+    cr_data = {}
     if a.case_resolved and os.path.isfile(a.case_resolved):
         try:
             with open(a.case_resolved, encoding="utf-8") as cf:
                 cr = json.load(cf)
+            cr_data = cr if isinstance(cr, dict) else {}
             main_src = os.path.abspath(cr.get("paper_source") or cr.get("paper_pdf") or "")
             chunks = []
             for mp in (cr.get("materials") or [])[:15]:
@@ -249,6 +325,26 @@ def main():
             pass
     extra_alnum = alnum(extra_text_blob)
     extra_norm = _strip_num_commas(norm(extra_text_blob))
+
+    # Build (number -> set of canonical units) map from full paper + tables + extra materials
+    paper_num_units = {}
+    unit_corpus_chunks = list(page_text.values())
+    for tbl in ctx.get("tables", []):
+        hdrs_t = tbl.get("headers") or []
+        unit_corpus_chunks.append(" ".join(hdrs_t))
+        col_units = [_extract_header_unit(h) for h in hdrs_t]
+        for r in (tbl.get("rows") or []):
+            unit_corpus_chunks.append(" ".join(str(c) for c in r))
+            for ci, cell_v in enumerate(r):
+                if ci < len(col_units) and col_units[ci]:
+                    cu_h, _ru_h = col_units[ci]
+                    for nm in re.findall(r"(?<![A-Za-z0-9.])\d+(?:\.\d+)?", _strip_num_commas(clean_str(str(cell_v)))):
+                        paper_num_units.setdefault(nm, set()).add(cu_h)
+    if extra_text_blob:
+        unit_corpus_chunks.append(extra_text_blob)
+    for chunk in unit_corpus_chunks:
+        for num, cu, _ru in _extract_num_units(chunk):
+            paper_num_units.setdefault(num, set()).add(cu)
 
     # Index captions by norm_id, canonical key, and raw alnum (list per key to handle multi-page mentions)
     cap_index = {}
@@ -278,6 +374,8 @@ def main():
                        "detail": f"{len(slides)} > max_slides={max_slides}"})
 
     has_limitation_slide = False
+    seen_slide_imgs = {}
+    paced_minutes = []
     for si, sld in enumerate(slides, 1):
         ev = sld.get("evidence") or {}
         refs = ev.get("paper_refs", []) or []
@@ -312,6 +410,17 @@ def main():
         if kind not in ("cover",) and not slide_line:
             issues.append({"slide": si, "sev": "warn", "type": "missing_slide_line",
                            "detail": "evidence.slide_line empty (auto-synthesized fallback will be used)"})
+        elif kind not in ("cover",) and slide_line and cap_index:
+            for sl_m in REF_PARSE_RE.finditer(clean_str(slide_line)):
+                sl_k = sl_m.group(1).lower().rstrip(".")
+                if sl_k in ("eq", "eqs", "equation", "equations", "式"):
+                    continue
+                sl_full, sl_base = canonical_ref_key(sl_k, sl_m.group(0))
+                if not (cap_index.get(sl_full) or (sl_base and cap_index.get(sl_base))):
+                    sl_al = alnum(sl_m.group(0))
+                    if sl_al and not any(sl_al in t for t in page_alnum.values()) and sl_al not in extra_alnum:
+                        issues.append({"slide": si, "sev": "warn", "type": "slide_line_ref_not_found",
+                                       "detail": f"slide_line cites '{sl_m.group(0)}' absent from paper"})
         if len(notes) < 20 and kind != "cover":
             issues.append({"slide": si, "sev": "warn", "type": "missing_notes",
                            "detail": f"notes len={len(notes)}"})
@@ -327,6 +436,19 @@ def main():
             if not isinstance(im_p, str) or not os.path.isfile(im_p):
                 issues.append({"slide": si, "sev": "error", "type": "image_file_missing",
                                "detail": f"image file not found: {im_p}"})
+            elif kind != "cover":
+                abs_im = os.path.abspath(im_p)
+                if abs_im in seen_slide_imgs:
+                    issues.append({"slide": si, "sev": "warn", "type": "duplicate_figure_across_slides",
+                                   "detail": f"{os.path.basename(im_p)} already embedded on slide {seen_slide_imgs[abs_im]}"})
+                else:
+                    seen_slide_imgs[abs_im] = si
+        pm_note = PACE_TAG_RE.search(notes)
+        if pm_note:
+            try:
+                paced_minutes.append(float(pm_note.group(1) or pm_note.group(2)))
+            except Exception:
+                pass
 
         cited_pages = set()
         cited_fig_norms = set()
@@ -380,7 +502,7 @@ def main():
                         issues.append({"slide": si, "sev": "error", "type": "ref_not_found",
                                        "detail": f"{rid_raw} not in paper captions"})
                 else:
-                    cap_pages = [int(c["page"]) for c in caps if c.get("page")]
+                    cap_pages = sorted(set(int(c["page"]) for c in caps if c.get("page")))
                     cited_pages.update(cap_pages)
                     if page and cap_pages and int(page) not in cap_pages:
                         issues.append({"slide": si, "sev": "warn", "type": "ref_page_mismatch",
@@ -471,13 +593,19 @@ def main():
             if isinstance(im_p, str):
                 fg = fig_file_meta.get(os.path.abspath(im_p)) or fig_file_meta.get(os.path.basename(im_p))
                 fg_norm = (fg or {}).get("norm_id")
-                if fg_norm and fg_norm.startswith("fig:") and cited_fig_norms:
-                    fg_base = re.sub(r"[a-z]+$", "", fg_norm)
-                    if fg_norm not in cited_fig_norms and fg_base not in cited_fig_norms:
+                if fg_norm and fg_norm.startswith("fig:"):
+                    if cited_fig_norms:
+                        fg_base = re.sub(r"[a-z]+$", "", fg_norm)
+                        if fg_norm not in cited_fig_norms and fg_base not in cited_fig_norms:
+                            issues.append({
+                                "slide": si, "sev": "warn", "type": "image_ref_mismatch",
+                                "detail": f"embedded {os.path.basename(im_p)} belongs to {fg.get('caption')} ({fg_norm}), "
+                                          f"but slide cites {sorted(cited_fig_norms)}",
+                            })
+                    elif kind != "cover":
                         issues.append({
-                            "slide": si, "sev": "warn", "type": "image_ref_mismatch",
-                            "detail": f"embedded {os.path.basename(im_p)} belongs to {fg.get('caption')} ({fg_norm}), "
-                                      f"but slide cites {sorted(cited_fig_norms)}",
+                            "slide": si, "sev": "warn", "type": "embedded_figure_uncited",
+                            "detail": f"embedded {os.path.basename(im_p)} ({fg.get('caption') or fg_norm}) is not cited in evidence.paper_refs",
                         })
                 if fg_norm:
                     src_caps = cap_index.get(fg_norm) or []
@@ -541,7 +669,8 @@ def main():
                         })
         seen_miss = set()
         for txt in check_texts:
-            cleaned_t = _strip_num_commas(ID_NUM_STRIP_RE.sub(" ", clean_str(txt)))
+            base_t = COVER_META_NUM_RE.sub(" ", clean_str(txt)) if kind == "cover" else clean_str(txt)
+            cleaned_t = _strip_num_commas(ID_NUM_STRIP_RE.sub(" ", base_t))
             for m_obj in KEY_NUM_RE.finditer(cleaned_t):
                 m = m_obj.group(0)
                 if m in seen_miss or YEAR_RE.match(m):
@@ -561,6 +690,53 @@ def main():
                     delta_hint = " (if a delta, also retain verbatim raw baseline & proposed values)" if prefix_ch in "+-" else ""
                     issues.append({"slide": si, "sev": "warn", "type": "number_absent_from_paper",
                                    "detail": f"'{m}' ABSENT FROM FULL PAPER — verify no rounding/fabrication{delta_hint}"})
+
+        # Scientific unit-mutation consistency check (catches e.g. '38 ms' mutated to '38 s', incl. table header units)
+        if kind != "cover" and paper_num_units:
+            unit_check_texts = list(check_texts)
+            tbl_hdrs = table_spec.get("headers") or []
+            if tbl_hdrs and (table_spec.get("rows") or []):
+                slide_col_units = [_extract_header_unit(h) for h in tbl_hdrs]
+                for row in (table_spec.get("rows") or []):
+                    for ci, cell_v in enumerate(row):
+                        if ci < len(slide_col_units) and slide_col_units[ci]:
+                            _cu_s, ru_s = slide_col_units[ci]
+                            for nm in re.findall(r"(?<![A-Za-z0-9.])\d+(?:\.\d+)?", _strip_num_commas(clean_str(str(cell_v)))):
+                                unit_check_texts.append(f"{nm} {ru_s}")
+            if isinstance(chart_spec, dict) and (chart_spec.get("unit") or "").strip():
+                cu_chart = str(chart_spec["unit"]).strip()
+                for ser in (chart_spec.get("series") or []):
+                    if isinstance(ser, dict):
+                        for v in (ser.get("values") or []):
+                            unit_check_texts.append(f"{v} {cu_chart}")
+            seen_unit_err = set()
+            all_paper_norm_blob = "".join(full_paper_norm.values()) + extra_norm
+            for utxt in unit_check_texts:
+                for num, cu, raw_u in _extract_num_units(utxt):
+                    if (num, cu) in seen_unit_err or YEAR_RE.match(num):
+                        continue
+                    known_units = paper_num_units.get(num)
+                    if not known_units or cu in known_units:
+                        continue
+                    # For 1-digit integers, require either a strict scientific unit or same physical dimension
+                    if "." not in num and len(num) < 2:
+                        cu_dim = UNIT_DIM_MAP.get(cu)
+                        same_dim = bool(cu_dim and any(UNIT_DIM_MAP.get(ku) == cu_dim for ku in known_units))
+                        if not same_dim and cu not in STRICT_SCI_UNITS:
+                            continue
+                    # Double-check normalized adjacency before alerting
+                    if f"{num}{cu}" in all_paper_norm_blob.lower():
+                        continue
+                    seen_unit_err.add((num, cu))
+                    issues.append({
+                        "slide": si, "sev": "warn", "type": "unit_mismatch_with_paper",
+                        "detail": f"'{num} {raw_u}' conflicts with paper unit(s) {sorted(known_units)} for '{num}'",
+                    })
+        if kind != "cover" and slide_imgs and (table_spec or chart_spec) and len(all_bullets) >= 4:
+            issues.append({
+                "slide": si, "sev": "warn", "type": "dual_media_crowded",
+                "detail": f"slide combines image + {'table' if table_spec else 'chart'} with {len(all_bullets)} bullets; trim bullets or split across slides",
+            })
 
         # Check explicit baseline attribution on comparative claims without a table
         if kind != "cover" and not table_spec:
@@ -611,6 +787,18 @@ def main():
     if lim_pages and (not max_slides or int(max_slides) >= 7) and not has_limitation_slide:
         issues.append({"slide": 0, "sev": "warn", "type": "missing_limitations_slide",
                        "detail": f"paper discusses limitations on p.{lim_pages[:4]} but no slide covers limitations"})
+
+    # Advisory pacing budget check when target duration_minutes is specified
+    target_dur = (cr_data.get("constraints") or {}).get("duration_minutes")
+    if target_dur and paced_minutes and len(paced_minutes) >= max(2, len(slides) // 2):
+        try:
+            td = float(target_dur)
+            tot_p = sum(paced_minutes)
+            if td > 0 and abs(tot_p - td) / td > 0.40:
+                issues.append({"slide": 0, "sev": "warn", "type": "pacing_budget_mismatch",
+                               "detail": f"speaker notes pacing sums to {tot_p:.1f} min vs target {td:.1f} min"})
+        except Exception:
+            pass
 
     n_err = sum(1 for i in issues if i["sev"] == "error")
     n_warn = sum(1 for i in issues if i["sev"] == "warn")

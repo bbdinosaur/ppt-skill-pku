@@ -154,20 +154,44 @@ def guess_title(doc):
     try:
         page = doc[0]
         ph = page.rect.height
-        best, best_size = "", 0.0
-        for txt, y0, _y1, _x0, _x1, size in span_lines(page)[:60]:
+        lines = span_lines(page)[:60]
+        best_i, best_size = -1, 0.0
+        for idx, (txt, y0, _y1, _x0, _x1, size) in enumerate(lines):
             t = txt.strip()
             if not t or y0 > ph * 0.55 or TITLE_BLACKLIST.search(t):
                 continue
             if 8 <= len(t) <= 180 and size > best_size and not CAPTION_RE.match(t):
-                best, best_size = t, size
-        return best
+                best_i, best_size = idx, size
+        if best_i < 0:
+            return ""
+        parts = [lines[best_i][0].strip()]
+        prev_y1 = lines[best_i][2]
+        # Stitch consecutive continuation lines of a multi-line title (same font size & tight vertical gap)
+        for nxt in lines[best_i + 1:best_i + 4]:
+            nt, ny0, ny1, _nx0, _nx1, nsz = nxt
+            nt = nt.strip()
+            if not nt or TITLE_BLACKLIST.search(nt) or CAPTION_RE.match(nt):
+                break
+            if abs(nsz - best_size) <= 0.7 and -2.0 <= (ny0 - prev_y1) <= max(best_size * 1.85, 22.0):
+                if sum(len(p) for p in parts) + len(nt) <= 200:
+                    parts.append(nt)
+                    prev_y1 = ny1
+                    continue
+            break
+        joined = parts[0]
+        for p in parts[1:]:
+            if joined and p and ord(joined[-1]) > 0x2E7F and ord(p[0]) > 0x2E7F:
+                joined += p
+            else:
+                joined += " " + p
+        return joined.strip()
     except Exception:
         return ""
 
 
-def render_clip(page, bbox, fn, dpi=180):
-    """Render a clipped region of a PDF page to PNG (preserves white bg, rotation, vector)."""
+def render_clip(page, bbox, fn, dpi=180, auto_trim=True):
+    """Render a clipped region of a PDF page to PNG (preserves white bg, rotation, vector),
+    auto-trimming excess pure-white outer borders while keeping crisp padding."""
     import pymupdf
     x0, y0, x1, y1 = bbox
     rect = pymupdf.Rect(x0, y0, x1, y1) & page.rect
@@ -176,8 +200,33 @@ def render_clip(page, bbox, fn, dpi=180):
     mat = pymupdf.Matrix(dpi / 72.0, dpi / 72.0)
     pix = page.get_pixmap(matrix=mat, clip=rect, alpha=False)
     pix.save(fn)
+    out_w, out_h = int(rect.width), int(rect.height)
+    if auto_trim and os.path.isfile(fn) and os.path.getsize(fn) > 1200:
+        try:
+            from PIL import Image, ImageChops
+            with Image.open(fn) as im:
+                rgb = im.convert("RGB")
+                bg = Image.new("RGB", rgb.size, (255, 255, 255))
+                diff = ImageChops.difference(rgb, bg).convert("L")
+                mask = diff.point(lambda v: 255 if v > 14 else 0)
+                tbox = mask.getbbox()
+                if tbox:
+                    iw, ih = rgb.size
+                    pad = max(6, int(dpi * 0.045))
+                    nx0 = max(0, tbox[0] - pad)
+                    ny0 = max(0, tbox[1] - pad)
+                    nx1 = min(iw, tbox[2] + pad)
+                    ny1 = min(ih, tbox[3] + pad)
+                    nw, nh = nx1 - nx0, ny1 - ny0
+                    trimmed_frac = 1.0 - (nw * nh) / max(float(iw * ih), 1.0)
+                    if trimmed_frac >= 0.08 and nw >= 60 and nh >= 45:
+                        rgb.crop((nx0, ny0, nx1, ny1)).save(fn)
+                        out_w = max(1, int(round(nw * 72.0 / float(dpi))))
+                        out_h = max(1, int(round(nh * 72.0 / float(dpi))))
+        except Exception:
+            pass
     if os.path.isfile(fn) and os.path.getsize(fn) > 1200:
-        return {"w": int(rect.width), "h": int(rect.height),
+        return {"w": out_w, "h": out_h,
                 "bbox": [round(rect.x0, 1), round(rect.y0, 1),
                          round(rect.x1, 1), round(rect.y1, 1)]}
     try:
@@ -271,9 +320,17 @@ def crop_vector_figure_for_caption(page, cap, all_caps_on_page, lines, outdir, p
     upper_bound = max(cap_ys_above) + 28 if cap_ys_above else ph * 0.06
 
     # Search above caption first (standard for Figure captions), then below if empty
+    def _has_valid_cands(cs):
+        if len(cs) >= 2:
+            return True
+        if len(cs) == 1:
+            b = cs[0]
+            return (b[2] - b[0]) >= pw * 0.22 and (b[3] - b[1]) >= ph * 0.10
+        return False
+
     def cluster_in_band(y_lo, y_hi, above_caption=True):
         cands = [b for b in dboxes if b[1] >= y_lo - 4 and b[3] <= y_hi + 4]
-        if len(cands) < 2:
+        if not _has_valid_cands(cands):
             return None
         # Keep boxes in the same column region as the caption if single-column caption
         cx0 = cap.get("x0", 0)
@@ -287,7 +344,7 @@ def crop_vector_figure_for_caption(page, cap, all_caps_on_page, lines, outdir, p
             elif cx0 > mid - 25:
                 cands = [b for b in cands if b[2] > mid - 20]
                 col_mode = "right"
-        if len(cands) < 2:
+        if not _has_valid_cands(cands):
             return None
 
         # Bottom-up prose barrier: stop before dense body paragraphs above the figure
@@ -372,30 +429,37 @@ def extract_page_tables(page, page_no, page_caps, page_text=""):
             tbls = getattr(tf2, "tables", []) or []
         except Exception:
             tbls = []
-    # Borderless scientific table fallback (whitespace-aligned columns near a Table caption)
+    # Borderless scientific table fallback (whitespace-aligned columns below or above a Table caption)
     if not tbls and has_tcap:
         try:
             import pymupdf
             tcaps_p = [c for c in page_caps if c["kind"] == "table" and c["y"] is not None]
             pw_t, ph_t = page.rect.width, page.rect.height
             for tc in tcaps_p[:2]:
-                band_y0 = max(0.0, tc["y"] + 8.0)
-                band_y1 = min(ph_t, tc["y"] + ph_t * 0.48)
-                if band_y1 - band_y0 < 50:
-                    continue
-                tf3 = page.find_tables(
-                    clip=pymupdf.Rect(0, band_y0, pw_t, band_y1),
-                    vertical_strategy="text",
-                    horizontal_strategy="text",
-                )
-                for cand in (getattr(tf3, "tables", []) or [])[:1]:
-                    raw_c = cand.extract() or []
-                    clean_c = [[clean_text(str(x or "")).strip() for x in rr]
-                               for rr in raw_c if any((x or "").strip() for x in rr)]
-                    if len(clean_c) >= 3 and len(clean_c[0]) >= 3:
-                        n_num = sum(1 for rr in clean_c[1:] for x in rr if re.search(r"\d", x))
-                        if n_num >= 3:
-                            tbls.append(cand)
+                bands = [
+                    (max(0.0, tc["y"] + 8.0), min(ph_t, tc["y"] + ph_t * 0.48)),
+                    (max(0.0, tc["y"] - ph_t * 0.45), max(0.0, tc["y"] - 6.0)),
+                ]
+                found_for_tc = False
+                for band_y0, band_y1 in bands:
+                    if band_y1 - band_y0 < 50:
+                        continue
+                    tf3 = page.find_tables(
+                        clip=pymupdf.Rect(0, band_y0, pw_t, band_y1),
+                        vertical_strategy="text",
+                        horizontal_strategy="text",
+                    )
+                    for cand in (getattr(tf3, "tables", []) or [])[:1]:
+                        raw_c = cand.extract() or []
+                        clean_c = [[clean_text(str(x or "")).strip() for x in rr]
+                                   for rr in raw_c if any((x or "").strip() for x in rr)]
+                        if len(clean_c) >= 3 and len(clean_c[0]) >= 3:
+                            n_num = sum(1 for rr in clean_c[1:] for x in rr if re.search(r"\d", x))
+                            if n_num >= 3:
+                                tbls.append(cand)
+                                found_for_tc = True
+                    if found_for_tc:
+                        break
         except Exception:
             pass
     for ti, tbl in enumerate(tbls[:4]):
@@ -457,6 +521,24 @@ def extract_page_tables(page, page_no, page_caps, page_text=""):
                               if any(ci < len(r) and r[ci].strip() for r in rows)]
             if len(non_empty_cols) >= 2 and len(non_empty_cols) < max_c:
                 rows = [[r[ci] if ci < len(r) else "" for ci in non_empty_cols] for r in rows]
+            # Merge 2-row LaTeX \multicolumn sub-headers (row 1 has 0 digits and either row has empty cells)
+            if (len(rows) >= 3 and len(rows[0]) == len(rows[1])
+                    and not any(re.search(r"\d", c) for c in rows[1])
+                    and (any(not c.strip() for c in rows[0]) or any(not c.strip() for c in rows[1]))):
+                merged_hdr = []
+                last_group = ""
+                for h0, h1 in zip(rows[0], rows[1]):
+                    h0s, h1s = h0.strip(), h1.strip()
+                    if h0s:
+                        last_group = h0s
+                    if h0s and h1s:
+                        merged_hdr.append(f"{h0s} {h1s}")
+                    elif h1s:
+                        merged_hdr.append(f"{last_group} {h1s}".strip() if last_group else h1s)
+                    else:
+                        merged_hdr.append(h0s)
+                if any(merged_hdr):
+                    rows = [merged_hdr] + rows[2:]
             bb = list(tbl.bbox) if getattr(tbl, "bbox", None) else [0, 0, 0, 0]
             # Match nearest Table caption on same page
             tcaps = [c for c in page_caps if c["kind"] == "table" and c["y"] is not None]
@@ -516,43 +598,44 @@ def extract_key_highlights(pages, max_total=16):
 
 
 def recommend_key_pages(sections, limit_pages, n_pages, tables=None, key_highlights=None):
-    """Recommend 3-5 highest-value pages (Method, Main Results/Tables, Limitations, Conclusion)
-    for fast targeted reading under tight step budgets."""
+    """Recommend up to 6 highest-value pages (Method, Main Results/Tables, Limitations, Conclusion)
+    preserving priority order before sorting so late-paper Limitations/Conclusion are never evicted."""
     role_pats = [
         ("method", re.compile(r"(?i)method|approach|model|framework|architecture|algorithm|方法|模型|架构")),
         ("results", re.compile(r"(?i)experiment|result|evaluation|benchmark|ablation|实验|结果|消融")),
         ("conclusion", re.compile(r"(?i)conclusion|summary|discussion|结论|总结|讨论")),
     ]
     rec = []
+
+    def _add_p(p):
+        if p and int(p) not in rec and len(rec) < 6:
+            rec.append(int(p))
+
     for _role, pat in role_pats:
         for s in sections or []:
             if pat.search(s.get("title") or ""):
-                p = s.get("page")
-                if p and p not in rec:
-                    rec.append(p)
-                    break
+                _add_p(s.get("page"))
+                break
+    # Prioritize Limitations BEFORE extra table/highlight pages so it is never truncated out
+    for lp in (limit_pages or [])[:1]:
+        _add_p(lp)
     # Include main table pages (often separate from the Experimental Setup start page!)
     for t in (tables or [])[:2]:
-        tp = t.get("page")
-        if tp and tp not in rec:
-            rec.append(tp)
+        _add_p(t.get("page"))
     # Include page with highest quantitative highlight density if still room
-    if key_highlights:
+    if key_highlights and len(rec) < 6:
         hl_cnt = {}
         for h in key_highlights:
             hp = h.get("page")
             if hp and hp > 1:
                 hl_cnt[hp] = hl_cnt.get(hp, 0) + 1
         for hp, _c in sorted(hl_cnt.items(), key=lambda kv: (-kv[1], kv[0])):
-            if hp not in rec and len(rec) < 5:
-                rec.append(hp)
+            _add_p(hp)
+            if len(rec) >= 6:
                 break
-    for lp in (limit_pages or [])[:1]:
-        if lp not in rec:
-            rec.append(lp)
     if not rec and n_pages:
         rec = [p for p in (1, max(2, n_pages // 2), n_pages) if 1 <= p <= n_pages]
-    return sorted(set(rec))[:5]
+    return sorted(set(rec))
 
 
 SCHEMATIC_HINT_RE = re.compile(

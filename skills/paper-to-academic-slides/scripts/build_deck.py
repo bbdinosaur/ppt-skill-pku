@@ -529,15 +529,56 @@ def _xml_fill_rgb(container_el, cmap):
     return None
 
 
+def _image_blob_luminance(blob):
+    """Return average relative luminance (0..1) of the central 70% of an image blob."""
+    try:
+        import io
+        from PIL import Image
+        with Image.open(io.BytesIO(blob)) as im:
+            rgb = im.convert("RGB")
+            rgb.thumbnail((32, 32))
+            w, h = rgb.size
+            x0, x1 = int(w * 0.15), max(int(w * 0.85), int(w * 0.15) + 1)
+            y0, y1 = int(h * 0.15), max(int(h * 0.85), int(h * 0.15) + 1)
+            crop = rgb.crop((x0, y0, x1, y1))
+            px = list(crop.getdata())
+            if px:
+                return sum(_rgb_luminance(c) for c in px) / float(len(px))
+    except Exception:
+        pass
+    return None
+
+
 def is_dark_slide_bg(slide, prs):
-    """Detect whether the slide/layout/master has a dark background fill using strictly
-    read-only XML inspection (NEVER touch obj.background, which mutates XML with <a:noFill/>!)."""
+    """Detect whether the slide/layout/master has a dark background fill or dark full-bleed
+    background picture in authentic PowerPoint Z-order (slide -> layout -> master, checking
+    full-bleed cover shapes/pictures before <p:bg> at each level), strictly read-only."""
     cmap = _theme_color_map(prs) if prs is not None else {}
-    # 1) Check explicit <p:bg> from slide -> layout -> master (first explicit fill wins)
+    R_EMBED = "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}embed"
+    slide_area = (prs.slide_width / EMU_IN) * (prs.slide_height / EMU_IN) if prs is not None else (13.333 * 7.5)
+
     for obj in (slide, getattr(slide, "slide_layout", None),
                 getattr(getattr(slide, "slide_layout", None), "slide_master", None)):
         if obj is None:
             continue
+        # A) Full-bleed background shapes or background pictures (>=60% slide area) sit ABOVE <p:bg>
+        try:
+            for shp in obj.shapes:
+                if getattr(shp, "is_placeholder", False):
+                    continue
+                area = (shp.width / EMU_IN) * (shp.height / EMU_IN)
+                if area >= 0.60 * slide_area:
+                    if shp.shape_type == 13:
+                        lum = _image_blob_luminance(shp.image.blob)
+                        if lum is not None:
+                            return lum < 0.45
+                    sp_pr = shp._element.find(f"{P_NS}spPr")
+                    rgb = _xml_fill_rgb(sp_pr, cmap)
+                    if rgb is not None:
+                        return _rgb_luminance(rgb) < 0.45
+        except Exception:
+            pass
+        # B) Explicit <p:bg> fill / gradient / blipFill / bgRef at this level
         try:
             bg = obj._element.find(f"{P_NS}cSld/{P_NS}bg")
             if bg is None:
@@ -554,6 +595,11 @@ def is_dark_slide_bg(slide, prs):
                     if rgbs:
                         avg_lum = sum(_rgb_luminance(c) for c in rgbs) / len(rgbs)
                         return avg_lum < 0.45
+                blip = bg_pr.find(f".//{A_NS}blipFill/{A_NS}blip")
+                if blip is not None and blip.get(R_EMBED):
+                    lum = _image_blob_luminance(obj.part.related_part(blip.get(R_EMBED)).blob)
+                    if lum is not None:
+                        return lum < 0.45
             bg_ref = bg.find(f"{P_NS}bgRef")
             if bg_ref is not None:
                 rgb = _xml_fill_rgb(bg_ref, cmap)
@@ -561,24 +607,6 @@ def is_dark_slide_bg(slide, prs):
                     return _rgb_luminance(rgb) < 0.45
         except Exception:
             pass
-    # 2) Check large background cover shapes (>60% of slide area) on slide/layout/master (read-only XML)
-    slide_area = (prs.slide_width / EMU_IN) * (prs.slide_height / EMU_IN)
-    for container in (slide, getattr(slide, "slide_layout", None),
-                      getattr(getattr(slide, "slide_layout", None), "slide_master", None)):
-        if container is None:
-            continue
-        for shp in container.shapes:
-            if getattr(shp, "is_placeholder", False):
-                continue
-            try:
-                area = (shp.width / EMU_IN) * (shp.height / EMU_IN)
-                if area >= 0.60 * slide_area:
-                    sp_pr = shp._element.find(f"{P_NS}spPr")
-                    rgb = _xml_fill_rgb(sp_pr, cmap)
-                    if rgb is not None:
-                        return _rgb_luminance(rgb) < 0.45
-            except Exception:
-                pass
     return False
 
 
@@ -614,14 +642,44 @@ def capture_placeholder_color(slide, ph):
     return None
 
 
-def set_title(slide, text, prs=None, max_pt=30, is_blank=False, is_cover=False, warnings=None):
+def detect_left_sidebar_clear(slide, prs):
+    """Detect any non-placeholder vertical left-edge sidebar on slide/layout/master
+    and return the safe left X coordinate (in inches) to avoid overlapping it."""
+    if prs is None:
+        return None
+    SW = prs.slide_width / EMU_IN
+    SH = prs.slide_height / EMU_IN
+    clear_x = None
+    for container in (slide, getattr(slide, "slide_layout", None),
+                      getattr(getattr(slide, "slide_layout", None), "slide_master", None)):
+        if container is None:
+            continue
+        for shp in container.shapes:
+            if getattr(shp, "is_placeholder", False):
+                continue
+            if getattr(shp, "name", "") in ("CoverAccent", "TitleRule", "TakeawayAccent"):
+                continue
+            try:
+                sl, st = shp.left / EMU_IN, shp.top / EMU_IN
+                sw, sh = shp.width / EMU_IN, shp.height / EMU_IN
+            except Exception:
+                continue
+            if sl <= 0.18 and 0.25 <= sw <= 2.40 and sh >= SH * 0.65 and sw < SW * 0.45:
+                cand = sl + sw + 0.25
+                clear_x = cand if clear_x is None else max(clear_x, cand)
+    return clear_x
+
+
+def set_title(slide, text, prs=None, max_pt=30, is_blank=False, is_cover=False, warnings=None, margin_l=None):
     ph = placeholder_by_role(slide, "title")
     if ph is None:
         if not text:
             return None
         # Fallback: never silently drop slide title when custom template lacks Title placeholder
         SW = prs.slide_width / EMU_IN if prs else 13.333
-        ph = slide.shapes.add_textbox(Inches(0.55), Inches(0.35), Inches(SW - 1.10), Inches(0.95))
+        fb_l = float(margin_l) if (margin_l is not None and margin_l >= 0.35) else 0.55
+        fb_w = max(SW - fb_l - 0.55, 4.0)
+        ph = slide.shapes.add_textbox(Inches(fb_l), Inches(0.35), Inches(fb_w), Inches(0.95))
         ph.name = "FallbackTitle"
         if warnings is not None:
             warnings.append("layout lacks title placeholder; fallback title textbox used")
@@ -675,10 +733,21 @@ def set_title(slide, text, prs=None, max_pt=30, is_blank=False, is_cover=False, 
                 break
     if pt is None:
         pt = max_pt
-        for cand in (32 if is_cover else 28, 26, 24, 22, 20, 18):
+        cand_list = (32, 30, 28, 26, 24, 22, 20, 18) if is_cover else (24, 22, 20, 18, 16)
+        w_fit = eff_w if is_cover else (eff_w * 0.90)
+        for cand in cand_list:
             pt = cand
-            if est_lines(disp_text, cand, eff_w) * 1.25 * cand / 72.0 <= h * 0.96:
+            if est_lines(disp_text, cand, w_fit) * 1.25 * cand / 72.0 <= h * 0.96:
                 break
+    # Guard tight template title placeholders against frame overflow when title wraps to 2+ lines
+    if not is_cover and ph is not None:
+        needed_h = est_lines(disp_text, pt, eff_w * 0.90) * 1.25 * pt / 72.0 + 0.08
+        if needed_h > h * 0.96 and h < 1.35:
+            try:
+                set_placeholder_box(ph, ph.left / EMU_IN, ph.top / EMU_IN, w, min(1.38, max(h, needed_h)))
+                h = ph.height / EMU_IN
+            except Exception:
+                pass
     tf.clear()
     para = tf.paragraphs[0]
     if is_blank and not is_cover:
@@ -693,15 +762,33 @@ def set_title(slide, text, prs=None, max_pt=30, is_blank=False, is_cover=False, 
         if not is_cover:
             try:
                 from pptx.enum.shapes import MSO_SHAPE
+                line_left = ph.left / EMU_IN if ph.left else 0.55
                 line_top = (ph.top + ph.height) / EMU_IN + 0.03
                 bar = slide.shapes.add_shape(
-                    MSO_SHAPE.RECTANGLE, Inches(0.55), Inches(line_top),
+                    MSO_SHAPE.RECTANGLE, Inches(line_left), Inches(line_top),
                     Inches(max(w, 4.0)), Inches(0.025))
                 bar.name = "TitleRule"
                 bar.fill.solid()
                 bar.fill.fore_color.rgb = RGBColor(*BLANK_ACCENT)
                 bar.line.fill.background()
                 _clear_shape_shadow(bar)
+            except Exception:
+                pass
+        else:
+            try:
+                from pptx.enum.shapes import MSO_SHAPE
+                SW = prs.slide_width / EMU_IN if prs else 13.333
+                SH = prs.slide_height / EMU_IN if prs else 7.5
+                div_w = 2.4
+                div_y = min((ph.top + ph.height) / EMU_IN + 0.14, SH * 0.53)
+                cdiv = slide.shapes.add_shape(
+                    MSO_SHAPE.RECTANGLE, Inches((SW - div_w) / 2.0), Inches(div_y),
+                    Inches(div_w), Inches(0.045))
+                cdiv.name = "CoverDivider"
+                cdiv.fill.solid()
+                cdiv.fill.fore_color.rgb = RGBColor(*BLANK_ACCENT)
+                cdiv.line.fill.background()
+                _clear_shape_shadow(cdiv)
             except Exception:
                 pass
     elif orig_rgb is not None:
@@ -711,9 +798,14 @@ def set_title(slide, text, prs=None, max_pt=30, is_blank=False, is_cover=False, 
     return ph
 
 
-def add_formatted_runs(para, text, pt, color_rgb=None, force_bold=False, is_blank=False):
-    """Render inline **bold** spans as native PowerPoint bold runs."""
-    parts = BOLD_SPLIT_RE.split(text or "")
+def add_formatted_runs(para, text, pt, color_rgb=None, force_bold=False, is_blank=False, auto_leadin=False):
+    """Render inline **bold** spans as native PowerPoint bold runs (optionally bolding concise 'Label:' lead-ins)."""
+    raw_t = text or ""
+    if auto_leadin and not force_bold and "**" not in raw_t:
+        m_ld = re.match(r"^([^:：\n]{2,28})([:：])(\s+.+|[^\s].+)$", raw_t)
+        if m_ld and not re.match(r"^(?:https?|ftp)$", m_ld.group(1).strip(), re.I):
+            raw_t = f"**{m_ld.group(1)}{m_ld.group(2)}**{m_ld.group(3)}"
+    parts = BOLD_SPLIT_RE.split(raw_t)
     any_run = False
     for part in parts:
         if not part:
@@ -760,7 +852,9 @@ def disable_paragraph_bullet(para):
 def fill_body(ph, bullets, base_pt=18, slide=None, prs=None, is_blank=False, no_bullets=False):
     """bullets: list of (level, text). Step-shrink until fits placeholder height."""
     orig_rgb = None if (is_blank or slide is None) else capture_placeholder_color(slide, ph)
-    if orig_rgb is None and not is_blank and slide is not None and prs is not None and is_dark_slide_bg(slide, prs):
+    if orig_rgb is None and is_blank and no_bullets:
+        orig_rgb = RGBColor(0x47, 0x55, 0x69)
+    elif orig_rgb is None and not is_blank and slide is not None and prs is not None and is_dark_slide_bg(slide, prs):
         orig_rgb = RGBColor(0xEA, 0xEE, 0xF5)
     tf = ph.text_frame
     tf.word_wrap = True
@@ -816,7 +910,10 @@ def fill_body(ph, bullets, base_pt=18, slide=None, prs=None, is_blank=False, no_
             para.space_after = Pt(5 if chosen >= 14 else 3)
         if no_bullets:
             disable_paragraph_bullet(para)
-        add_formatted_runs(para, glue_num_units(text), max(chosen - 2 * lv, 10.5), color_rgb=orig_rgb, is_blank=is_blank)
+        add_formatted_runs(
+            para, glue_num_units(text), max(chosen - 2 * lv, 10.5),
+            color_rgb=orig_rgb, is_blank=is_blank, auto_leadin=(not no_bullets and para.level == 0),
+        )
 
 
 def extract_theme_accent(prs):
@@ -932,7 +1029,7 @@ def add_evidence_line(slide, prs, text, reserve_right_in=0.0, is_blank=False, le
         return
     ev_top, ev_max_w, _cb = footer_layout_info(slide, prs)
     SW = prs.slide_width / EMU_IN
-    left_x = max(0.35, min(float(left_in), 2.0))
+    left_x = max(0.35, min(float(left_in), 2.6))
     ev_max_w = min(ev_max_w - max(0.0, left_x - 0.35), max(3.2, SW - left_x - max(0.35, reserve_right_in)))
     # Trim gracefully to fit available horizontal width without clipping/overlapping right footer
     trimmed = text[:160].strip()
@@ -973,7 +1070,7 @@ def add_blank_slide_number(slide, prs, idx, total):
     run.font.color.rgb = RGBColor(*GRAY)
 
 
-def synthesize_slide_line(paper_refs):
+def synthesize_slide_line(paper_refs, title=""):
     """Auto-synthesize a compact evidence footer line from paper_refs when slide_line is omitted."""
     if not paper_refs:
         return ""
@@ -990,7 +1087,11 @@ def synthesize_slide_line(paper_refs):
             parts.append(rid)
         elif pg:
             parts.append(f"p.{pg}")
-    return ("证据: " + "; ".join(parts)) if parts else ""
+    if not parts:
+        return ""
+    sample = (title or "") + " " + " ".join(parts)
+    is_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in sample)
+    return (("证据: " if is_cjk else "Source: ") + "; ".join(parts))
 
 
 def _style_cell_booktabs(cell, bot_hex=None, bot_pt=0.75, top_hex=None, top_pt=0.75):
@@ -1200,18 +1301,22 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
     cell_pt = base_pt
     row_heights = [0.34] * n_rows
     all_r = ([headers] if headers else []) + rows
-    for cand_pt in (base_pt, 11, 10):
+    tight_pad = False
+    for cand_pt in (base_pt, 11, 10, 9.5):
         cell_pt = cand_pt
         rhs = []
+        vpad_h = 0.08 if cand_pt <= 10 else 0.12
         for r in all_r:
-            rh = 0.30
+            rh = 0.28 if cand_pt <= 10 else 0.30
             for ci in range(min(len(r), n_cols)):
-                nl = est_lines(r[ci], cand_pt, max(widths[ci] - 0.14, 0.42))
-                rh = max(rh, nl * 1.30 * cand_pt / 72.0 + 0.12)
+                nl = est_lines(r[ci], cand_pt, max(widths[ci] - 0.12, 0.42))
+                rh = max(rh, nl * 1.28 * cand_pt / 72.0 + vpad_h)
             rhs.append(rh)
         row_heights = rhs
         if sum(rhs) <= avail_h:
             break
+    if sum(row_heights) > avail_h * 0.95 or cell_pt <= 10:
+        tight_pad = True
 
     tot_rh = sum(row_heights)
     if tot_rh > avail_h and tot_rh > 0:
@@ -1263,12 +1368,13 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
     rule_hex = "3B475E" if dark_bg else "D8DEE9"
     end_hex = "64748B" if dark_bg else "{:02X}{:02X}{:02X}".format(*accent)
 
+    v_margin_in = 0.018 if tight_pad else 0.03
     if headers:
         for ci, txt in enumerate(headers[:n_cols]):
             cell = tbl.cell(0, ci)
             cell.vertical_anchor = MSO_ANCHOR.MIDDLE
             cell.margin_left = cell.margin_right = Inches(0.06)
-            cell.margin_top = cell.margin_bottom = Inches(0.03)
+            cell.margin_top = cell.margin_bottom = Inches(v_margin_in)
             cell.fill.solid()
             cell.fill.fore_color.rgb = RGBColor(*hdr_bg)
             _style_cell_booktabs(cell, top_hex=end_hex, top_pt=1.0, bot_hex=end_hex, bot_pt=1.25)
@@ -1289,7 +1395,7 @@ def add_table(slide, prs, table_spec, left_in, top_in, max_w_in, max_h_in,
             cell = tbl.cell(ri + r_i, ci)
             cell.vertical_anchor = MSO_ANCHOR.MIDDLE
             cell.margin_left = cell.margin_right = Inches(0.06)
-            cell.margin_top = cell.margin_bottom = Inches(0.03)
+            cell.margin_top = cell.margin_bottom = Inches(v_margin_in)
             cell.fill.solid()
             if is_ours:
                 cell.fill.fore_color.rgb = RGBColor(*row_ours_bg)
@@ -1368,16 +1474,18 @@ def add_native_chart(slide, prs, chart_spec, left_in, top_in, max_w_in, max_h_in
     note_disp = glue_num_units(note[:140]) if note else ""
     note_h = 0.28 if note_disp else 0.0
     note_res = (note_h + 0.06) if note_disp else 0.0
-    ch_h = min(max_h_in - note_res, max(safe_bot - top_in - note_res, 1.8))
-    ch_h = max(ch_h, 1.8)
+    ch_h_avail = min(max_h_in - note_res, max(safe_bot - top_in - note_res, 1.8))
+    ch_h = max(min(ch_h_avail, 4.35), 1.8)
     ch_w = max(max_w_in, 2.8)
+    ch_slack = ch_h_avail - ch_h
+    ch_top = top_in + (min(ch_slack * 0.25, 0.40) if ch_slack > 0.35 else 0.0)
 
     data = CategoryChartData()
     data.categories = cats
     for sname, svals in valid_series:
         data.add_series(sname, svals)
 
-    g_shape = slide.shapes.add_chart(ctype, Inches(left_in), Inches(top_in), Inches(ch_w), Inches(ch_h), data)
+    g_shape = slide.shapes.add_chart(ctype, Inches(left_in), Inches(ch_top), Inches(ch_w), Inches(ch_h), data)
     g_shape.name = "NativeChart"
     chart = g_shape.chart
     dark_bg = is_dark_slide_bg(slide, prs)
@@ -1393,6 +1501,11 @@ def add_native_chart(slide, prs, chart_spec, left_in, top_in, max_w_in, max_h_in
         palette[0] = (min(255, accent[0] + 65), min(255, accent[1] + 75), min(255, accent[2] + 95))
 
     txt_rgb = RGBColor(0xEA, 0xEE, 0xF5) if dark_bg else RGBColor(0x1E, 0x29, 0x3B)
+    chart_sample_txt = " ".join(cats) + " " + " ".join(sn for sn, _ in valid_series)
+    chart_font_name = (
+        (_BLANK_CJK_FONT if (any(ord(ch) > 0x2E7F for ch in chart_sample_txt) and _BLANK_CJK_FONT) else _BLANK_LATIN_FONT)
+        if is_blank else None
+    )
     ctitle = (chart_spec.get("title") or "").strip()
     unit = (chart_spec.get("unit") or "").strip()
     if ctitle:
@@ -1408,13 +1521,18 @@ def add_native_chart(slide, prs, chart_spec, left_in, top_in, max_w_in, max_h_in
     else:
         chart.has_title = False
 
+    dense_chart = (len(cats) >= 5 or len(valid_series) >= 3)
+    lbl_pt = 9.0 if dense_chart else 9.5
+
     chart.has_legend = len(valid_series) > 1
     if chart.has_legend:
         chart.legend.position = XL_LEGEND_POSITION.BOTTOM
         chart.legend.include_in_layout = False
         try:
-            chart.legend.font.size = Pt(9.5)
+            chart.legend.font.size = Pt(lbl_pt)
             chart.legend.font.color.rgb = txt_rgb
+            if chart_font_name:
+                chart.legend.font.name = chart_font_name
         except Exception:
             pass
 
@@ -1422,34 +1540,61 @@ def add_native_chart(slide, prs, chart_spec, left_in, top_in, max_w_in, max_h_in
     plot.has_data_labels = True
     try:
         plot.data_labels.show_value = True
-        plot.data_labels.font.size = Pt(9.5)
+        plot.data_labels.font.size = Pt(lbl_pt)
         plot.data_labels.font.color.rgb = txt_rgb
+        if chart_font_name:
+            plot.data_labels.font.name = chart_font_name
     except Exception:
         pass
 
+    ours_chart_re = re.compile(r"(?:\bours\b|\bproposed\b|\bthis\s+work\b|本文|本方法)", re.I)
+    single_series_highlight = (
+        len(valid_series) == 1
+        and ctype != XL_CHART_TYPE.LINE_MARKERS
+        and any(ours_chart_re.search(c) for c in cats)
+    )
+    muted_bar_rgb = RGBColor(0x64, 0x74, 0x8B) if dark_bg else RGBColor(0x94, 0xA3, 0xB8)
     for si_c, ser in enumerate(plot.series):
         col_rgb = RGBColor(*palette[si_c % len(palette)])
         try:
             if ctype == XL_CHART_TYPE.LINE_MARKERS:
                 ser.format.line.color.rgb = col_rgb
                 ser.format.line.width = Pt(2.25)
+            elif single_series_highlight:
+                ser.format.fill.solid()
+                ser.format.fill.fore_color.rgb = muted_bar_rgb
+                for pi_c, cat_lbl in enumerate(cats):
+                    if ours_chart_re.search(cat_lbl):
+                        try:
+                            pt_c = ser.points[pi_c]
+                            pt_c.format.fill.solid()
+                            pt_c.format.fill.fore_color.rgb = col_rgb
+                        except Exception:
+                            pass
             else:
                 ser.format.fill.solid()
                 ser.format.fill.fore_color.rgb = col_rgb
         except Exception:
             pass
 
+    grid_rgb = RGBColor(0x33, 0x41, 0x55) if dark_bg else RGBColor(0xE2, 0xE8, 0xF0)
     for ax_attr in ("category_axis", "value_axis"):
         try:
             ax = getattr(chart, ax_attr, None)
             if ax is not None:
-                ax.tick_labels.font.size = Pt(9.5)
+                ax.tick_labels.font.size = Pt(lbl_pt)
                 ax.tick_labels.font.color.rgb = txt_rgb
+                if chart_font_name:
+                    ax.tick_labels.font.name = chart_font_name
+                if ax_attr == "value_axis":
+                    ax.has_major_gridlines = True
+                    ax.major_gridlines.format.line.color.rgb = grid_rgb
+                    ax.major_gridlines.format.line.width = Pt(0.5)
         except Exception:
             pass
 
     if note_disp:
-        note_top = min(top_in + ch_h + 0.04, safe_bot - note_h)
+        note_top = min(ch_top + ch_h + 0.04, safe_bot - note_h)
         box = slide.shapes.add_textbox(Inches(left_in), Inches(note_top), Inches(ch_w), Inches(note_h))
         box.name = "ChartNote"
         tf = box.text_frame
@@ -1630,9 +1775,11 @@ def clean_reused_slide(slide, keep_shapes, prs=None, keep_existing_media=False):
 
 def should_use_wide_stacked_layout(imgs, table_spec, bullets, is_cover, avail_h, chart_spec=None):
     """Switch to Top-Bullets + Full-Width Media for wide tables (>=5 cols, or 4 wide cols),
-    wide native charts (>=5 categories), or wide banner diagrams (aspect >= 2.2) when bullets are concise."""
+    wide native charts (>=5 categories), dual-media slides, or wide banner diagrams (aspect >= 2.2) when bullets are concise."""
     if is_cover or not bullets or avail_h < 3.6:
         return False
+    if imgs and (table_spec or chart_spec) and len(bullets) <= 3 and avail_h >= 4.0:
+        return True
     if table_spec:
         headers = table_spec.get("headers") or []
         rows = table_spec.get("rows") or []
@@ -1813,7 +1960,7 @@ def main():
         ev = sld.get("evidence") or {}
         ev_text = (ev.get("slide_line") or "").strip()
         if not ev_text and not is_cover and ev.get("paper_refs"):
-            ev_text = synthesize_slide_line(ev.get("paper_refs"))
+            ev_text = synthesize_slide_line(ev.get("paper_refs"), title=title)
 
         keep_existing_media = bool(sld.get("keep_existing_media") and reused_this)
         img = sld.get("image")
@@ -1836,16 +1983,40 @@ def main():
         init_content_phs = [p for p in (body, right_ph, pic_ph) if p is not None]
         filled_els = set()
 
+        # Detect any non-placeholder left sidebar or reused top-textbox left anchor BEFORE set_title
+        sidebar_clear = None if is_blank else detect_left_sidebar_clear(slide, prs)
+        reused_title_left = None
+        if reused_this and tph is None:
+            for shp in slide.shapes:
+                if getattr(shp, "is_placeholder", False) or not getattr(shp, "has_text_frame", False):
+                    continue
+                try:
+                    sl_i, st_i = shp.left / EMU_IN, shp.top / EMU_IN
+                    sw_i, sh_i = shp.width / EMU_IN, shp.height / EMU_IN
+                    if st_i <= 1.25 and sh_i <= 1.55 and sw_i >= 4.0 and 0.30 <= sl_i <= 2.40:
+                        reused_title_left = sl_i
+                        break
+                except Exception:
+                    pass
+
+        pre_margin_l = 0.55
+        if not is_blank:
+            if sidebar_clear is not None:
+                pre_margin_l = max(pre_margin_l, sidebar_clear)
+            if reused_title_left is not None:
+                pre_margin_l = max(pre_margin_l, reused_title_left)
+
         if reused_this:
             clean_reused_slide(slide, keep_shapes=[tph, body, right_ph, pic_ph],
                                prs=prs, keep_existing_media=keep_existing_media)
             scale_4x3_template_placeholders_if_needed(slide, prs)
             if keep_existing_media and not has_media and body is not None:
-                # Prevent body text from overlapping any preserved right-side chart/picture/group
+                # Prevent body text from overlapping any preserved right-side OR left-side chart/picture/group
                 try:
                     bx, by = body.left / EMU_IN, body.top / EMU_IN
                     bw, bh = body.width / EMU_IN, body.height / EMU_IN
                     kept_right_min = None
+                    kept_left_max = None
                     skip_els = {s._element for s in (body, tph) if s is not None}
                     for shp in slide.shapes:
                         if shp._element in skip_els:
@@ -1856,10 +2027,17 @@ def main():
                             sl = shp.left / EMU_IN
                             sw = shp.width / EMU_IN
                             sh = shp.height / EMU_IN
-                            if sl >= SW_in * 0.42 and sw >= 1.5 and sh >= 1.2 and (sw * sh < 0.65 * SW_in * SH_in):
-                                kept_right_min = sl if kept_right_min is None else min(kept_right_min, sl)
+                            if sw >= 1.5 and sh >= 1.2 and (sw * sh < 0.65 * SW_in * SH_in):
+                                if sl >= SW_in * 0.42:
+                                    kept_right_min = sl if kept_right_min is None else min(kept_right_min, sl)
+                                elif (sl + sw) <= SW_in * 0.58:
+                                    kept_left_max = (sl + sw) if kept_left_max is None else max(kept_left_max, sl + sw)
                     if kept_right_min is not None and (bx + bw) > kept_right_min - 0.15:
                         set_placeholder_box(body, bx, by, max(kept_right_min - bx - 0.25, 3.0), bh)
+                    elif kept_left_max is not None and bx < kept_left_max + 0.15:
+                        new_bx = kept_left_max + 0.25
+                        new_bw = max((bx + bw) - new_bx, SW_in - new_bx - 0.45, 3.0)
+                        set_placeholder_box(body, new_bx, by, min(new_bw, SW_in - new_bx - 0.40), bh)
                 except Exception:
                     pass
 
@@ -1877,7 +2055,8 @@ def main():
             except Exception:
                 pass
 
-        tph_used = set_title(slide, title, prs=prs, is_blank=is_blank, is_cover=is_cover, warnings=warnings)
+        tph_used = set_title(slide, title, prs=prs, is_blank=is_blank, is_cover=is_cover,
+                             warnings=warnings, margin_l=pre_margin_l)
         if tph is None and tph_used is not None:
             tph = tph_used
         if tph_used is not None and getattr(tph_used, "is_placeholder", False) and (title or "").strip():
@@ -1892,18 +2071,18 @@ def main():
                 pass
         _ev_top, _ev_w, safe_bottom = footer_layout_info(slide, prs)
 
-        # Compute horizontal margins respecting template placeholders (never overlap left sidebars)
-        margin_l = 0.55
-        content_w = SW_in - 1.10
+        # Compute horizontal margins respecting template placeholders & left sidebars
+        margin_l = pre_margin_l
+        content_w = SW_in - margin_l - 0.55
         if not is_blank:
             ref_ph = tph if tph is not None else body
             if ref_ph is not None:
                 try:
                     rl = ref_ph.left / EMU_IN
                     rr = (ref_ph.left + ref_ph.width) / EMU_IN
-                    if 0.30 <= rl <= 1.60 and (rr - rl) >= SW_in * 0.55:
-                        margin_l = rl
-                        content_w = min(SW_in - margin_l - 0.45, max(rr - rl, SW_in * 0.65))
+                    if 0.30 <= rl <= 2.40 and (rr - rl) >= SW_in * 0.55:
+                        margin_l = max(rl, sidebar_clear or 0.0)
+                        content_w = min(SW_in - margin_l - 0.45, max(rr - margin_l, SW_in * 0.60))
                 except Exception:
                     pass
 
@@ -1936,15 +2115,21 @@ def main():
 
         avail_h = max(safe_bottom - title_bottom, 2.2)
 
-        # Clamp non-cover body placeholder bottom so it never overlaps EvidenceLine
-        if not is_cover and body is not None:
-            try:
-                bx, by = body.left / EMU_IN, body.top / EMU_IN
-                bw, bh = body.width / EMU_IN, body.height / EMU_IN
-                if by + bh > safe_bottom:
-                    set_placeholder_box(body, bx, by, bw, max(safe_bottom - by, 1.5))
-            except Exception:
-                pass
+        # Unconditionally clamp non-cover placeholders between title_bottom and safe_bottom
+        # (prevents 2-line top-title overlaps with body/media; preserves centered Section Header layouts)
+        if not is_cover:
+            for ph_s in (body, right_ph, pic_ph):
+                if ph_s is not None:
+                    try:
+                        px, py = ph_s.left / EMU_IN, ph_s.top / EMU_IN
+                        pw, ph_h = ph_s.width / EMU_IN, ph_s.height / EMU_IN
+                        new_py = max(py, title_bottom) if (title_bottom < SH_in * 0.45 and safe_bottom - title_bottom >= 1.5) else py
+                        max_bh = max(safe_bottom - new_py, 0.45)
+                        new_bh = min(ph_h, max_bh)
+                        if abs(new_py - py) > 0.005 or abs(new_bh - ph_h) > 0.005:
+                            set_placeholder_box(ph_s, px, new_py, pw, new_bh)
+                    except Exception:
+                        pass
 
         # Determine target media box (prefer native right_ph/pic_ph, or top-bullets + wide media for wide tables/banners)
         media_box = None
@@ -1963,7 +2148,8 @@ def main():
             for lv, t in bullets:
                 nl = est_lines(t, 15, max(full_w - 0.45 - 0.35 * lv, 3.0))
                 top_est += nl * 1.28 * 15.0 / 72.0 + 0.07
-            top_h = min(max(top_est + 0.20, 0.95), min(1.85, avail_h * 0.38))
+            top_cap = min(2.10, avail_h * 0.42) if avail_h >= 4.6 else min(1.85, avail_h * 0.38)
+            top_h = min(max(top_est + 0.20, 0.95), top_cap)
             if body is not None:
                 set_placeholder_box(body, margin_l, title_bottom, full_w, top_h)
             media_top = title_bottom + top_h + 0.14
@@ -2049,13 +2235,13 @@ def main():
                 except Exception:
                     media_box = None
             elif not bullets:
-                # Full-width showcase when no left bullets
+                # Full-width showcase when no left bullets (respecting template margin_l/content_w)
                 if body is not None:
                     remove_shape(body)
                     body = None
                 if right_ph is not None:
                     remove_shape(right_ph)
-                media_box = (SW_in * 0.07, title_bottom, SW_in * 0.86, avail_h)
+                media_box = (margin_l, title_bottom, content_w, avail_h)
             else:
                 # Single body placeholder: safely capture all 4 xfrm dims, then shrink to left half
                 if body is not None:
@@ -2065,17 +2251,19 @@ def main():
                         bw = body.width / EMU_IN
                         bh = min(body.height / EMU_IN, safe_bottom - by)
                         if bx < SW_in * 0.40:
-                            new_w = min(bw, SW_in * 0.45)
+                            new_w = min(bw, content_w * 0.46)
                             set_placeholder_box(body, bx, by, new_w, max(bh, 2.0))
-                            mx = max(bx + new_w + 0.25, SW_in * 0.52)
-                            media_box = (mx, title_bottom, SW_in - mx - 0.45, avail_h)
+                            mx = max(bx + new_w + 0.25, margin_l + content_w * 0.49)
+                            media_box = (mx, title_bottom, max(margin_l + content_w - mx, 2.6), avail_h)
                         else:
                             # Body lives on right; place media on left
-                            media_box = (0.45, title_bottom, max(bx - 0.70, SW_in * 0.42), avail_h)
+                            media_box = (margin_l, title_bottom, max(bx - margin_l - 0.25, content_w * 0.42), avail_h)
                     except Exception:
-                        media_box = (SW_in * 0.52, title_bottom, SW_in * 0.44, avail_h)
+                        mx = margin_l + content_w * 0.50
+                        media_box = (mx, title_bottom, max(margin_l + content_w - mx, 2.6), avail_h)
                 else:
-                    media_box = (SW_in * 0.52, title_bottom, SW_in * 0.44, avail_h)
+                    mx = margin_l + content_w * 0.50
+                    media_box = (mx, title_bottom, max(margin_l + content_w - mx, 2.6), avail_h)
         else:
             # No new media: avoid expanding body across preserved existing media when keep_existing_media=True
             if right_ph is not None:
@@ -2099,9 +2287,15 @@ def main():
             fill_body(body, bullets, b_base_pt, slide=slide, prs=prs, is_blank=is_blank, no_bullets=is_cover)
             filled_els.add(body._element)
         elif bullets:
-            tb_w = (SW_in - 1.10) if wide_stacked else (SW_in * 0.45 if has_media else SW_in * 0.88)
+            tb_x = margin_l
+            if wide_stacked:
+                tb_w = content_w
+            elif has_media and media_box:
+                tb_w = max(min(content_w * 0.46, media_box[0] - tb_x - 0.22), 2.5) if media_box[0] > tb_x + 2.7 else content_w * 0.46
+            else:
+                tb_w = content_w
             tb_h = top_h if wide_stacked else avail_h
-            tb = slide.shapes.add_textbox(Inches(0.55), Inches(title_bottom),
+            tb = slide.shapes.add_textbox(Inches(tb_x), Inches(title_bottom),
                                           Inches(tb_w), Inches(tb_h))
             tb.text_frame.word_wrap = True
             fill_body(tb, bullets, b_base_pt, slide=slide, prs=prs, is_blank=is_blank, no_bullets=is_cover)
@@ -2115,21 +2309,22 @@ def main():
             ml, mt, mw, mh = media_box
             mw = max(mw, 2.2)
             mh = max(mh, 1.8)
-            if imgs:
+            mh_clamped = min(mh, max(safe_bottom - mt, 1.4))
+
+            def _render_imgs_in(bx_l, bx_t, bx_w, bx_h, box_bot):
                 img_cap = (sld.get("image_caption") or sld.get("caption") or "").strip()
                 if not img_cap and isinstance(sld.get("image_captions"), list):
                     img_cap = "  |  ".join(str(x).strip() for x in sld["image_captions"] if str(x).strip())
                 cap_disp = glue_num_units(img_cap[:135]) if img_cap else ""
-                cap_lines = est_lines(cap_disp, 10, max(mw - 0.06, 1.5)) if cap_disp else 0
+                cap_lines = est_lines(cap_disp, 10, max(bx_w - 0.06, 1.5)) if cap_disp else 0
                 cap_pt = 9.5 if cap_lines >= 2 else 10
                 cap_h = (0.40 if cap_lines >= 2 else 0.26) if cap_disp else 0.0
                 cap_reserve = (cap_h + 0.08) if cap_disp else 0.0
-                mh_clamped = min(mh, max(safe_bottom - mt, 1.4))
-                pic_bottom = stack_images(slide, imgs, ml, mt, mw, max(mh_clamped - cap_reserve, 1.3), prs=prs)
+                pic_bottom = stack_images(slide, imgs, bx_l, bx_t, bx_w, max(bx_h - cap_reserve, 1.15), prs=prs)
                 if cap_disp:
-                    cap_top = min(pic_bottom + 0.04, safe_bottom - cap_h)
-                    cbox = slide.shapes.add_textbox(Inches(ml), Inches(cap_top),
-                                                    Inches(mw), Inches(cap_h))
+                    cap_top = min(pic_bottom + 0.04, box_bot - cap_h)
+                    cbox = slide.shapes.add_textbox(Inches(bx_l), Inches(cap_top),
+                                                    Inches(bx_w), Inches(cap_h))
                     cbox.name = "ImageCaption"
                     ctf = cbox.text_frame
                     ctf.word_wrap = True
@@ -2142,6 +2337,64 @@ def main():
                     _apply_blank_font(crun, cap_disp, is_blank)
                     cfg = LIGHT_GRAY if is_dark_slide_bg(slide, prs) else GRAY
                     crun.font.color.rgb = RGBColor(*cfg)
+                    return cap_top + cap_h
+                return pic_bottom
+
+            secondary = ("table", table_spec) if table_spec else (("chart", chart_spec) if chart_spec else None)
+            if imgs and secondary is not None:
+                # Never silently drop coexisting table/chart: split media_box cleanly side-by-side or vertically
+                sec_kind, sec_spec = secondary
+                warnings.append(f"slide {si+1}: coexisting image + {sec_kind}; rendered in split media region")
+                if mw >= 7.6:
+                    gap_m = 0.24
+                    w_l = (mw - gap_m) * 0.48
+                    w_r = mw - gap_m - w_l
+                    _render_imgs_in(ml, mt, w_l, mh_clamped, safe_bottom)
+                    if sec_kind == "table":
+                        add_table(slide, prs, sec_spec, ml + w_l + gap_m, mt, w_r, mh_clamped,
+                                  is_blank=is_blank, theme_accent=theme_accent,
+                                  safe_bottom_override=safe_bottom)
+                    else:
+                        add_native_chart(slide, prs, sec_spec, ml + w_l + gap_m, mt, w_r, mh_clamped,
+                                         is_blank=is_blank, theme_accent=theme_accent,
+                                         safe_bottom_override=safe_bottom)
+                else:
+                    gap_v = 0.14
+                    h_top = max(mh_clamped * 0.48, 1.45)
+                    used_bot = _render_imgs_in(ml, mt, mw, h_top, mt + h_top)
+                    sec_top = max(used_bot + gap_v, mt + h_top + gap_v)
+                    sec_h = max(safe_bottom - sec_top, 1.35)
+                    if sec_kind == "table":
+                        add_table(slide, prs, sec_spec, ml, sec_top, mw, sec_h,
+                                  is_blank=is_blank, theme_accent=theme_accent,
+                                  safe_bottom_override=safe_bottom)
+                    else:
+                        add_native_chart(slide, prs, sec_spec, ml, sec_top, mw, sec_h,
+                                         is_blank=is_blank, theme_accent=theme_accent,
+                                         safe_bottom_override=safe_bottom)
+            elif imgs:
+                _render_imgs_in(ml, mt, mw, mh_clamped, safe_bottom)
+            elif table_spec and chart_spec:
+                warnings.append(f"slide {si+1}: coexisting table + chart; rendered in split media region")
+                if mw >= 7.6:
+                    gap_m = 0.24
+                    w_l = (mw - gap_m) * 0.50
+                    w_r = mw - gap_m - w_l
+                    add_table(slide, prs, table_spec, ml, mt, w_l, mh_clamped,
+                              is_blank=is_blank, theme_accent=theme_accent,
+                              safe_bottom_override=safe_bottom)
+                    add_native_chart(slide, prs, chart_spec, ml + w_l + gap_m, mt, w_r, mh_clamped,
+                                     is_blank=is_blank, theme_accent=theme_accent,
+                                     safe_bottom_override=safe_bottom)
+                else:
+                    h_top = max(mh_clamped * 0.48, 1.45)
+                    add_table(slide, prs, table_spec, ml, mt, mw, h_top,
+                              is_blank=is_blank, theme_accent=theme_accent,
+                              safe_bottom_override=mt + h_top)
+                    add_native_chart(slide, prs, chart_spec, ml, mt + h_top + 0.14, mw,
+                                     max(safe_bottom - (mt + h_top + 0.14), 1.4),
+                                     is_blank=is_blank, theme_accent=theme_accent,
+                                     safe_bottom_override=safe_bottom)
             elif table_spec:
                 add_table(slide, prs, table_spec, ml, mt, mw, mh,
                           is_blank=is_blank, theme_accent=theme_accent,
