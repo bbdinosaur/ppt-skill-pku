@@ -88,6 +88,32 @@ def normalize_spec(spec: dict):
                     sl["figure"]["path"] = sl["figure"][fk]
                     fixes.append(f"s{idx}.figure.{fk}->path")
                     break
+        # figures: list[str|dict] -> normalized list[dict] (1 item collapses to figure if figure unset)
+        if isinstance(sl.get("figures"), list) and sl["figures"]:
+            norm_fs = []
+            f_chg = False
+            for f_it in sl["figures"][:2]:
+                if isinstance(f_it, str) and f_it.strip():
+                    norm_fs.append({"path": f_it.strip()})
+                    f_chg = True
+                elif isinstance(f_it, dict):
+                    fd = dict(f_it)
+                    if not fd.get("path"):
+                        for fk in ("file", "src", "image", "img", "fig_path"):
+                            if fd.get(fk):
+                                fd["path"] = fd[fk]
+                                f_chg = True
+                                break
+                    if fd.get("path"):
+                        norm_fs.append(fd)
+            if len(norm_fs) == 1 and not sl.get("figure"):
+                sl["figure"] = norm_fs[0]
+                sl.pop("figures", None)
+                fixes.append(f"s{idx}.figures[1]->figure")
+            elif norm_fs:
+                sl["figures"] = norm_fs
+                if f_chg:
+                    fixes.append(f"s{idx}.figures normalized")
         # reuse: int -> {"slide_index": N, "action": "edit"}; coerce slide/index -> slide_index
         ru = sl.get("reuse")
         if isinstance(ru, int) and not isinstance(ru, bool):
@@ -217,6 +243,13 @@ def normalize_spec(spec: dict):
             if changed_st:
                 sl["steps"] = new_steps
                 fixes.append(f"s{idx}.steps normalized")
+        # callout: normalize alias keys (key_takeaway/highlight/equation_box -> callout)
+        if not sl.get("callout"):
+            for cok in ("key_takeaway", "highlight", "highlight_box", "equation_box", "note_box"):
+                if sl.get(cok):
+                    sl["callout"] = sl[cok]
+                    fixes.append(f"s{idx}.callout<-{cok}")
+                    break
         # evidence: str or list[str] -> list[{type, locator, strength}] + default strength
         role_l = str(sl.get("role") or "").lower()
         def_str = "NA" if role_l in ("title", "thanks", "roadmap", "qa_backup") else "S2"
@@ -233,6 +266,18 @@ def normalize_spec(spec: dict):
                     et = "figure" if re.search(r"fig|图", el, re.I) else ("table" if re.search(r"tab|表", el, re.I) else "section")
                     new_evs.append({"type": et, "locator": el, "strength": def_str})
                 elif isinstance(ev, dict):
+                    if not ev.get("locator"):
+                        for ek in ("source", "ref", "location", "cite"):
+                            if ev.get(ek):
+                                ev["locator"] = str(ev[ek])
+                                changed_ev = True
+                                break
+                    if not ev.get("strength"):
+                        for sk in ("level", "tier", "grade"):
+                            if ev.get(sk):
+                                ev["strength"] = str(ev[sk]).upper()
+                                changed_ev = True
+                                break
                     if ev.get("locator") and not ev.get("strength"):
                         ev["strength"] = def_str
                         changed_ev = True
@@ -255,24 +300,45 @@ def normalize_spec(spec: dict):
                 fixes.append(f"qa_prep<-{qk}")
             break
     if isinstance(qa, list):
+        CAT_NORM = {
+            "机制": "mechanism", "原理": "mechanism", "方法": "mechanism", "mech": "mechanism",
+            "数据": "data", "实验": "data", "指标": "data", "统计": "data",
+            "对照": "baseline", "基线": "baseline", "消融": "baseline", "比较": "baseline", "ctrl": "baseline", "comparison": "baseline", "ablation": "baseline",
+            "局限": "limitation", "边界": "limitation", "风险": "limitation", "不足": "limitation", "limit": "limitation", "limits": "limitation", "boundary": "limitation",
+        }
+        qa_chg = False
         for q in qa:
             if not isinstance(q, dict):
                 continue
             if not q.get("category"):
-                for ck in ("cat", "type", "dimension"):
+                for ck in ("cat", "type", "dim", "dimension"):
                     if q.get(ck):
                         q["category"] = str(q[ck]).strip().lower()
+                        qa_chg = True
                         break
+            if q.get("category"):
+                cl = str(q["category"]).strip().lower()
+                if cl in CAT_NORM:
+                    q["category"] = CAT_NORM[cl]
+                    qa_chg = True
             if not q.get("question") and q.get("q"):
                 q["question"] = q["q"]
+                qa_chg = True
             if not q.get("answer_key"):
-                for alt_k in ("answer", "key", "response", "a"):
+                for alt_k in ("answer", "key_points", "key", "response", "a"):
                     if q.get(alt_k):
                         q["answer_key"] = q[alt_k]
+                        qa_chg = True
                         break
+            if not q.get("cite_slide") and isinstance(q.get("cite_slides"), list) and q["cite_slides"]:
+                q["cite_slide"] = _coerce_int(q["cite_slides"][0])
+                qa_chg = True
             for rk in ("cite_slide", "backup_slide"):
                 if isinstance(q.get(rk), str):
                     q[rk] = _coerce_int(q[rk])
+                    qa_chg = True
+        if qa_chg:
+            fixes.append("qa_prep normalized")
     return spec, fixes
 
 
@@ -483,17 +549,23 @@ def main():
     else:
         print("  [numbers/evidence] skipped (paper.txt absent)")
 
-    # 2d figure paths exist
+    # 2d figure paths exist (covers both singular figure and dual figures[])
     bad_figs = []
     for idx, sl in enumerate(spec.get("slides", []), 1):
-        fp = (sl.get("figure") or {}).get("path")
-        if fp and not Path(fp).exists():
-            alts = [
-                work / fp, work / "figs" / Path(fp).name, work / Path(fp).name,
-                cpath.parent / fp, work.parent / fp, work.parent.parent / fp,
-            ]
-            if not any(alt.exists() for alt in alts):
-                bad_figs.append((idx, fp))
+        f_paths = []
+        if isinstance(sl.get("figure"), dict) and sl["figure"].get("path"):
+            f_paths.append(sl["figure"]["path"])
+        for f_it in (sl.get("figures") or [])[:2]:
+            if isinstance(f_it, dict) and f_it.get("path"):
+                f_paths.append(f_it["path"])
+        for fp in f_paths:
+            if fp and not Path(fp).exists():
+                alts = [
+                    work / fp, work / "figs" / Path(fp).name, work / Path(fp).name,
+                    cpath.parent / fp, work.parent / fp, work.parent.parent / fp,
+                ]
+                if not any(alt.exists() for alt in alts):
+                    bad_figs.append((idx, fp))
     if bad_figs:
         gate_fail += 1
         fix_hints.append("figs: replace missing figure path(s) with exact path from reading_map.md or use table/chart/steps")
@@ -559,26 +631,15 @@ def main():
             if sheets:
                 print("  contact sheets (inspect these first): " + ", ".join(sheets))
 
-    # 4) Export speaker notes handout
-    print("== [4/5] speaker notes ==")
-    en_args = ["--deck", str(deck_out), "--plan", str(work / "slide_plan.json"), "--out", str(out_dir / "speaker_notes.md")]
-    if (work / "qa_plan.json").exists():
-        en_args += ["--qa", str(work / "qa_plan.json")]
-    if (work / "paper_outline.json").exists():
-        en_args += ["--outline", str(work / "paper_outline.json")]
-    if a.notes_pdf:
-        en_args += ["--pdf"]
-    ren = run_py("export_notes.py", en_args)
-    print("  " + (ren.stdout or ren.stderr).strip().replace("\n", "\n  "))
-
-    # 4b) Deterministic rendered-pixel + semantic quality audit & real revision provenance (changes.json)
+    # 4) Deterministic rendered-pixel + semantic quality audit & real revision provenance (changes.json)
     raud = run_py("audit_talk.py", ["--work", str(work), "--out-dir", str(out_dir), "--spec", str(spec_path), "--out", str(work / "quality_audit.json")])
     audit_out = (raud.stdout or "").strip()
+
     try:
         cur_plan = json.loads((work / "slide_plan.json").read_text(encoding="utf-8")) if (work / "slide_plan.json").exists() else {}
         cur_slides = cur_plan.get("slides") or []
         cur_sig = [
-            (s.get("pptx_slide"), s.get("role"), s.get("title"), s.get("claim"), s.get("visuals"), s.get("notes_chars"))
+            [s.get("pptx_slide"), s.get("role"), s.get("title"), s.get("claim"), list(s.get("visuals") or []), s.get("notes_chars")]
             for s in cur_slides
         ]
         prev_p = work / "_prev_plan_sig.json"
@@ -623,6 +684,23 @@ def main():
     except Exception:
         pass
 
+    # 4b) Export speaker notes handout + standalone evidence_map.md (after audit_talk & changes.json)
+    print("== [4/5] speaker notes & evidence map ==")
+    notes_out = out_dir / "speaker_notes.md"
+    evmap_out = out_dir / "evidence_map.md"
+    en_args = [
+        "--deck", str(deck_out), "--plan", str(work / "slide_plan.json"),
+        "--out", str(notes_out), "--evidence-map", str(evmap_out),
+    ]
+    if (work / "qa_plan.json").exists():
+        en_args += ["--qa", str(work / "qa_plan.json")]
+    if (work / "paper_outline.json").exists():
+        en_args += ["--outline", str(work / "paper_outline.json")]
+    if a.notes_pdf:
+        en_args += ["--pdf"]
+    ren = run_py("export_notes.py", en_args)
+    print("  " + (ren.stdout or ren.stderr).strip().replace("\n", "\n  "))
+
     # 5) Assemble result.json
     print("== [5/5] result.json ==")
     res_args = ["--case", str(cpath), "--work", str(work), "--out", str(result_out)]
@@ -630,6 +708,32 @@ def main():
         res_args += ["--fill", str(work / "result_fill.json")]
     rres = run_py("build_result.py", res_args)
     print("  " + (rres.stdout or rres.stderr).strip().replace("\n", "\n  "))
+
+    # Fulfill any extra explicitly requested companion output filenames from task.md / case.json
+    extra_outs = ingest.get("extra_requested_outputs") or []
+    if extra_outs:
+        try:
+            rj_full = json.loads(result_out.read_text(encoding="utf-8")) if result_out.exists() else {}
+            for req_fn in extra_outs[:6]:
+                fn = Path(str(req_fn)).name
+                target_p = out_dir / fn
+                if target_p.exists() or fn in (deck_out.name, result_out.name):
+                    continue
+                fl = fn.lower()
+                if fl.endswith(".md"):
+                    if any(k in fl for k in ("evidence", "trace", "map", "audit", "report", "summary")) and evmap_out.exists():
+                        target_p.write_text(evmap_out.read_text(encoding="utf-8"), encoding="utf-8")
+                    elif any(k in fl for k in ("note", "script", "handout", "outline", "qa", "talk")) and notes_out.exists():
+                        target_p.write_text(notes_out.read_text(encoding="utf-8"), encoding="utf-8")
+                elif fl.endswith(".json"):
+                    if any(k in fl for k in ("evidence", "trace", "map")):
+                        target_p.write_text(json.dumps(rj_full.get("evidence_map") or [], ensure_ascii=False, indent=2), encoding="utf-8")
+                    elif "qa" in fl:
+                        target_p.write_text(json.dumps(rj_full.get("qa_prep") or [], ensure_ascii=False, indent=2), encoding="utf-8")
+                    elif any(k in fl for k in ("plan", "outline", "slide")):
+                        target_p.write_text(json.dumps(rj_full.get("slide_plan") or [], ensure_ascii=False, indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     try:
         rj = json.loads(result_out.read_text(encoding="utf-8"))

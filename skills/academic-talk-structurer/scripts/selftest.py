@@ -181,36 +181,227 @@ def main():
     if pipe_ok:
         pr = json.loads((pipe_dir / "out" / "result.json").read_text(encoding="utf-8"))
         notes_md = (pipe_dir / "out" / "speaker_notes.md").read_text(encoding="utf-8") if (pipe_dir / "out" / "speaker_notes.md").exists() else ""
+        ev_md = (pipe_dir / "out" / "evidence_map.md").read_text(encoding="utf-8") if (pipe_dir / "out" / "evidence_map.md").exists() else ""
         pipe_ok = (
             pr.get("qa_prep", [{}])[0].get("backup_slide") == 4
             and any(s.get("type") == "source_document" for s in pr.get("sources", []))
             and "source_coverage_audit" in pr
             and "visual_diversity_pct" in (pr.get("evidence_coverage") or {})
             and "| Slide | Role |" in notes_md
+            and "| Slide | Role | Takeaway Claim |" in ev_md
+            and bool((pr.get("deliverables") or {}).get("evidence_map"))
             and (pipe_dir / "work" / "page_budget.json").exists()
             and (pipe_dir / "work" / "reading_map.md").exists()
         )
-    results.append(("ingest+deliver+chart (e2e)", pipe_ok, (r_ing.stderr + r_del.stdout + r_del.stderr).strip()[-180:]))
+    results.append(("ingest+deliver+chart+evmap (e2e)", pipe_ok, (r_ing.stderr + r_del.stdout + r_del.stderr).strip()[-180:]))
 
-    # 6b) exact numeric token + derived delta + scientific notation + unit conversion + Q&A audit
-    (tmp / "num_src.txt").write_text("Total samples 1420 with accuracy 76.3% vs baseline 73.1%, lr=3e-4, latency 450ms (Eq. (1), Algorithm 1).", encoding="utf-8")
+    # 6c) dual side-by-side figures + enhanced math/ASCII polish (x_t, ℝ^d, >=)
+    dual_spec = {
+        "meta": {"title": "Dual Fig Math Test", "duration_minutes": 5, "language": "en"},
+        "slides": [
+            {"role": "result", "title": "Dual Panel Comparison on ℝ^d", "claim": "Score g_t >= 0.18 cuts cost 2.4x",
+             "figures": [{"path": str(fig), "caption": "Left panel: Fig.1"}, {"path": str(fig), "caption": "Right panel: Fig.2"}],
+             "evidence": [{"type": "figure", "locator": "Figs. 1–2", "strength": "S1"}],
+             "notes": "Compare left and right panels showing g_t >= 0.18 achieves a 2.4x reduction.", "time_s": 60}
+        ],
+    }
+    (tmp / "dual_spec.json").write_text(json.dumps(dual_spec, ensure_ascii=False), encoding="utf-8")
+    r_dual = run([str(HERE / "build_deck.py"), "--spec", str(tmp / "dual_spec.json"), "--out", str(tmp / "dual.pptx"), "--work", str(tmp)])
+    dual_ok = r_dual.returncode == 0 and (tmp / "dual.pptx").exists()
+    if dual_ok:
+        try:
+            from pptx import Presentation as _PrsDual
+            from pptx.enum.shapes import MSO_SHAPE_TYPE as _MST
+            _p_d = _PrsDual(str(tmp / "dual.pptx"))
+            _s0 = _p_d.slides[0]
+            _n_pics = sum(1 for sh in _s0.shapes if sh.shape_type == _MST.PICTURE)
+            _all_t = " ".join(sh.text_frame.text for sh in _s0.shapes if sh.has_text_frame)
+            dual_ok = (_n_pics == 2 and "ℝᵈ" in _all_t and "gₜ" in _all_t and "≥" in _all_t)
+        except Exception:
+            dual_ok = False
+    results.append(("build_deck (dual_figs+math)", dual_ok, (r_dual.stdout + r_dual.stderr).strip()[-140:]))
+
+    # 6d) multi-media zero-overlap (fig+tbl without bullets, fig+tbl with bullets, and edit_deck reuse fig+tbl)
+    mm_spec = {
+        "meta": {"title": "Multi-Media Zero Overlap", "duration_minutes": 6, "language": "en"},
+        "slides": [
+            {"role": "result", "title": "Side-by-Side Figure and Table",
+             "claim": "Zero overlap when figure and table coexist without bullets",
+             "figure": {"path": str(fig), "caption": "Fig. 1: Synthetic curve"},
+             "table": {"headers": ["Method", "Acc", "Lat"], "rows": [["Base", "80.1%", "40ms"], ["Ours", "84.5%", "22ms"]], "caption": "Table 1: Main results"},
+             "evidence": [{"type": "figure", "locator": "Fig. 1, Table 1", "strength": "S1"}],
+             "notes": "Left panel shows Fig. 1 and right panel shows Table 1 with zero overlap.", "time_s": 60},
+            {"role": "analysis", "title": "Bullets Above Side-by-Side Media",
+             "claim": "Top bullet band sits cleanly above paired figure and table",
+             "bullets": ["Top band summarizes key latency vs accuracy tradeoff cleanly.", "Bottom-left figure and bottom-right table stay completely disjoint."],
+             "figure": {"path": str(fig), "caption": "Fig. 2: Latency profile"},
+             "table": {"headers": ["Setting", "Gain"], "rows": [["Static", "+1.2%"], ["Ours", "+4.4%"]], "caption": "Table 2: Ablation"},
+             "evidence": [{"type": "table", "locator": "Fig. 2, Table 2", "strength": "S1"}],
+             "notes": "Read the top bullets first, then inspect Fig. 2 on the bottom left and Table 2 on the bottom right.", "time_s": 60},
+        ],
+    }
+    (tmp / "mm_spec.json").write_text(json.dumps(mm_spec, ensure_ascii=False), encoding="utf-8")
+    r_mm = run([str(HERE / "build_deck.py"), "--spec", str(tmp / "mm_spec.json"), "--out", str(tmp / "mm.pptx"), "--work", str(tmp)])
+    r_mm_lint = run([str(HERE / "check_layout.py"), str(tmp / "mm.pptx"), "--json", str(tmp / "mm_lint.json")])
+    # Also verify edit_deck (is_reuse) with fig+tbl does NOT delete the newly inserted figure when adding the table
+    mm_reuse_spec = {
+        "meta": {"title": "Reuse Multi-Media", "duration_minutes": 5, "language": "en", "keep_only_spec_slides": True},
+        "slides": [
+            {"reuse": {"slide_index": 0, "action": "edit", "clear_visuals": False},
+             "role": "result", "title": "Reused Slide With Both Fig and Table",
+             "claim": "Single-pass clear_old preserves both newly inserted media items",
+             "figure": {"path": str(fig), "caption": "New Fig. 1"},
+             "table": {"headers": ["Model", "Score"], "rows": [["Old", "70.0"], ["New", "78.5"]], "caption": "New Table 1"},
+             "notes": "Both new figure and new table survive reuse.", "time_s": 60},
+        ],
+    }
+    (tmp / "mm_reuse_spec.json").write_text(json.dumps(mm_reuse_spec, ensure_ascii=False), encoding="utf-8")
+    r_mm_reuse = run([str(HERE / "build_deck.py"), "--spec", str(tmp / "mm_reuse_spec.json"), "--deck", str(tmp / "mm.pptx"), "--out", str(tmp / "mm_reuse.pptx"), "--work", str(tmp)])
+    r_mm_reuse_lint = run([str(HERE / "check_layout.py"), str(tmp / "mm_reuse.pptx"), "--json", str(tmp / "mm_reuse_lint.json")])
+    mm_ok = (r_mm.returncode == 0 and r_mm_lint.returncode == 0 and r_mm_reuse.returncode == 0 and r_mm_reuse_lint.returncode == 0)
+    if mm_ok:
+        try:
+            from pptx import Presentation as _PrsMM
+            from pptx.enum.shapes import MSO_SHAPE_TYPE as _MSTMM
+            _pm = _PrsMM(str(tmp / "mm.pptx"))
+            _s0_pic = [sh for sh in _pm.slides[0].shapes if sh.shape_type == _MSTMM.PICTURE]
+            _s0_tbl = [sh for sh in _pm.slides[0].shapes if getattr(sh, "has_table", False)]
+            _s1_pic = [sh for sh in _pm.slides[1].shapes if sh.shape_type == _MSTMM.PICTURE]
+            _s1_tbl = [sh for sh in _pm.slides[1].shapes if getattr(sh, "has_table", False)]
+            _pr = _PrsMM(str(tmp / "mm_reuse.pptx"))
+            _sr_pic = [sh for sh in _pr.slides[0].shapes if sh.shape_type == _MSTMM.PICTURE]
+            _sr_tbl = [sh for sh in _pr.slides[0].shapes if getattr(sh, "has_table", False)]
+            mm_ok = (
+                len(_s0_pic) == 1 and len(_s0_tbl) == 1 and (_s0_pic[0].left + _s0_pic[0].width) <= _s0_tbl[0].left
+                and len(_s1_pic) == 1 and len(_s1_tbl) == 1 and (_s1_pic[0].left + _s1_pic[0].width) <= _s1_tbl[0].left
+                and len(_sr_pic) == 1 and len(_sr_tbl) == 1
+            )
+        except Exception:
+            mm_ok = False
+    results.append(("build_deck (multi-media+reuse)", mm_ok, (r_mm.stdout + r_mm_lint.stdout + r_mm_reuse_lint.stdout).strip()[-160:]))
+
+    # 6e) dark bg detection (full-bleed PICTURE, blipFill, gradFill, schemeClr+lumMod/shade, Z-order) + >=65% bg lint exemption
+    dark_ok = False
+    dark_note = ""
+    try:
+        import importlib.util as _ilu
+        from PIL import Image as _PImg
+        from pptx import Presentation as _PrsDk
+        from pptx.util import Inches as _In
+        from pptx.oxml import parse_xml as _pxml
+        from pptx.oxml.ns import nsdecls as _nsd, qn as _qn
+        _spec_bd = _ilu.spec_from_file_location("bd_mod", str(HERE / "build_deck.py"))
+        _bd = _ilu.module_from_spec(_spec_bd)
+        _spec_bd.loader.exec_module(_bd)
+
+        dk_img = tmp / "dark_bg.png"
+        _PImg.new("RGB", (640, 360), (16, 28, 48)).save(str(dk_img))
+        lt_img = tmp / "light_bg.png"
+        _PImg.new("RGB", (640, 360), (242, 246, 250)).save(str(lt_img))
+
+        _pdk = _PrsDk()
+        _pdk.slide_width, _pdk.slide_height = _In(13.333), _In(7.5)
+        # Slide 1: dark full-bleed PICTURE shape (covering 76% of slide) -> must detect dark & exempt overlap
+        _sl1 = _pdk.slides.add_slide(_pdk.slide_layouts[0])
+        _pic_bg = _sl1.shapes.add_picture(str(dk_img), _In(0.4), _In(0.4), width=_In(12.2), height=_In(6.2))
+        _sl1.shapes._spTree.remove(_pic_bg._element)
+        _sl1.shapes._spTree.insert(2, _pic_bg._element)
+        _d1 = _bd.detect_slide_dark_bg(_sl1, {}, _pdk.slide_width, _pdk.slide_height)
+
+        # Slide 2: dark <p:bg><p:bgPr><a:gradFill> multi-stop gradient
+        _sl2 = _pdk.slides.add_slide(_pdk.slide_layouts[1])
+        _sl2._element.cSld.insert(0, _pxml(
+            f'<p:bg {_nsd("p", "a")}><p:bgPr><a:gradFill><a:gsLst>'
+            f'<a:gs pos="0"><a:srgbClr val="0F172A"/></a:gs>'
+            f'<a:gs pos="100000"><a:srgbClr val="1E3A5F"/></a:gs>'
+            f'</a:gsLst></a:gradFill></p:bgPr></p:bg>'
+        ))
+        _d2 = _bd.detect_slide_dark_bg(_sl2, {}, _pdk.slide_width, _pdk.slide_height)
+
+        # Slide 3: dark <a:schemeClr val="bg1"><a:lumMod val="20000"/> modifier
+        _sl3 = _pdk.slides.add_slide(_pdk.slide_layouts[1])
+        _sl3._element.cSld.insert(0, _pxml(
+            f'<p:bg {_nsd("p", "a")}><p:bgPr><a:solidFill>'
+            f'<a:schemeClr val="bg1"><a:lumMod val="20000"/></a:schemeClr>'
+            f'</a:solidFill></p:bgPr></p:bg>'
+        ))
+        _d3 = _bd.detect_slide_dark_bg(_sl3, {"lt1": (255, 255, 255)}, _pdk.slide_width, _pdk.slide_height)
+
+        # Slide 4: dark <p:bg><p:bgPr><a:blipFill> via related image part
+        _sl4 = _pdk.slides.add_slide(_pdk.slide_layouts[1])
+        _, _rid4 = _sl4.part.get_or_add_image_part(str(dk_img))
+        _sl4._element.cSld.insert(0, _pxml(
+            f'<p:bg {_nsd("p", "a", "r")}><p:bgPr><a:blipFill>'
+            f'<a:blip r:embed="{_rid4}"/><a:stretch><a:fillRect/></a:stretch>'
+            f'</a:blipFill></p:bgPr></p:bg>'
+        ))
+        _d4 = _bd.detect_slide_dark_bg(_sl4, {}, _pdk.slide_width, _pdk.slide_height)
+
+        # Slide 5: light full-bleed PICTURE overriding dark gradient master (Z-order: slide > master)
+        _sl5 = _pdk.slides.add_slide(_pdk.slide_layouts[1])
+        _sl5._element.cSld.insert(0, _pxml(
+            f'<p:bg {_nsd("p", "a")}><p:bgPr><a:solidFill><a:srgbClr val="0F172A"/></a:solidFill></p:bgPr></p:bg>'
+        ))
+        _sl5.shapes.add_picture(str(lt_img), _In(0.0), _In(0.0), width=_In(13.333), height=_In(7.5))
+        _d5 = _bd.detect_slide_dark_bg(_sl5, {}, _pdk.slide_width, _pdk.slide_height)
+
+        _pdk.save(str(tmp / "dark_tpl.pptx"))
+        # Build on dark_tpl via edit_deck (reuse slide 0 with dark full-bleed photo) and verify light text + 0 overlap lint
+        dk_spec = {
+            "meta": {"title": "Dark Photo Cover", "duration_minutes": 5, "language": "en", "keep_only_spec_slides": True},
+            "slides": [
+                {"reuse": {"slide_index": 0, "action": "edit", "clear_visuals": False},
+                 "role": "title", "title": "Readable Light Title Over Dark Cover Photo",
+                 "bullets": ["Author · Institute · 2026"], "notes": "Cover over dark full-bleed photo.", "time_s": 25},
+                {"reuse": {"slide_index": 1, "action": "edit", "clear_visuals": False},
+                 "role": "result", "title": "Dark Gradient Slide Contrast Check",
+                 "claim": "Gradient background triggers light typography automatically",
+                 "bullets": ["Light body text over dark gradient background."], "notes": "Gradient dark bg check.", "time_s": 60},
+            ],
+        }
+        (tmp / "dk_spec.json").write_text(json.dumps(dk_spec, ensure_ascii=False), encoding="utf-8")
+        r_dk_b = run([str(HERE / "build_deck.py"), "--spec", str(tmp / "dk_spec.json"), "--deck", str(tmp / "dark_tpl.pptx"), "--out", str(tmp / "dk_out.pptx"), "--work", str(tmp)])
+        r_dk_l = run([str(HERE / "check_layout.py"), str(tmp / "dk_out.pptx"), "--json", str(tmp / "dk_lint.json")])
+        _pdk_out = _PrsDk(str(tmp / "dk_out.pptx"))
+        _t0_rgb = _pdk_out.slides[0].shapes.title.text_frame.paragraphs[0].runs[0].font.color.rgb
+        _t1_rgb = _pdk_out.slides[1].shapes.title.text_frame.paragraphs[0].runs[0].font.color.rgb
+        _t0_lum = _bd.luminance((_t0_rgb[0], _t0_rgb[1], _t0_rgb[2])) if _t0_rgb else 0
+        _t1_lum = _bd.luminance((_t1_rgb[0], _t1_rgb[1], _t1_rgb[2])) if _t1_rgb else 0
+        dark_ok = (_d1 is True and _d2 is True and _d3 is True and _d4 is True and _d5 is False
+                   and r_dk_b.returncode == 0 and r_dk_l.returncode == 0 and _t0_lum >= 160 and _t1_lum >= 160)
+        dark_note = f"flags={(_d1,_d2,_d3,_d4,_d5)} lum=({_t0_lum:.0f},{_t1_lum:.0f}) lint={r_dk_l.returncode}"
+    except Exception as _e_dk:
+        dark_note = repr(_e_dk)
+    results.append(("dark_bg (pic+blip+grad+mod+lint)", dark_ok, dark_note))
+
+    # 6b) exact numeric token + derived delta + scientific notation + unit conversion + Roman/range evidence + Q&A audit
+    (tmp / "num_src.txt").write_text(
+        "--- PAGE 1 ---\nIII. METHOD\nFigure 1: Pipeline. Figure 2: Scaling. TABLE II: Results.\n"
+        "Total samples 1420 with accuracy 76.3% vs baseline 73.1%, lr=3e-4, latency 450ms, cuts 1/4 memory (Eq. (1), Algorithm 1).\n",
+        encoding="utf-8",
+    )
     (tmp / "num_spec.json").write_text(json.dumps({"slides": [{"title": "Test", "claim": "Accuracy reaches 42% on subset"}]}), encoding="utf-8")
     r_num = run([str(HERE / "check_numbers.py"), "--spec", str(tmp / "num_spec.json"), "--source", str(tmp / "num_src.txt")])
     (tmp / "num_spec_ok.json").write_text(json.dumps({
-        "slides": [{"role": "result", "title": "Gain", "claim": "76.3% vs 73.1% (+3.2pt), lr=3e-4, 0.45s",
-                    "evidence": [{"type": "equation", "locator": "Eq. (1), Alg. 1", "strength": "S1"}]}],
-        "qa_prep": [{"question": "Latency & gain?", "answer_key": "0.45s (450ms) at lr=3e-4, +3.2pt vs Eq. (1), bogus 99.9%", "cite_slide": 1}],
+        "slides": [{"role": "result", "title": "Gain", "claim": "76.3% vs 73.1% (+3.2pt), lr=3e-4, 0.45s, 25% memory cut",
+                    "evidence": [{"type": "table", "locator": "Table 2, Figs. 1–2, §3, Eq. (1), Alg. 1", "strength": "S1"}]}],
+        "qa_prep": [{"question": "Latency & gain?", "answer_key": "0.45s (450ms) on 8xA100 FP16 at lr=3e-4, +3.2pt vs Eq. (1), bogus 99.9%", "cite_slide": 1}],
+    }), encoding="utf-8")
+    (tmp / "ev_spec_bad.json").write_text(json.dumps({
+        "slides": [{"role": "result", "title": "Bad", "evidence": [{"type": "table", "locator": "Table 5, Figs. 1–9", "strength": "S1"}]}]
     }), encoding="utf-8")
     r_num_ok = run([str(HERE / "check_numbers.py"), "--spec", str(tmp / "num_spec_ok.json"), "--source", str(tmp / "num_src.txt"), "--out", str(tmp / "num_ok.json")])
     r_ev_ok = run([str(HERE / "check_evidence.py"), "--spec", str(tmp / "num_spec_ok.json"), "--source", str(tmp / "num_src.txt")])
+    r_ev_bad = run([str(HERE / "check_evidence.py"), "--spec", str(tmp / "ev_spec_bad.json"), "--source", str(tmp / "num_src.txt")])
     qa_caught = False
     if (tmp / "num_ok.json").exists():
         try:
-            qa_caught = len(json.loads((tmp / "num_ok.json").read_text(encoding="utf-8")).get("qa_suspects") or []) == 1
+            q_sus = json.loads((tmp / "num_ok.json").read_text(encoding="utf-8")).get("qa_suspects") or []
+            qa_caught = (len(q_sus) == 1 and q_sus[0].get("value") == "99.9")
         except Exception:
             qa_caught = False
-    results.append(("check_numbers+ev (sci+unit+qa)", r_num.returncode == 1 and r_num_ok.returncode == 0 and r_ev_ok.returncode == 0 and qa_caught,
-                    (r_num.stdout + r_num_ok.stdout + r_ev_ok.stdout).strip()[-140:]))
+    results.append(("check_numbers+ev (sci+unit+roman+qa)", r_num.returncode == 1 and r_num_ok.returncode == 0 and r_ev_ok.returncode == 0 and r_ev_bad.returncode == 1 and qa_caught,
+                    (r_num.stdout + r_num_ok.stdout + r_ev_ok.stdout + r_ev_bad.stdout).strip()[-140:]))
 
     # 7) audit_talk + result assembly + soffice availability
     r_aud = run([str(HERE / "audit_talk.py"), "--work", str(pipe_dir / "work"), "--out-dir", str(pipe_dir / "out"),
@@ -218,7 +409,7 @@ def main():
     aud_ok = (r_aud.returncode == 0 and (pipe_dir / "work" / "quality_audit.json").exists())
     if aud_ok:
         qa_j = json.loads((pipe_dir / "work" / "quality_audit.json").read_text(encoding="utf-8"))
-        aud_ok = "editorial_audit" in qa_j and "pixel_audit" in qa_j
+        aud_ok = "editorial_audit" in qa_j and "pixel_audit" in qa_j and "readiness_checks" in qa_j
     results.append(("audit_talk (pixel+editorial)", aud_ok, (r_aud.stdout + r_aud.stderr).strip()[-120:]))
 
     (tmp / "qa_plan.json").write_text("[]", encoding="utf-8")

@@ -59,6 +59,8 @@ def parse_captions(page):
                 continue
             if li == 0 and re.match(r"^(?:shows?|demonstrates?|illustrates?|presents?|compares?|reports?|summarizes?|depicts?|lists?|gives?|indicates?|reveals?)\b", rest, re.I):
                 continue
+            if li == 0 and re.match(r"^(?:展示|说明|给出|对比|表明|显示|列举|总结|报告|如下|可见|中|的)", rest):
+                continue
             lbl = m.group(1).rstrip(". ")
             kind = "table" if re.match(r"^(?:tab|表)", lbl, re.I) else "figure"
             bb = ln.get("bbox") or blk.get("bbox") or (0, 0, 0, 0)
@@ -584,7 +586,7 @@ def main():
     ap.add_argument("--text", help="optional path to dump full page-marked text (e.g. /app/work/paper.txt)")
     ap.add_argument("--outline", help="optional path to save paper_outline.json (default: sibling of --text)")
     ap.add_argument("--tables", help="optional path to save paper_tables.json (default: sibling of --text)")
-    ap.add_argument("--max-pages", type=int, default=14)
+    ap.add_argument("--max-pages", type=int, default=20)
     ap.add_argument("--min-px", type=int, default=140)
     a = ap.parse_args()
     out = Path(a.out)
@@ -655,8 +657,15 @@ def main():
             if rects and caps:
                 r0 = rects[0]
                 best = None
+                pw_p = float(pr.width) or 600.0
                 for c in caps:
-                    d = abs(c["y0"] - r0.y1) if c["y0"] >= r0.y1 else abs(c["y1"] - r0.y0)
+                    d_y = abs(c["y0"] - r0.y1) if c["y0"] >= r0.y1 else abs(c["y1"] - r0.y0)
+                    # Penalize cross-column mismatch on 2-column papers so right-column figs never pair with left-column captions
+                    cap_w_c = c["x1"] - c["x0"]
+                    x_pen = 0.0
+                    if cap_w_c < pw_p * 0.48 and (r0.x1 < c["x0"] - 36 or r0.x0 > c["x1"] + 36):
+                        x_pen = 220.0
+                    d = d_y + x_pen
                     if best is None or d < best[0]:
                         best = (d, c)
                 if best and best[0] < 140:

@@ -18,15 +18,18 @@ No-script fallback: python-pptx snippet in SKILL.md S3.
 Exit: 0 ok, 3 python-pptx missing, 4 spec invalid.
 """
 import argparse
+import colorsys
 import json
 import math
 import re
 import shutil
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 EMU_IN = 914400.0
 DEFAULT_ACCENT = (0x1F, 0x4E, 0x79)
+CJK_FONT = "Noto Sans CJK SC"
 
 
 def char_units(s):
@@ -50,24 +53,65 @@ def is_cjk(s):
 
 
 _SUB_MAP = str.maketrans("0123456789+-=()aeoxhklmnpstij", "₀₁₂₃₄₅₆₇₈₉₊₋₌₍₎ₐₑₒₓₕₖₗₘₙₚₛₜᵢⱼ")
-_SUP_MAP = str.maketrans("0123456789+-=()ni", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱ")
+_SUP_MAP = str.maketrans("0123456789+-=()nidkmtrT", "⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻⁼⁽⁾ⁿⁱᵈᵏᵐᵗʳᵀ")
+
+
+_LATEX_SYM_MAP = {
+    "pm": "±", "mp": "∓", "times": "×", "cdot": "·", "leq": "≤", "le": "≤",
+    "geq": "≥", "ge": "≥", "approx": "≈", "neq": "≠", "ne": "≠", "sim": "~",
+    "equiv": "≡", "propto": "∝", "perp": "⊥", "parallel": "∥", "star": "★", "dagger": "†",
+    "nabla": "∇", "partial": "∂", "in": "∈", "notin": "∉", "subset": "⊂", "subseteq": "⊆",
+    "forall": "∀", "exists": "∃", "ell": "ℓ", "dots": "…", "ldots": "…", "cdots": "⋯",
+    "rightarrow": "→", "to": "→", "leftarrow": "←", "leftrightarrow": "↔", "infty": "∞",
+    "alpha": "α", "beta": "β", "gamma": "γ", "delta": "δ", "epsilon": "ε", "varepsilon": "ε",
+    "eta": "η", "theta": "θ", "kappa": "κ", "lambda": "λ", "mu": "μ", "nu": "ν",
+    "pi": "π", "rho": "ρ", "sigma": "σ", "tau": "τ", "phi": "φ", "psi": "ψ", "omega": "ω",
+    "Delta": "Δ", "Sigma": "Σ", "Omega": "Ω", "Lambda": "Λ", "Gamma": "Γ", "Theta": "Θ",
+}
+_LATEX_SYM_RE = re.compile(r"\\(" + "|".join(sorted(_LATEX_SYM_MAP.keys(), key=len, reverse=True)) + r")(?![A-Za-z])")
+_NBSP_UNIT_RE = re.compile(r"(\d)\s+(pt|pp|ms|μs|us|ns|GB|MB|KB|TB|Hz|kHz|MHz|GHz|×)(?![A-Za-z0-9_])")
+_HAT_MAP = {"y": "ŷ", "x": "x̂", "w": "ŵ", "h": "ĥ", "p": "p̂", "z": "ẑ", "Y": "Ŷ"}
 
 
 def polish_math_text(s):
-    """Convert unambiguous inline math notation (α_l, B_0, N^2, 10^-4) to crisp Unicode on slides."""
-    if not s or ("_" not in s and "^" not in s):
+    """Convert unambiguous inline math/LaTeX symbols (\\pm, \\alpha, x_t, ℝ^d, 10^{-4}, >=) to crisp Unicode & prevent orphan unit wraps."""
+    if not s:
         return s
+    out = s
+    if "\\" in out:
+        out = re.sub(r"\\frac\{([^{}]+)\}\{([^{}]+)\}", r"\1/\2", out)
+        out = re.sub(r"\\(?:text|mathrm|mathbf|mathit|operatorname|boldsymbol)\{([^{}]+)\}", r"\1", out)
+        out = re.sub(r"\\hat\{([A-Za-z])\}", lambda m: _HAT_MAP.get(m.group(1), m.group(1) + "\u0302"), out)
+        out = re.sub(r"\\%", "%", out)
+        out = re.sub(r"\\mathbb\{R\}", "ℝ", out)
+        out = re.sub(r"\\mathbb\{E\}", "𝔼", out)
+        out = re.sub(r"\\mathbb\{N\}", "ℕ", out)
+        out = re.sub(r"\\mathbb\{Z\}", "ℤ", out)
+        out = re.sub(r"\\mathcal\{([A-Z])\}", r"\1", out)
+        out = _LATEX_SYM_RE.sub(lambda m: _LATEX_SYM_MAP.get(m.group(1), m.group(0)), out)
+    # Clean ASCII math comparison/arrow shorthands outside URLs/paths
+    if not re.search(r"https?://", out):
+        out = re.sub(r"(?<![<>=!])>=(?!=)", "≥", out)
+        out = re.sub(r"(?<![<>=!])<=(?!=)", "≤", out)
+        out = re.sub(r"(?<![<>=!])!=(?!=)", "≠", out)
+        out = re.sub(r"(?<![A-Za-z0-9/])\+/-(?=\s*\d|\s|$)", "±", out)
+        out = re.sub(r"(?<=\s)->(?=\s)", "→", out)
     # Avoid touching URLs, file paths, or multi-char snake_case identifiers
-    def _sub_repl(m):
-        base, sub = m.group(1), m.group(2)
-        return base + sub.translate(_SUB_MAP)
+    if "_" in out or "^" in out:
+        def _sub_repl(m):
+            base, sub = m.group(1), m.group(2)
+            return base + sub.translate(_SUB_MAP)
 
-    def _sup_repl(m):
-        base, sup = m.group(1), m.group(2)
-        return base + sup.translate(_SUP_MAP)
+        def _sup_repl(m):
+            base, sup = m.group(1), m.group(2)
+            return base + sup.translate(_SUP_MAP)
 
-    out = re.sub(r"(?<![A-Za-z0-9_/.])([α-ωΑ-Ωλσμθβγδ]|(?:[A-Z]))_([0-9ijlmnkt])(?![A-Za-z0-9_])", _sub_repl, s)
-    out = re.sub(r"(?<![A-Za-z0-9_/.])([A-Za-z0-9α-ωΑ-Ω)])\^([+-]?[0-9ni]{1,3})(?![A-Za-z0-9_])", _sup_repl, out)
+        out = re.sub(r"(?<![A-Za-z0-9_/.])([α-ωΑ-ΩλσμθβγδA-Za-z])_\{?([0-9ijlmnkt])\}?(?![A-Za-z0-9_/.])", _sub_repl, out)
+        out = re.sub(r"(?<![A-Za-z_/.])([A-Za-z0-9α-ωΑ-Ωℝ𝔼ℕℤ)])\^\{([+-]?[0-9nidkmtrT]{1,3})\}(?![A-Za-z0-9_])", _sup_repl, out)
+        out = re.sub(r"(?<![A-Za-z_/.])([A-Za-z0-9α-ωΑ-Ωℝ𝔼ℕℤ)])\^([+-]?[0-9nidkmtrT]{1,3})(?![A-Za-z0-9_])", _sup_repl, out)
+    # Bind numbers to short units with non-breaking space so PowerPoint/LibreOffice never orphan 'pt'/'GB'/'ms' on a new line
+    out = _NBSP_UNIT_RE.sub(lambda m: f"{m.group(1)}\u00A0{m.group(2)}", out)
+    out = re.sub(r"(\d)\s+%", r"\1%", out)
     return out
 
 
@@ -85,7 +129,7 @@ def luminance(rgb):
 
 
 def theme_palette(pptx_path):
-    """Parse dk1/lt1/dk2/lt2/accent1/accent2 RGB tuples from ppt/theme/theme1.xml."""
+    """Parse dk1/lt1/dk2/lt2/accent1..6 RGB tuples from ppt/theme/theme1.xml."""
     pal = {}
     if not pptx_path or not Path(pptx_path).exists():
         return pal
@@ -93,7 +137,7 @@ def theme_palette(pptx_path):
         import zipfile
         with zipfile.ZipFile(str(pptx_path)) as z:
             xml = z.read("ppt/theme/theme1.xml").decode("utf-8", "ignore")
-        for key in ("dk1", "lt1", "dk2", "lt2", "accent1", "accent2"):
+        for key in ("dk1", "lt1", "dk2", "lt2", "accent1", "accent2", "accent3", "accent4", "accent5", "accent6"):
             m = re.search(rf'<a:{key}>.*?(?:srgbClr val|lastClr)="([0-9A-Fa-f]{{6}})"', xml, re.S)
             if m:
                 v = m.group(1)
@@ -103,26 +147,205 @@ def theme_palette(pptx_path):
     return pal
 
 
-def _bg_xml_is_dark(el_xml, scheme_map):
-    """Return True (dark), False (light/noFill), or None (inherit from parent) for one <p:bg> block."""
-    m_bg = re.search(r"<p:bg\b.*?</p:bg>", el_xml or "", re.S)
-    if not m_bg:
+def _xml_local(el):
+    return el.tag.rsplit("}", 1)[-1] if isinstance(el.tag, str) and "}" in el.tag else str(el.tag)
+
+
+def _resolve_color_el(color_el, scheme_map):
+    """Resolve an OOXML color element (srgbClr/schemeClr/sysClr) + shade/tint/lumMod/lumOff/alpha modifiers."""
+    if color_el is None:
+        return None, 1.0
+    tag = _xml_local(color_el)
+    base = None
+    if tag == "srgbClr":
+        val = color_el.get("val", "")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", val):
+            base = tuple(float(int(val[i:i + 2], 16)) for i in (0, 2, 4))
+    elif tag == "schemeClr":
+        val = color_el.get("val", "")
+        if val in scheme_map:
+            base = tuple(float(c) for c in scheme_map[val])
+    elif tag == "sysClr":
+        val = color_el.get("lastClr", "")
+        if re.fullmatch(r"[0-9A-Fa-f]{6}", val):
+            base = tuple(float(int(val[i:i + 2], 16)) for i in (0, 2, 4))
+    if base is None:
+        return None, 1.0
+    r, g, b = base
+    alpha = 1.0
+    for mod in color_el:
+        mt = _xml_local(mod)
+        mv = mod.get("val")
+        if mv is None:
+            continue
+        try:
+            f = int(mv) / 100000.0
+        except (TypeError, ValueError):
+            continue
+        if mt == "shade":
+            r, g, b = r * f, g * f, b * f
+        elif mt == "tint":
+            r = r * f + 255.0 * (1.0 - f)
+            g = g * f + 255.0 * (1.0 - f)
+            b = b * f + 255.0 * (1.0 - f)
+        elif mt in ("lumMod", "lumOff"):
+            h, l, s = colorsys.rgb_to_hls(
+                max(0.0, min(1.0, r / 255.0)),
+                max(0.0, min(1.0, g / 255.0)),
+                max(0.0, min(1.0, b / 255.0)),
+            )
+            l = max(0.0, min(1.0, l * f)) if mt == "lumMod" else max(0.0, min(1.0, l + f))
+            rr, gg, bb = colorsys.hls_to_rgb(h, l, s)
+            r, g, b = rr * 255.0, gg * 255.0, bb * 255.0
+        elif mt == "alpha":
+            alpha = max(0.0, min(1.0, f))
+    rgb = (
+        int(round(max(0.0, min(255.0, r)))),
+        int(round(max(0.0, min(255.0, g)))),
+        int(round(max(0.0, min(255.0, b)))),
+    )
+    return rgb, alpha
+
+
+def _image_blob_is_dark(blob, bright_offset=0.0):
+    """Sample perceptual mean luminance of an image blob via PIL (True if dark < 95, False if light, None on error)."""
+    if not blob:
         return None
-    blk = m_bg.group(0)
-    if "<a:noFill" in blk:
-        return False
-    ms = re.search(r'<a:srgbClr val="([0-9A-Fa-f]{6})"', blk)
-    if ms:
-        v = ms.group(1)
-        return luminance(tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))) < 95
-    mc = re.search(r'<a:schemeClr val="([^"]+)"', blk)
-    if mc and mc.group(1) in scheme_map:
-        return luminance(scheme_map[mc.group(1)]) < 95
+    try:
+        from io import BytesIO
+        from PIL import Image as _PILImage
+        with _PILImage.open(BytesIO(blob)) as im:
+            if im.mode in ("RGBA", "LA") or ("transparency" in im.info):
+                rgba = im.convert("RGBA").resize((48, 36))
+                a_vals = list(rgba.getdata(3))
+                if a_vals and (sum(1 for a in a_vals if a < 64) / float(len(a_vals))) > 0.65:
+                    return None
+                white_bg = _PILImage.new("RGBA", rgba.size, (255, 255, 255, 255))
+                rgb_im = _PILImage.alpha_composite(white_bg, rgba).convert("RGB")
+            else:
+                rgb_im = im.convert("RGB").resize((48, 36))
+            w, h = rgb_im.size
+            crop = rgb_im.crop((int(w * 0.10), int(h * 0.10), max(int(w * 0.90), 1), max(int(h * 0.90), 1)))
+            pxs = list(crop.getdata())
+            if not pxs:
+                return None
+            mean_lum = sum(0.299 * p[0] + 0.587 * p[1] + 0.114 * p[2] for p in pxs) / float(len(pxs))
+            if bright_offset:
+                mean_lum = max(0.0, min(255.0, mean_lum + bright_offset * 255.0))
+            return mean_lum < 95.0
+    except Exception:
+        return None
+
+
+def _blip_el_is_dark(blip_fill_el, part):
+    """Inspect <a:blipFill> or <p:blipFill> image luminance via related part blob."""
+    if blip_fill_el is None or part is None:
+        return None
+    blip_el = None
+    for el in blip_fill_el.iter():
+        if _xml_local(el) == "blip":
+            blip_el = el
+            break
+    if blip_el is None:
+        return None
+    rid = None
+    for ak, av in blip_el.attrib.items():
+        if ak.endswith("}embed") or ak == "embed":
+            rid = av
+            break
+    if not rid:
+        return None
+    bright_off = 0.0
+    for ch in blip_el:
+        if _xml_local(ch) == "lum" and ch.get("bright"):
+            try:
+                bright_off = int(ch.get("bright")) / 100000.0
+            except (TypeError, ValueError):
+                pass
+    try:
+        rel_part = part.related_part(rid)
+        return _image_blob_is_dark(rel_part.blob, bright_offset=bright_off)
+    except Exception:
+        return None
+
+
+def _fill_container_is_dark(container_el, part, scheme_map, treat_nofill_light=False):
+    """Evaluate solidFill / gradFill (mean stop luminance) / blipFill / noFill inside <p:bgPr> or <p:spPr>."""
+    if container_el is None:
+        return None
+    for ch in container_el:
+        tag = _xml_local(ch)
+        if tag == "noFill":
+            return False if treat_nofill_light else None
+        if tag == "solidFill":
+            for c_el in ch:
+                if _xml_local(c_el) in ("srgbClr", "schemeClr", "sysClr"):
+                    rgb, alpha = _resolve_color_el(c_el, scheme_map)
+                    if rgb is None or alpha < 0.25:
+                        return None
+                    return luminance(rgb) < 95
+        if tag == "gradFill":
+            lums, alphas = [], []
+            for el in ch.iter():
+                if _xml_local(el) == "gs":
+                    for c_el in el:
+                        if _xml_local(c_el) in ("srgbClr", "schemeClr", "sysClr"):
+                            rgb, alpha = _resolve_color_el(c_el, scheme_map)
+                            if rgb is not None:
+                                lums.append(luminance(rgb))
+                                alphas.append(alpha)
+                            break
+            if lums and (sum(alphas) / float(len(alphas))) >= 0.25:
+                return (sum(lums) / float(len(lums))) < 95.0
+        if tag == "blipFill":
+            res = _blip_el_is_dark(ch, part)
+            if res is not None:
+                return res
+    return None
+
+
+def _bg_xml_is_dark(el_xml, scheme_map, part=None):
+    """Return True (dark), False (light/noFill), or None (inherit from parent) for one <p:bg> block."""
+    if not el_xml or "<p:bg" not in el_xml:
+        return None
+    try:
+        root = ET.fromstring(el_xml)
+    except Exception:
+        m_bg = re.search(r"<p:bg\b.*?</p:bg>", el_xml, re.S)
+        if not m_bg:
+            return None
+        blk = m_bg.group(0)
+        if "<a:noFill" in blk:
+            return False
+        ms = re.search(r'<a:srgbClr val="([0-9A-Fa-f]{6})"', blk)
+        if ms:
+            v = ms.group(1)
+            return luminance(tuple(int(v[i:i + 2], 16) for i in (0, 2, 4))) < 95
+        return None
+    bg_el = None
+    for el in root.iter():
+        if _xml_local(el) == "bg":
+            bg_el = el
+            break
+    if bg_el is None:
+        return None
+    for ch in bg_el:
+        ct = _xml_local(ch)
+        if ct == "bgPr":
+            res = _fill_container_is_dark(ch, part, scheme_map, treat_nofill_light=True)
+            if res is not None:
+                return res
+        elif ct == "bgRef":
+            for c_el in ch:
+                if _xml_local(c_el) in ("srgbClr", "schemeClr", "sysClr"):
+                    rgb, alpha = _resolve_color_el(c_el, scheme_map)
+                    if rgb is not None and alpha >= 0.25:
+                        return luminance(rgb) < 95
     return None
 
 
 def detect_slide_dark_bg(slide, pal=None, sw=None, sh=None):
-    """Per-slide dark background detection following OOXML cascade: slide -> layout -> master (+ full-slide fill)."""
+    """Per-slide dark background detection following true Z-order: slide -> layout -> master (shapes + <p:bg>)."""
     pal = pal or {}
     scheme_map = {
         "bg1": pal.get("lt1", (255, 255, 255)),
@@ -132,24 +355,75 @@ def detect_slide_dark_bg(slide, pal=None, sw=None, sh=None):
         "dk1": pal.get("dk1", (0, 0, 0)),
         "dk2": pal.get("dk2", (31, 41, 55)),
         "tx1": pal.get("dk1", (0, 0, 0)),
+        "tx2": pal.get("dk2", (31, 41, 55)),
+        "phClr": pal.get("accent1", DEFAULT_ACCENT),
         "accent1": pal.get("accent1", DEFAULT_ACCENT),
         "accent2": pal.get("accent2", DEFAULT_ACCENT),
+        "accent3": pal.get("accent3", DEFAULT_ACCENT),
+        "accent4": pal.get("accent4", DEFAULT_ACCENT),
+        "accent5": pal.get("accent5", DEFAULT_ACCENT),
+        "accent6": pal.get("accent6", DEFAULT_ACCENT),
     }
     try:
-        # Check full-slide solid background rectangle on slide/layout first
-        if sw and sh:
-            for container in (slide.shapes, slide.slide_layout.shapes):
-                for sh_el in container:
-                    if sh_el.width and sh_el.height and sh_el.width > sw * 0.90 and sh_el.height > sh * 0.85:
+        from pptx.enum.shapes import MSO_SHAPE_TYPE as _MST
+    except Exception:
+        _MST = None
+    try:
+        layers = [slide, slide.slide_layout, slide.slide_layout.slide_master]
+    except Exception:
+        layers = [slide]
+    slide_area = float(sw * sh) if (sw and sh) else 0.0
+    try:
+        for obj in layers:
+            part = getattr(obj, "part", None)
+            # 1) Full-bleed background shapes on this layer (reverse XML order = topmost first)
+            if slide_area > 0:
+                try:
+                    sh_list = list(obj.shapes)
+                except Exception:
+                    sh_list = []
+                for sh_el in reversed(sh_list):
+                    w, h = getattr(sh_el, "width", None), getattr(sh_el, "height", None)
+                    if not (w and h):
+                        continue
+                    if (float(w) * float(h)) / slide_area < 0.65:
+                        continue
+                    if getattr(sh_el, "has_table", False) or getattr(sh_el, "has_chart", False):
+                        continue
+                    if getattr(sh_el, "has_text_frame", False) and len((sh_el.text_frame.text or "").strip()) > 30:
+                        continue
+                    # Picture shape -> PIL luminance sampling on image blob
+                    if _MST is not None and sh_el.shape_type == _MST.PICTURE:
                         try:
-                            rgb = sh_el.fill.fore_color.rgb
-                            if rgb is not None:
-                                return luminance((rgb[0], rgb[1], rgb[2])) < 95
+                            res = _image_blob_is_dark(sh_el.image.blob)
+                            if res is not None:
+                                return res
                         except Exception:
                             pass
-        for obj in (slide, slide.slide_layout, slide.slide_layout.slide_master):
+                        try:
+                            el_root = ET.fromstring(sh_el._element.xml)
+                            for bf in el_root.iter():
+                                if _xml_local(bf) == "blipFill":
+                                    res = _blip_el_is_dark(bf, part)
+                                    if res is not None:
+                                        return res
+                        except Exception:
+                            pass
+                        continue
+                    # AutoShape / background rectangle -> XML fill (solidFill/gradFill/blipFill + shade/lumMod/lumOff)
+                    try:
+                        el_root = ET.fromstring(sh_el._element.xml)
+                        for sp_pr in el_root.iter():
+                            if _xml_local(sp_pr) == "spPr":
+                                res = _fill_container_is_dark(sp_pr, part, scheme_map, treat_nofill_light=False)
+                                if res is not None:
+                                    return res
+                                break
+                    except Exception:
+                        pass
+            # 2) <p:bg> on this layer (solidFill / gradFill / blipFill / bgRef + modifiers)
             try:
-                res = _bg_xml_is_dark(obj._element.xml, scheme_map)
+                res = _bg_xml_is_dark(obj._element.xml, scheme_map, part=part)
                 if res is not None:
                     return res
             except Exception:
@@ -438,8 +712,8 @@ def main():
                     continue
                 if top_v + h < int(SH - Inches(0.62)):
                     continue
-                # Ignore full-slide background fills
-                if w > int(SW * 0.92) and h > int(SH * 0.70):
+                # Ignore full-slide background fills and full-bleed background pictures (>=65% area)
+                if (w > int(SW * 0.92) and h > int(SH * 0.70)) or ((w * h) >= 0.65 * SW * SH):
                     continue
                 has_txt = bool(sh.has_text_frame and sh.text_frame.text.strip())
                 is_footer_ph = bool(sh.is_placeholder and sh.placeholder_format.type in FOOTER_TYPES and has_txt)
@@ -525,7 +799,7 @@ def main():
             if not txt:
                 remove_shape(sh)
 
-    def clear_overlapping_visuals(slide, region_box, keep_shapes=None, clear_orig_els=None):
+    def clear_overlapping_visuals(slide, region_box, keep_shapes=None, clear_orig_els=None, only_orig_els=None):
         """Remove existing pictures/tables/charts (and stale original non-placeholder shapes when clear_orig_els set) colliding with region_box."""
         rl, rt, rw, rh = region_box
         keep_els = {s._element for s in (keep_shapes or []) if s is not None}
@@ -533,11 +807,13 @@ def main():
         for sh in list(slide.shapes):
             if sh._element in keep_els:
                 continue
+            if only_orig_els is not None and sh._element not in only_orig_els:
+                continue
             l, t, w, h = sh.left, sh.top, sh.width, sh.height
             if None in (l, t, w, h):
                 continue
-            # Never remove full-slide backgrounds, top/bottom header-footer banner chrome, or tall sidebar strips
-            if w > int(SW * 0.88) and h > int(SH * 0.78):
+            # Never remove full-slide backgrounds, full-bleed >=65% bg pictures, top/bottom banner chrome, or tall sidebar strips
+            if (w > int(SW * 0.88) and h > int(SH * 0.78)) or (sh.shape_type == MSO_SHAPE_TYPE.PICTURE and (w * h) >= 0.65 * SW * SH):
                 continue
             if t <= int(Inches(0.35)) and w >= int(SW * 0.80) and h <= int(Inches(1.35)):
                 continue
@@ -549,7 +825,7 @@ def main():
                 continue
             if sh.is_placeholder and sh.placeholder_format.type in (TITLE_TYPES | FOOTER_TYPES):
                 continue
-            is_vis = (sh.shape_type == MSO_SHAPE_TYPE.PICTURE or getattr(sh, "has_table", False) or getattr(sh, "has_chart", False))
+            is_vis = (sh.shape_type in (MSO_SHAPE_TYPE.PICTURE, MSO_SHAPE_TYPE.GROUP) or getattr(sh, "has_table", False) or getattr(sh, "has_chart", False))
             has_txt_sh = bool(sh.has_text_frame and sh.text_frame.text.strip())
             is_thin_decor = (not is_vis) and (not has_txt_sh) and (w < int(Inches(0.22)) or h < int(Inches(0.18)))
             is_stale_orig = bool(clear_orig_els and sh._element in clear_orig_els and not sh.is_placeholder and not is_thin_decor)
@@ -619,9 +895,13 @@ def main():
                 est_lines = max(1, math.ceil(char_units(text) * base_sz / w_pt))
                 eff_sz = base_sz
                 if role in ("title", "thanks"):
-                    # Cover titles naturally wrap to 2 lines; only shrink if >2 lines so cover title stays larger than subtitle
+                    # Cover titles naturally wrap to 2 lines; shrink gently if >2 lines OR if line 2 would be a short 1-word orphan
                     if est_lines > 2 and base_sz > 28:
                         eff_sz = max(28.0, min(base_sz, (2.0 * w_pt) / max(1.0, char_units(text)) * 0.94))
+                    elif est_lines == 2 and not is_reuse and base_sz >= 32:
+                        ratio_1l = (char_units(text) * base_sz) / w_pt
+                        if ratio_1l <= 1.24:
+                            eff_sz = max(28.0, min(base_sz, w_pt / max(1.0, char_units(text)) * 0.95))
                 elif est_lines > 1 and base_sz > 26:
                     eff_sz = max(22.0, min(base_sz, w_pt / max(1.0, char_units(text)) * 0.96))
                 for p0 in t.text_frame.paragraphs:
@@ -629,16 +909,29 @@ def main():
                     for r0 in p0.runs:
                         if eff_sz != title_sz:
                             r0.font.size = Pt(round(eff_sz))
-                        if dark_bg and not is_reuse:
-                            r0.font.color.rgb = RGBColor(*text_primary)
+                        if dark_bg:
+                            needs_light = not is_reuse
+                            if is_reuse:
+                                try:
+                                    c_rgb = r0.font.color.rgb if r0.font.color and r0.font.color.type else None
+                                    needs_light = (c_rgb is None) or (luminance((c_rgb[0], c_rgb[1], c_rgb[2])) < 120)
+                                except Exception:
+                                    needs_light = True
+                            if needs_light:
+                                r0.font.color.rgb = RGBColor(*text_primary)
                 need_emu = int(max(1, math.ceil(char_units(text) * eff_sz / w_pt)) * eff_sz * 1.24 / 72.0 * EMU_IN + 140000)
                 if t.height is not None and (need_emu > t.height or (role not in ("title", "thanks") and t.height > need_emu + Inches(0.35))):
                     set_geom(t, height=max(need_emu, int(Inches(0.62))))
-                # Ensure any full-width top header banner picture stays BEHIND the title placeholder in z-order
+                # Ensure full-width top header banners and full-bleed >=65% background pictures stay BEHIND the title in z-order
                 sp_tree = slide.shapes._spTree
                 for _bsh in list(slide.shapes):
                     if _bsh.shape_type == MSO_SHAPE_TYPE.PICTURE and None not in (_bsh.top, _bsh.width, _bsh.height):
                         if _bsh.top <= int(Inches(0.35)) and _bsh.width >= int(SW * 0.80) and _bsh.height <= int(Inches(1.35)):
+                            sp_tree.remove(_bsh._element)
+                            sp_tree.insert(2, _bsh._element)
+                for _bsh in list(slide.shapes):
+                    if _bsh.shape_type == MSO_SHAPE_TYPE.PICTURE and None not in (_bsh.width, _bsh.height):
+                        if (_bsh.width * _bsh.height) >= 0.65 * SW * SH:
                             sp_tree.remove(_bsh._element)
                             sp_tree.insert(2, _bsh._element)
             except Exception:
@@ -838,7 +1131,7 @@ def main():
         fp = ftf.paragraphs[0]
         fr = fp.add_run()
         fr.text = text
-        fr.font.size = Pt(9.5)
+        fr.font.size = Pt(9.0 if len(text) > 88 else 10.0)
         fr.font.color.rgb = RGBColor(*text_muted)
         apply_font(fr, text)
         if mode == "no_template":
@@ -851,7 +1144,7 @@ def main():
             except Exception:
                 pass
 
-    def add_kpis(slide, kpis, top_y, frame=None, clear_old=False):
+    def add_kpis(slide, kpis, top_y, frame=None, clear_old=False, only_orig_els=None):
         """Render 2-4 compact metric highlight cards across top band; returns bottom EMU."""
         items = [k for k in (kpis or []) if isinstance(k, dict) and k.get("value")]
         if not items:
@@ -867,33 +1160,45 @@ def main():
         val_sz = 22.5 if n <= 3 else 18.5
         lbl_sz = 11.2 if n <= 3 else 10.0
         need_h_in = 1.04
+        def _delta_color(d_s: str):
+            dl = (d_s or "").strip().lower()
+            if re.search(r"^(?:[-−]\s*\d)|bottleneck|drop|loss|fail|risk|limit|oom|degrad|slower|cost|wall|瓶颈|下降|损耗|风险|局限", dl):
+                return (0xFB, 0xBF, 0x24) if dark_bg else (0xB4, 0x53, 0x09)
+            if re.search(r"^(?:\+\s*\d|↑|↓\s*\d)|faster|speedup|gain|win|best|save|reduc|提升|加速|优于|降低", dl):
+                return (0x5E, 0xEA, 0xD4) if dark_bg else (0x0F, 0x76, 0x6E)
+            return text_muted
+
+        inline_delta = True
         for k in items:
             vtxt = str(k.get("value", ""))
             dtxt = str(k.get("delta", "") or "")
             ltxt = str(k.get("label", "") or "")
+            if dtxt and (char_units(vtxt) * val_sz + char_units(f" · {dtxt}") * 10.5) > w_pt_est * 0.96:
+                inline_delta = False
             best_k = 13.5
             for cand in (val_sz, 20.0, 17.5, 15.5, 13.5):
                 if cand > val_sz:
                     continue
-                used = char_units(vtxt) * cand + (char_units(f"  {dtxt}") * 12.0 if dtxt else 0.0)
+                used = char_units(vtxt) * cand + (char_units(f" · {dtxt}") * 10.5 if (dtxt and inline_delta) else 0.0)
                 if used <= w_pt_est * 0.96:
                     best_k = cand
                     break
             val_sz = min(val_sz, best_k)
-            v_lines = max(1, math.ceil((char_units(vtxt) * val_sz + (char_units(f"  {dtxt}") * 12.0 if dtxt else 0.0)) / w_pt_est))
+            v_lines = max(1, math.ceil((char_units(vtxt) * val_sz + (char_units(f" · {dtxt}") * 10.5 if (dtxt and inline_delta) else 0.0)) / w_pt_est))
+            d_extra_lines = (1 if (dtxt and not inline_delta) else 0)
             for lc in (lbl_sz, 9.5, 8.8):
                 if lc > lbl_sz:
                     continue
                 l_lines = max(1, math.ceil(char_units(ltxt) * lc / w_pt_est)) if ltxt else 0
-                est_in = (v_lines * val_sz * 1.28 + l_lines * lc * 1.30 + 18.0) / 72.0 + 0.18
-                if est_in <= 1.26 or lc == 8.8:
+                est_in = (v_lines * val_sz * 1.28 + d_extra_lines * 13.5 + l_lines * lc * 1.30 + 18.0) / 72.0 + 0.18
+                if est_in <= 1.34 or lc == 8.8:
                     lbl_sz = min(lbl_sz, lc)
                     need_h_in = max(need_h_in, est_in)
                     break
-        card_h = int(Inches(min(1.28, max(1.04, need_h_in))))
+        card_h = int(Inches(min(1.36, max(1.04, need_h_in))))
         y = int(top_y + Inches(0.10))
         if clear_old:
-            clear_overlapping_visuals(slide, (fl, y, fw, card_h))
+            clear_overlapping_visuals(slide, (fl, y, fw, card_h), only_orig_els=only_orig_els)
         for idx, k in enumerate(items):
             x = int(fl + idx * (card_w + gap))
             bar_h = Inches(0.055)
@@ -924,26 +1229,37 @@ def main():
             rv.font.bold = True
             rv.font.color.rgb = RGBColor(*claim_prefix_rgb)
             apply_font(rv, rv.text)
-            if k.get("delta"):
+            if k.get("delta") and inline_delta:
                 rd = p0.add_run()
-                rd.text = f"  {polish_math_text(str(k['delta']))}"
-                rd.font.size = Pt(12.0)
+                rd.text = f"  ·  {polish_math_text(str(k['delta']))}"
+                rd.font.size = Pt(10.5)
                 rd.font.bold = True
-                rd.font.color.rgb = RGBColor(*accent)
+                rd.font.color.rgb = RGBColor(*_delta_color(str(k["delta"])))
                 apply_font(rd, rd.text)
 
             if k.get("label"):
                 p1 = tf.add_paragraph()
                 p1.alignment = PP_ALIGN.LEFT
-                p1.space_before = Pt(2)
+                p1.space_before = Pt(3)
                 rl = p1.add_run()
                 rl.text = polish_math_text(str(k["label"]))
                 rl.font.size = Pt(lbl_sz)
                 rl.font.color.rgb = RGBColor(*text_muted)
                 apply_font(rl, rl.text)
+
+            if k.get("delta") and not inline_delta:
+                p2 = tf.add_paragraph()
+                p2.alignment = PP_ALIGN.LEFT
+                p2.space_before = Pt(2)
+                rd2 = p2.add_run()
+                rd2.text = polish_math_text(str(k["delta"]))
+                rd2.font.size = Pt(10.0)
+                rd2.font.bold = True
+                rd2.font.color.rgb = RGBColor(*_delta_color(str(k["delta"])))
+                apply_font(rd2, rd2.text)
         return y + card_h
 
-    def add_steps(slide, steps, top_y, has_below=False, frame=None, clear_old=False):
+    def add_steps(slide, steps, top_y, has_below=False, frame=None, clear_old=False, only_orig_els=None):
         """Render 2-5 horizontal numbered step cards (for roadmap / method pipeline); returns bottom EMU."""
         items = [st for st in (steps or []) if isinstance(st, dict) and (st.get("title") or st.get("detail"))]
         if not items:
@@ -985,8 +1301,7 @@ def main():
         if not has_below and avail_h > card_h + Inches(0.50):
             y = int(y + min(Inches(0.75), (avail_h - card_h) * 0.28))
         if clear_old:
-            clear_overlapping_visuals(slide, (fl, y, fw, card_h))
-
+            clear_overlapping_visuals(slide, (fl, y, fw, card_h), only_orig_els=only_orig_els)
         for idx, st in enumerate(items):
             x = int(fl + idx * (card_w + gap))
             # Accent top bar (no text -> zero overlap)
@@ -1092,7 +1407,7 @@ def main():
                 r.font.color.rgb = RGBColor(*color_rgb)
             apply_font(r, text)
 
-    def add_two_col(slide, tc, top_y, frame=None, clear_old=False):
+    def add_two_col(slide, tc, top_y, frame=None, clear_old=False, only_orig_els=None):
         """Render balanced 2-column structured comparison cards (each card is 1 text shape)."""
         if not isinstance(tc, dict):
             return top_y
@@ -1120,7 +1435,7 @@ def main():
         if max_col_h > col_h + Inches(0.40):
             y = int(y + min(Inches(0.55), (max_col_h - col_h) * 0.28))
         if clear_old:
-            clear_overlapping_visuals(slide, (fl, y, fw, col_h))
+            clear_overlapping_visuals(slide, (fl, y, fw, col_h), only_orig_els=only_orig_els)
         bar_h = Inches(0.08)
 
         for idx, (ctitle, cbullets) in enumerate(cols):
@@ -1178,7 +1493,8 @@ def main():
                 rb_dot = p.add_run()
                 rb_dot.text = "•  "
                 rb_dot.font.size = Pt(b_sz)
-                rb_dot.font.color.rgb = RGBColor(*text_primary)
+                rb_dot.font.bold = True
+                rb_dot.font.color.rgb = RGBColor(*(claim_prefix_rgb if dark_bg else accent))
                 apply_font(rb_dot, txt)
                 add_bullet_runs(p, txt, sz_pt=b_sz, color_rgb=text_primary, bold_lead=True)
         return y + col_h
@@ -1207,15 +1523,15 @@ def main():
         start_sz = min(default_sz, cap) if default_sz > cap else default_sz
         if start_sz == default_sz and est_need(default_sz) <= h_pt * 0.94:
             return None
-        for cand in (start_sz, 18.0, 16.5, 15.0, 13.5, 12.5):
+        for cand in (start_sz, 18.0, 16.5, 15.0, 13.5, 12.5, 11.5):
             if cand <= start_sz and est_need(cand) <= h_pt * 0.94:
                 return cand
-        return 12.0
+        return 11.0
 
     def fill_body(slide, b, bullets, top_override=None, is_reuse=False, has_right=False, has_left=False, has_bottom=False, bottom_cap_y=None, role="default", frame=None):
         fl, fw, foot_y = frame if frame else (int(MARGIN), int(SW - 2 * MARGIN), int(SH - Inches(0.36)))
         safe_bot = foot_y - Inches(0.10)
-        eff_bot_cap = int(min(int(SH * 0.51), bottom_cap_y)) if (has_bottom and bottom_cap_y) else int(SH * 0.51)
+        eff_bot_cap = int(min(safe_bot - Inches(1.2), bottom_cap_y)) if (has_bottom and bottom_cap_y) else int(SH * 0.51)
         if is_reuse and bullets is None:
             return b
         if not bullets:
@@ -1266,6 +1582,20 @@ def main():
 
         target_sz = fit_bullet_font_size(b, bullets, body_sz, has_split, role=role)
         sparse_plain = (not has_split and not has_bottom and role not in ("title", "thanks") and len(bullets or []) <= 4)
+        # Optical vertical balance on split slides (e.g. 2-3 bullets beside a tall right figure/table)
+        if has_split and not has_bottom and (created_textbox or not is_reuse) and role not in ("title", "thanks") and 1 <= len(bullets or []) <= 4:
+            try:
+                w_pt_s = max(80.0, (b.width - 182880) / EMU_IN * 72.0) if b.width else 320.0
+                h_pt_s = max(60.0, (b.height - 91440) / EMU_IN * 72.0) if b.height else 300.0
+                sz_s = target_sz if target_sz is not None else min(body_sz, 18.0)
+                est_s = sum(
+                    max(1, math.ceil(char_units(it.get("text", "") if isinstance(it, dict) else str(it)) * sz_s / w_pt_s)) * sz_s * 1.32 + 10.0
+                    for it in (bullets or [])
+                )
+                if est_s < h_pt_s * 0.65:
+                    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            except Exception:
+                pass
         first = True
         for item in bullets or []:
             if isinstance(item, dict):
@@ -1275,34 +1605,71 @@ def main():
             p = tf.paragraphs[0] if first else tf.add_paragraph()
             first = False
             p.level = level
-            p.space_after = Pt(11 if sparse_plain else 7)
+            if has_bottom and len(bullets or []) >= 3:
+                p.space_after = Pt(5)
+            else:
+                p.space_after = Pt(12 if (sparse_plain or (has_split and not has_bottom and len(bullets or []) <= 3)) else 8)
             if role in ("title", "thanks") and not is_reuse:
                 p.alignment = PP_ALIGN.CENTER
-            eff_sz = max(11.5, target_sz - level * 1.5) if target_sz is not None else None
-            eff_col = (text_muted if role in ("title", "thanks") else text_primary) if (dark_bg and not is_reuse) else None
-            if created_textbox and role not in ("title", "thanks") and text and not text.lstrip().startswith(("•", "-", "▪", "·")):
+            eff_sz = max(11.0, target_sz - level * 1.5) if target_sz is not None else None
+            eff_col = (text_muted if role in ("title", "thanks") else text_primary) if dark_bg else None
+            if created_textbox and role not in ("title", "thanks") and text and not text.lstrip().startswith(("•", "-", "▪", "·", "▸")):
                 rb_dot = p.add_run()
-                rb_dot.text = ("  " * level) + "•  "
+                rb_dot.text = ("  " * level) + ("▸  " if level == 0 else "•  ")
                 if eff_sz is not None:
                     rb_dot.font.size = Pt(eff_sz)
-                if eff_col is not None:
-                    rb_dot.font.color.rgb = RGBColor(*eff_col)
+                rb_dot.font.bold = True
+                rb_dot.font.color.rgb = RGBColor(*(claim_prefix_rgb if dark_bg else accent))
             add_bullet_runs(p, text, sz_pt=eff_sz, color_rgb=eff_col, bold_lead=(role not in ("title", "thanks")))
         return b
 
-    def visual_box(region, top_anchor=None, frame=None):
+    def visual_box(region, top_anchor=None, frame=None, split_y=None):
         fl, fw, foot_y = frame if frame else (int(MARGIN), int(SW - 2 * MARGIN), int(SH - Inches(0.36)))
         top0 = int(top_anchor + Inches(0.12)) if top_anchor else int(Inches(1.68))
         # Reserve space for caption (0.32") + gap above evidence footer so caption & footer NEVER collide
         max_vis_bot = foot_y - Inches(0.40)
+        left_w = max(Inches(2.2), int(fw * 0.49))
+        right_l = int(fl + fw * 0.51)
+        right_w = max(Inches(2.2), int(fl + fw - right_l))
+        full_h = max(Inches(1.2), max_vis_bot - top0)
+        if region == "left":
+            return fl, top0, left_w, full_h
         if region == "right":
-            rl = int(fl + fw * 0.51)
-            rw = int(fl + fw - rl)
-            return rl, top0, max(Inches(2.2), rw), max(Inches(1.2), max_vis_bot - top0)
+            return right_l, top0, right_w, full_h
         if region == "bottom":
-            bt = max(int(SH * 0.54), top0)
+            bt = int(split_y) if split_y is not None else max(int(SH * 0.54), top0)
             return fl, bt, fw, max(Inches(1.1), max_vis_bot - bt)
-        return fl, top0, fw, max(Inches(1.2), max_vis_bot - top0)
+        if region == "bottom_left":
+            bt = int(split_y) if split_y is not None else max(int(SH * 0.54), top0)
+            return fl, bt, left_w, max(Inches(1.1), max_vis_bot - bt)
+        if region == "bottom_right":
+            bt = int(split_y) if split_y is not None else max(int(SH * 0.54), top0)
+            return right_l, bt, right_w, max(Inches(1.1), max_vis_bot - bt)
+        if region in ("bottom_third_0", "bottom_third_1", "bottom_third_2"):
+            k_idx = int(region[-1])
+            bt = int(split_y) if split_y is not None else max(int(SH * 0.54), top0)
+            g3 = Inches(0.18)
+            w3 = max(Inches(1.8), int((fw - 2 * g3) / 3))
+            return int(fl + k_idx * (w3 + g3)), bt, w3, max(Inches(1.1), max_vis_bot - bt)
+        if region == "top":
+            mid_gap = Inches(0.42)
+            hh = max(Inches(1.1), int((max_vis_bot - top0 - mid_gap) / 2))
+            return fl, top0, fw, hh
+        if region == "bottom_half":
+            mid_gap = Inches(0.42)
+            hh = max(Inches(1.1), int((max_vis_bot - top0 - mid_gap) / 2))
+            bt = int(top0 + hh + mid_gap)
+            return fl, bt, fw, max(Inches(1.1), max_vis_bot - bt)
+        if region == "right_top":
+            mid_gap = Inches(0.42)
+            hh = max(Inches(1.0), int((max_vis_bot - top0 - mid_gap) / 2))
+            return right_l, top0, right_w, hh
+        if region == "right_bottom":
+            mid_gap = Inches(0.42)
+            hh = max(Inches(1.0), int((max_vis_bot - top0 - mid_gap) / 2))
+            bt = int(top0 + hh + mid_gap)
+            return right_l, bt, right_w, max(Inches(1.0), max_vis_bot - bt)
+        return fl, top0, fw, full_h
 
     def bind_caption(raw_cap, evidence, kind="figure"):
         cap = (raw_cap or "").strip()
@@ -1313,7 +1680,8 @@ def main():
         if hit:
             mm = re.search(r"(Fig(?:ure)?\.?\s*[S]?\d+[a-z]?|图\s*\d+|Tab(?:le)?\.?\s*(?:[S]?\d+|[IVX]+)|表\s*\d+)", hit, re.I)
             key = mm.group(1) if mm else hit
-        if cap and hit and key.lower() not in cap.lower():
+        already_cited = bool(re.search(r"(?:Fig(?:ure)?\.?\s*[S]?\d+|图\s*\d+|Tab(?:le)?\.?\s*(?:[S]?\d+|[IVX]+)|表\s*\d+|§\s*\d+|Sec\.?\s*\d+)", cap, re.I))
+        if cap and hit and not already_cited and key.lower() not in cap.lower():
             cap = f"{cap}（{hit}）" if is_cjk(cap) else f"{cap} ({hit})"
         elif not cap and hit:
             cap = hit
@@ -1323,7 +1691,7 @@ def main():
         if not cap:
             return
         fl, fw, foot_y = frame if frame else (int(MARGIN), int(SW - 2 * MARGIN), int(SH - Inches(0.36)))
-        cw = int(min(fw, max(width, Inches(2.6))))
+        cw = int(min(fw, width if width >= Inches(2.0) else max(width, Inches(2.2))))
         cl = int(max(fl, min(left, fl + fw - cw)))
         cap_txt = polish_math_text(str(cap).strip())
         if len(cap_txt) > 135:
@@ -1350,14 +1718,14 @@ def main():
         cr.font.color.rgb = RGBColor(*text_muted)
         apply_font(cr, cr.text)
 
-    def add_figure(slide, fig, region, evidence, top_anchor=None, clear_old=False, frame=None):
+    def add_figure(slide, fig, region, evidence, top_anchor=None, clear_old=False, frame=None, split_y=None, only_orig_els=None):
         p = resolve_figure_path(fig.get("path", ""), work)
         if not p or not p.exists():
             log["warnings"].append(f"figure missing on disk, skipped: {fig.get('path')}")
             return
-        box = visual_box(region, top_anchor, frame=frame)
+        box = visual_box(region, top_anchor, frame=frame, split_y=split_y)
         if clear_old:
-            clear_overlapping_visuals(slide, box)
+            clear_overlapping_visuals(slide, box, only_orig_els=only_orig_els)
         l, t, w, h = box
         # On dark backgrounds, transparent PNGs with dark axes become invisible unless backed by a light mat
         needs_light_mat = False
@@ -1397,16 +1765,77 @@ def main():
                 pass
         cap = bind_caption(fig.get("caption"), evidence, kind="figure")
         cap_top = (pic.top + pic.height + pad_m) if needs_light_mat else (pic.top + pic.height)
-        add_caption_box(slide, pic.left, cap_top, pic.width, cap, frame=frame)
+        add_caption_box(slide, l, cap_top, w, cap, frame=frame)
 
-    def add_table(slide, tbl, region, evidence, top_anchor=None, clear_old=False, frame=None):
+    def add_dual_figures(slide, figs_list, region, evidence, top_anchor=None, clear_old=False, frame=None, split_y=None, only_orig_els=None):
+        """Render 2 figures side-by-side in equal aspect-ratio-locked panels with individual captions."""
+        valid = []
+        for fobj in (figs_list or [])[:2]:
+            if not isinstance(fobj, dict):
+                continue
+            p = resolve_figure_path(fobj.get("path", ""), work)
+            if p and p.exists():
+                valid.append((p, fobj))
+            else:
+                log["warnings"].append(f"figure missing on disk, skipped: {fobj.get('path')}")
+        if not valid:
+            return
+        if len(valid) == 1:
+            add_figure(slide, valid[0][1], region or "full", evidence, top_anchor=top_anchor, clear_old=clear_old, frame=frame, split_y=split_y, only_orig_els=only_orig_els)
+            return
+        box = visual_box(region or "full", top_anchor, frame=frame, split_y=split_y)
+        if clear_old:
+            clear_overlapping_visuals(slide, box, only_orig_els=only_orig_els)
+        l, t, w, h = box
+        gap = Inches(0.24)
+        panel_w = int((w - gap) / 2)
+        for pi, (p, fobj) in enumerate(valid):
+            pl = int(l + pi * (panel_w + gap))
+            needs_light_mat = False
+            if dark_bg:
+                try:
+                    from PIL import Image as _PILImage
+                    with _PILImage.open(str(p)) as _im:
+                        if _im.mode in ("RGBA", "LA") or ("transparency" in _im.info):
+                            if _im.convert("RGBA").getextrema()[3][0] < 245:
+                                needs_light_mat = True
+                except Exception:
+                    pass
+            pic = slide.shapes.add_picture(str(p), pl, t, width=panel_w)
+            if pic.height > h:
+                r = h / pic.height
+                pic.height = int(pic.height * r)
+                pic.width = int(pic.width * r)
+            pic.left = pl + (panel_w - pic.width) // 2
+            pic.top = t + (h - pic.height) // 2
+            pad_m = int(Inches(0.05))
+            if needs_light_mat:
+                mat = slide.shapes.add_shape(
+                    MSO_SHAPE.RECTANGLE,
+                    max(pl, pic.left - pad_m), max(t, pic.top - pad_m),
+                    min(panel_w, pic.width + 2 * pad_m), min(h, pic.height + 2 * pad_m),
+                )
+                mat.fill.solid()
+                mat.fill.fore_color.rgb = RGBColor(0xF8, 0xFA, 0xFC)
+                mat.line.color.rgb = RGBColor(*card_border)
+                mat.line.width = Pt(0.75)
+                strip_shadow(mat)
+                try:
+                    pic._element.addprevious(mat._element)
+                except Exception:
+                    pass
+            cap = str(fobj.get("caption") or "").strip() or bind_caption("", evidence, kind="figure")
+            cap_top = (pic.top + pic.height + pad_m) if needs_light_mat else (pic.top + pic.height)
+            add_caption_box(slide, pl, cap_top, panel_w, cap, frame=frame)
+
+    def add_table(slide, tbl, region, evidence, top_anchor=None, clear_old=False, frame=None, split_y=None, only_orig_els=None):
         headers, rows = tbl.get("headers") or [], tbl.get("rows") or []
         if not rows:
             log["warnings"].append("table spec has no rows; skipped")
             return
-        box = visual_box(region, top_anchor, frame=frame)
+        box = visual_box(region, top_anchor, frame=frame, split_y=split_y)
         if clear_old:
-            clear_overlapping_visuals(slide, box)
+            clear_overlapping_visuals(slide, box, only_orig_els=only_orig_els)
         l, tp, w, h = box
         ncols = len(headers) or max((len(r) for r in rows), default=1) or 1
         nrows = len(rows) + (1 if headers else 0)
@@ -1448,7 +1877,7 @@ def main():
 
         hdr_pt, cell_pt = 10.0, 9.0
         row_heights, _ = est_rows(hdr_pt, cell_pt)
-        for hp, cp in ((13.5, 12.5), (12.5, 11.5), (11.5, 10.5), (10.5, 9.5), (9.5, 8.8)):
+        for hp, cp in ((14.0, 13.0), (13.0, 12.0), (12.0, 11.0), (11.0, 10.0), (10.0, 9.2), (9.5, 8.8)):
             cand_rh, wb = est_rows(hp, cp)
             if sum(cand_rh) <= h and (not wb or hp <= 9.5):
                 hdr_pt, cell_pt, row_heights = hp, cp, cand_rh
@@ -1456,11 +1885,17 @@ def main():
         if sum(row_heights) > h and sum(row_heights) > 0:
             scale = h / float(sum(row_heights))
             row_heights = [max(int(Inches(0.26)), int(rh * scale)) for rh in row_heights]
+        elif nrows <= 6 and sum(row_heights) < int(h * 0.62) and sum(row_heights) > 0:
+            # Give compact academic tables generous breathing room so rows look crisp and legible
+            target_tot = min(int(h * 0.70), nrows * int(Inches(0.56)))
+            if target_tot > sum(row_heights):
+                up_s = target_tot / float(sum(row_heights))
+                row_heights = [min(int(Inches(0.62)), int(rh * up_s)) for rh in row_heights]
         hdr_font, cell_font = Pt(hdr_pt), Pt(cell_pt)
         tbl_h = min(h, sum(row_heights))
         # Optical vertical balance when a compact table sits in a tall region (avoid top-heavy dead void)
         tp_eff = tp
-        if region in ("full", "right") and tbl_h < int(h * 0.72):
+        if region in ("full", "left", "right", "bottom_left", "bottom_right") and tbl_h < int(h * 0.72):
             tp_eff = int(tp + min(Inches(0.55), int((h - tbl_h) * 0.26)))
         gshape = slide.shapes.add_table(nrows, ncols, l, tp_eff, w, tbl_h)
         gt = gshape.table
@@ -1563,7 +1998,7 @@ def main():
         actual_h = sum(r.height for r in gt.rows) if gt.rows else tbl_h
         add_caption_box(slide, l, tp_eff + max(tbl_h, actual_h) + Inches(0.06), w, cap, frame=frame)
 
-    def add_chart(slide, ch_spec, region, evidence, top_anchor=None, clear_old=False, frame=None):
+    def add_chart(slide, ch_spec, region, evidence, top_anchor=None, clear_old=False, frame=None, split_y=None, only_orig_els=None):
         """Render a native editable PowerPoint chart (bar/barh/line) from source-verified data."""
         if not isinstance(ch_spec, dict):
             return
@@ -1578,9 +2013,9 @@ def main():
         except Exception as e:
             log["warnings"].append(f"chart skipped (pptx.chart unavailable): {e!r}")
             return
-        box = visual_box(region, top_anchor, frame=frame)
+        box = visual_box(region, top_anchor, frame=frame, split_y=split_y)
         if clear_old:
-            clear_overlapping_visuals(slide, box)
+            clear_overlapping_visuals(slide, box, only_orig_els=only_orig_els)
         l, tp, w, h = box
         if ch_spec.get("caption"):
             h = max(Inches(1.1), int(h - Inches(0.06)))
@@ -1636,9 +2071,11 @@ def main():
                 ch.legend.include_in_layout = True
                 ch.legend.font.size = Pt(10.5)
                 ch.legend.font.color.rgb = RGBColor(*text_primary)
-                if tpl_font and (tpl_font_is_cjk or not is_cjk(" ".join(valid_series))):
+                leg_txt = " ".join(valid_series)
+                leg_font = tpl_font if (tpl_font and (tpl_font_is_cjk or not is_cjk(leg_txt))) else (CJK_FONT if is_cjk(leg_txt) else (tpl_font or "Calibri"))
+                if leg_font:
                     try:
-                        ch.legend.font.name = tpl_font
+                        ch.legend.font.name = leg_font
                     except Exception:
                         pass
 
@@ -1665,6 +2102,11 @@ def main():
                 s_colors = [muted_s, alt_s, accent, deep_s]
 
             plot = ch.plots[0]
+            if ctype != XL_CHART_TYPE.LINE_MARKERS:
+                try:
+                    plot.gap_width = 75
+                except Exception:
+                    pass
             show_labels = ch_spec.get("data_labels", len(cats) * len(valid_series) <= 16)
             plot.has_data_labels = bool(show_labels)
             if plot.has_data_labels:
@@ -1717,7 +2159,14 @@ def main():
             if plot.has_data_labels and ch_font_name:
                 plot.data_labels.font.name = ch_font_name
             va.has_major_gridlines = True
-            va.major_gridlines.format.line.color.rgb = RGBColor(*((0x33, 0x41, 0x55) if dark_bg else (0xE2, 0xE8, 0xF0)))
+            grid_rgb = (0x33, 0x41, 0x55) if dark_bg else (0xE2, 0xE8, 0xF0)
+            axis_rgb = (0x47, 0x55, 0x69) if dark_bg else (0xCB, 0xD5, 0xE1)
+            va.major_gridlines.format.line.color.rgb = RGBColor(*grid_rgb)
+            try:
+                ca.format.line.color.rgb = RGBColor(*axis_rgb)
+                va.format.line.color.rgb = RGBColor(*axis_rgb)
+            except Exception:
+                pass
             if ch_spec.get("y_min") is not None:
                 va.minimum_scale = float(ch_spec["y_min"])
             elif ctype != XL_CHART_TYPE.LINE_MARKERS and all_vals and min(all_vals) >= 0:
@@ -1725,6 +2174,16 @@ def main():
                     va.minimum_scale = 0.0
             if ch_spec.get("y_max") is not None:
                 va.maximum_scale = float(ch_spec["y_max"])
+            elif plot.has_data_labels and all_vals and max(all_vals) > 0 and ctype != XL_CHART_TYPE.BAR_CLUSTERED:
+                mx_v = max(all_vals)
+                base_min = float(ch_spec["y_min"]) if ch_spec.get("y_min") is not None else (0.0 if min(all_vals) >= 0 else min(all_vals))
+                span_v = max(1e-6, mx_v - base_min)
+                raw_top = mx_v + (span_v * 0.26 if ch_spec.get("y_min") is not None else mx_v * 0.18)
+                mag = 10 ** math.floor(math.log10(max(1e-6, span_v)))
+                step = mag * (0.2 if span_v / mag <= 2 else (0.5 if span_v / mag <= 5 else 1.0))
+                nice_max = math.ceil(raw_top / step) * step
+                if nice_max > mx_v + span_v * 0.10:
+                    va.maximum_scale = float(round(nice_max, 6))
             if ch_spec.get("y_label"):
                 va.has_title = True
                 va.axis_title.text_frame.text = polish_math_text(str(ch_spec["y_label"]))
@@ -1744,6 +2203,125 @@ def main():
 
         cap = bind_caption(ch_spec.get("caption"), evidence, kind="table")
         add_caption_box(slide, l, tp + h + Inches(0.03), w, cap, frame=frame)
+
+    def add_callout(slide, callout_spec, frame=None, clear_old=False, only_orig_els=None):
+        """Render a sleek bottom-anchored highlight box (key formula, core insight, or decision needed); returns top EMU."""
+        if not callout_spec:
+            return None
+        if isinstance(callout_spec, str):
+            ctitle, ctext = "", callout_spec.strip()
+        elif isinstance(callout_spec, dict):
+            ctitle = str(callout_spec.get("title") or callout_spec.get("label") or "").strip()
+            ctext = str(callout_spec.get("text") or callout_spec.get("body") or callout_spec.get("detail") or "").strip()
+        else:
+            return None
+        if not (ctitle or ctext):
+            return None
+        fl, fw, foot_y = frame if frame else (int(MARGIN), int(SW - 2 * MARGIN), int(SH - Inches(0.36)))
+        w_pt = max(160.0, (fw - Inches(0.46)) / EMU_IN * 72.0)
+        full_line = (f"{ctitle}: {ctext}" if (ctitle and ctext) else (ctitle or ctext))
+        pt_sz = 13.5
+        n_ln = max(1, math.ceil(char_units(full_line) * pt_sz / w_pt))
+        if n_ln > 2:
+            pt_sz = 12.0
+            n_ln = max(1, math.ceil(char_units(full_line) * pt_sz / w_pt))
+        box_h = int(min(Inches(1.08), max(Inches(0.56), Inches((n_ln * pt_sz * 1.32 + 16.0) / 72.0))))
+        y = int(foot_y - box_h - Inches(0.14))
+        if clear_old:
+            clear_overlapping_visuals(slide, (fl, y, fw, box_h), only_orig_els=only_orig_els)
+        box = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, fl, y, fw, box_h)
+        box.fill.solid()
+        box.fill.fore_color.rgb = RGBColor(*accent_tint)
+        box.line.color.rgb = RGBColor(*card_border)
+        box.line.width = Pt(1.0)
+        strip_shadow(box)
+        stripe = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, fl, y, Inches(0.07), box_h)
+        stripe.fill.solid()
+        stripe.fill.fore_color.rgb = RGBColor(*accent)
+        stripe.line.fill.background()
+        strip_shadow(stripe)
+        tf = box.text_frame
+        tf.word_wrap = True
+        tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+        tf.margin_left = Inches(0.20)
+        tf.margin_right = Inches(0.16)
+        tf.margin_top = Inches(0.06)
+        tf.margin_bottom = Inches(0.06)
+        p0 = tf.paragraphs[0]
+        p0.alignment = PP_ALIGN.LEFT
+        if ctitle:
+            rt = p0.add_run()
+            rt.text = polish_math_text(ctitle) + ("：" if is_cjk(ctitle + ctext) else ": ") if ctext else polish_math_text(ctitle)
+            rt.font.size = Pt(pt_sz)
+            rt.font.bold = True
+            rt.font.color.rgb = RGBColor(*claim_prefix_rgb)
+            apply_font(rt, rt.text)
+        if ctext:
+            rx = p0.add_run()
+            rx.text = polish_math_text(ctext)
+            rx.font.size = Pt(pt_sz)
+            rx.font.bold = not bool(ctitle)
+            rx.font.color.rgb = RGBColor(*text_primary)
+            apply_font(rx, rx.text)
+        return y
+
+    def add_bullet_cards(slide, bullets, top_y, bottom_y, frame=None):
+        """Render 2-4 standalone level-0 bullets as balanced horizontal left-accent insight cards (eliminates dead whitespace)."""
+        items = [(it.get("text", "") if isinstance(it, dict) else str(it)).strip() for it in (bullets or [])]
+        items = [x for x in items if x]
+        if not (2 <= len(items) <= 4):
+            return False
+        fl, fw, _ = frame if frame else (int(MARGIN), int(SW - 2 * MARGIN), int(SH - Inches(0.36)))
+        y0 = int(top_y + Inches(0.14))
+        avail_h = int(bottom_y - y0 - Inches(0.10))
+        if avail_h < int(Inches(2.15)):
+            return False
+        n = len(items)
+        gap = Inches(0.14)
+        w_pt = max(160.0, (fw - Inches(0.46)) / EMU_IN * 72.0)
+        chosen_sz, card_hs = None, None
+        for cand_sz in (17.0, 15.5, 14.5, 13.5, 12.5):
+            hs = []
+            for tx in items:
+                n_ln = max(1, math.ceil(char_units(tx) * cand_sz / w_pt))
+                hs.append(int(max(Inches(0.68), Inches((n_ln * cand_sz * 1.38 + 22.0) / 72.0))))
+            tot = sum(hs) + int(gap) * (n - 1)
+            if tot <= avail_h:
+                chosen_sz, card_hs = cand_sz, hs
+                break
+        if chosen_sz is None:
+            return False
+        tot_h = sum(card_hs) + int(gap) * (n - 1)
+        if tot_h < int(avail_h * 0.72):
+            extra_each = min(int(Inches(0.30)), int((avail_h * 0.74 - tot_h) / n))
+            if extra_each > 0:
+                card_hs = [h_i + extra_each for h_i in card_hs]
+                tot_h = sum(card_hs) + int(gap) * (n - 1)
+        y_cur = y0 + (min(int(Inches(0.42)), int((avail_h - tot_h) * 0.30)) if avail_h > tot_h + Inches(0.35) else 0)
+        for tx, ch_i in zip(items, card_hs):
+            card = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, fl, y_cur, fw, ch_i)
+            card.fill.solid()
+            card.fill.fore_color.rgb = RGBColor(*card_bg)
+            card.line.color.rgb = RGBColor(*card_border)
+            card.line.width = Pt(0.85)
+            strip_shadow(card)
+            bar = slide.shapes.add_shape(MSO_SHAPE.RECTANGLE, fl, y_cur, Inches(0.06), ch_i)
+            bar.fill.solid()
+            bar.fill.fore_color.rgb = RGBColor(*accent)
+            bar.line.fill.background()
+            strip_shadow(bar)
+            tf = card.text_frame
+            tf.word_wrap = True
+            tf.vertical_anchor = MSO_ANCHOR.MIDDLE
+            tf.margin_left = Inches(0.20)
+            tf.margin_right = Inches(0.16)
+            tf.margin_top = Inches(0.06)
+            tf.margin_bottom = Inches(0.06)
+            p0 = tf.paragraphs[0]
+            p0.alignment = PP_ALIGN.LEFT
+            add_bullet_runs(p0, tx, sz_pt=chosen_sz, color_rgb=text_primary, bold_lead=True)
+            y_cur += ch_i + int(gap)
+        return True
 
     def set_notes(slide, notes, claim, time_s):
         txt = notes or ""
@@ -1794,11 +2372,15 @@ def main():
         orig_shape_els = {sh._element for sh in slide.shapes} if is_reuse else set()
         claim = s.get("claim", "")
         fig = s.get("figure")
+        figs_list = s.get("figures") if isinstance(s.get("figures"), list) and len(s.get("figures")) >= 2 else None
+        if not fig and isinstance(s.get("figures"), list) and len(s.get("figures")) == 1:
+            fig = s["figures"][0]
         tbl = s.get("table")
         ch_spec = s.get("chart")
         steps = s.get("steps")
         kpis = s.get("kpis")
         two_col = s.get("two_col")
+        callout = s.get("callout")
 
         set_slide_theme(slide)
         if not (is_reuse and reuse_action == "keep"):
@@ -1845,26 +2427,32 @@ def main():
                     (fl_c, ct_c, fw_c, max(Inches(1.0), fy_c - ct_c - Inches(0.05))),
                     keep_shapes=[t, b, claim_bar],
                     clear_orig_els=orig_shape_els,
+                    only_orig_els=orig_shape_els,
                 )
 
+            callout_top = None
+            if callout and role not in ("title", "thanks"):
+                callout_top = add_callout(slide, callout, frame=frame, clear_old=(is_reuse and not clear_visuals), only_orig_els=orig_shape_els)
+            eff_frame = (frame[0], frame[1], min(frame[2], int(callout_top - Inches(0.08)))) if callout_top else frame
+
             if kpis and role not in ("title", "thanks"):
-                content_top = add_kpis(slide, kpis, content_top or Inches(1.48), frame=frame, clear_old=(is_reuse and (clear_visuals or True)))
+                content_top = add_kpis(slide, kpis, content_top or Inches(1.48), frame=eff_frame, clear_old=(is_reuse and not clear_visuals), only_orig_els=orig_shape_els)
 
             has_bullets = bool(s.get("bullets"))
-            if is_reuse and b is not None and not has_bullets and any([kpis, steps, two_col, fig, tbl, ch_spec]):
+            if is_reuse and b is not None and not has_bullets and any([kpis, steps, two_col, fig, figs_list, tbl, ch_spec, callout]):
                 remove_shape(b)
                 b = None
             if steps and role not in ("title", "thanks"):
                 content_top = add_steps(slide, steps, content_top or Inches(1.48),
-                                        has_below=has_bullets or bool(fig or tbl or ch_spec),
-                                        frame=frame, clear_old=(is_reuse and (clear_visuals or True)))
+                                        has_below=has_bullets or bool(fig or figs_list or tbl or ch_spec),
+                                        frame=eff_frame, clear_old=(is_reuse and not clear_visuals), only_orig_els=orig_shape_els)
 
             if two_col and role not in ("title", "thanks"):
                 # two_col takes over main body area cleanly
                 if b is not None:
                     remove_shape(b)
                     b = None
-                add_two_col(slide, two_col, content_top or Inches(1.48), frame=frame, clear_old=(is_reuse and (clear_visuals or True)))
+                add_two_col(slide, two_col, content_top or Inches(1.48), frame=eff_frame, clear_old=(is_reuse and not clear_visuals), only_orig_els=orig_shape_els)
             else:
                 def norm_reg(obj):
                     if not obj:
@@ -1872,27 +2460,66 @@ def main():
                     r = obj.get("region") or ("right" if has_bullets else "full")
                     return ("right" if has_bullets else "full") if r == "auto" else r
 
-                fig_reg = norm_reg(fig)
-                tbl_reg = norm_reg(tbl)
-                ch_reg = norm_reg(ch_spec)
-                used_regs = []
-                if fig_reg:
-                    used_regs.append(fig_reg)
-                if tbl_reg:
-                    if tbl_reg in used_regs:
-                        tbl_reg = "bottom" if tbl_reg == "right" else "right"
-                        log["warnings"].append(f"s{i}: figure and table shared region -> auto-placed table in '{tbl_reg}'")
-                    used_regs.append(tbl_reg)
-                if ch_reg:
-                    if ch_reg in used_regs:
-                        ch_reg = "bottom" if ch_reg == "right" else "right"
-                        log["warnings"].append(f"s{i}: chart shared region -> auto-placed chart in '{ch_reg}'")
-                    used_regs.append(ch_reg)
+                media_slots = []
+                if figs_list:
+                    media_slots.append(("dual", figs_list))
+                elif fig:
+                    media_slots.append(("fig", fig))
+                if tbl:
+                    media_slots.append(("tbl", tbl))
+                if ch_spec:
+                    media_slots.append(("chart", ch_spec))
 
-                has_right = "right" in used_regs
-                has_left = False
-                has_bottom = "bottom" in used_regs
+                reg_map = {}
+                media_split_y = None
                 bottom_cap_y = None
+                if len(media_slots) == 1:
+                    mk, mobj = media_slots[0]
+                    reg_map[mk] = ("bottom" if has_bullets else "full") if mk == "dual" else norm_reg(mobj)
+                elif len(media_slots) == 2:
+                    (k0, _), (k1, _) = media_slots
+                    if not has_bullets:
+                        if k0 == "dual":
+                            reg_map[k0], reg_map[k1] = "top", "bottom_half"
+                        else:
+                            reg_map[k0], reg_map[k1] = "left", "right"
+                        log["warnings"].append(f"s{i}: 2 media items without bullets -> auto-placed side-by-side ('{reg_map[k0]}' + '{reg_map[k1]}')")
+                    else:
+                        _, _, fy_m = eff_frame
+                        top_m = int((content_top or Inches(1.48)) + Inches(0.10))
+                        max_vis_m = int(fy_m - Inches(0.40))
+                        avail_m = max(Inches(2.4), max_vis_m - top_m)
+                        band_h = int(max(Inches(1.05), min(Inches(1.85), avail_m * 0.33)))
+                        bottom_cap_y = int(top_m + band_h)
+                        media_split_y = int(bottom_cap_y + Inches(0.12))
+                        reg_map[k0], reg_map[k1] = "bottom_left", "bottom_right"
+                        log["warnings"].append(f"s{i}: 2 media items with bullets -> top bullet band + side-by-side ('bottom_left' + 'bottom_right')")
+                elif len(media_slots) >= 3:
+                    if not has_bullets:
+                        for idx_m, (mk, _) in enumerate(media_slots[:3]):
+                            reg_map[mk] = ("left", "right_top", "right_bottom")[idx_m]
+                        log["warnings"].append(f"s{i}: 3 media items without bullets -> auto-placed ('left' + 'right_top' + 'right_bottom')")
+                    else:
+                        _, _, fy_m = eff_frame
+                        top_m = int((content_top or Inches(1.48)) + Inches(0.10))
+                        max_vis_m = int(fy_m - Inches(0.40))
+                        avail_m = max(Inches(2.4), max_vis_m - top_m)
+                        band_h = int(max(Inches(1.00), min(Inches(1.70), avail_m * 0.31)))
+                        bottom_cap_y = int(top_m + band_h)
+                        media_split_y = int(bottom_cap_y + Inches(0.12))
+                        for idx_m, (mk, _) in enumerate(media_slots[:3]):
+                            reg_map[mk] = f"bottom_third_{idx_m}"
+                        log["warnings"].append(f"s{i}: 3 media items with bullets -> top bullet band + 3-col bottom strip")
+
+                fig_reg = reg_map.get("fig")
+                dual_reg = reg_map.get("dual")
+                tbl_reg = reg_map.get("tbl")
+                ch_reg = reg_map.get("chart")
+                used_regs = list(reg_map.values())
+
+                has_right = any(r in ("right", "right_top", "right_bottom") for r in used_regs)
+                has_left = any(r == "left" for r in used_regs)
+                has_bottom = any(r in ("bottom", "bottom_left", "bottom_right", "bottom_half", "bottom_third_0", "bottom_third_1", "bottom_third_2") for r in used_regs)
                 # In edit_deck mode without clear_visuals, detect preserved original visual (right/left/bottom) so bullets & Source footer never overlap it
                 if is_reuse and not clear_visuals and not used_regs:
                     fl_p, fw_p, fy_p = frame
@@ -1907,7 +2534,7 @@ def main():
                         )
                         if not is_pvis or None in (_sh.left, _sh.top, _sh.width, _sh.height):
                             continue
-                        if _sh.width > int(SW * 0.88) and _sh.height > int(SH * 0.78):
+                        if (_sh.width > int(SW * 0.88) and _sh.height > int(SH * 0.78)) or (_sh.shape_type == MSO_SHAPE_TYPE.PICTURE and (_sh.width * _sh.height) >= 0.65 * SW * SH):
                             continue
                         if _sh.top >= int(fy_p - Inches(0.45)):
                             continue
@@ -1927,8 +2554,25 @@ def main():
                         elif _sh.top >= int(ct_p + Inches(0.20 if not has_bullets else 1.15)):
                             has_bottom = True
                             bottom_cap_y = min(bottom_cap_y, int(_sh.top - Inches(0.12))) if bottom_cap_y else int(_sh.top - Inches(0.12))
-                b = fill_body(slide, b, s.get("bullets"), content_top, is_reuse=is_reuse,
-                              has_right=has_right, has_left=has_left, has_bottom=has_bottom, bottom_cap_y=bottom_cap_y, role=role, frame=frame)
+                can_use_cards = (
+                    has_bullets
+                    and not (has_right or has_left or has_bottom or fig or figs_list or tbl or ch_spec or steps or two_col)
+                    and role not in ("title", "thanks", "qa_backup")
+                    and (not is_reuse or clear_visuals or bool(kpis))
+                    and 2 <= len(s.get("bullets") or []) <= 4
+                    and all((not isinstance(it, dict) or int(it.get("level", 0)) == 0) for it in (s.get("bullets") or []))
+                )
+                used_cards = False
+                if can_use_cards:
+                    used_cards = add_bullet_cards(slide, s.get("bullets"), content_top or Inches(1.48), eff_frame[2], frame=eff_frame)
+                    if used_cards and b is not None:
+                        remove_shape(b)
+                        b = None
+                if not used_cards:
+                    b = fill_body(slide, b, s.get("bullets"), content_top, is_reuse=is_reuse,
+                                  has_right=has_right, has_left=has_left, has_bottom=has_bottom, bottom_cap_y=bottom_cap_y, role=role, frame=eff_frame)
+                if media_split_y is not None and b is not None and b.top is not None and b.height is not None:
+                    media_split_y = max(media_split_y, int(b.top + b.height + Inches(0.10)))
                 # Subtle centered takeaway badge on template-less cover when cover claim is distinct from title & subtitle
                 if mode == "no_template" and role == "title" and not is_reuse and claim and len(claim.strip()) <= 95:
                     sub_txt = " ".join((x.get("text", "") if isinstance(x, dict) else str(x)) for x in (s.get("bullets") or []))
@@ -1957,12 +2601,28 @@ def main():
                             pr0.font.bold = True
                             pr0.font.color.rgb = RGBColor(*claim_prefix_rgb)
                             apply_font(pr0, pr0.text)
-                if fig:
-                    add_figure(slide, fig, fig_reg, s.get("evidence"), content_top, clear_old=(is_reuse and (clear_visuals or True)), frame=frame)
+                # Clear stale original visuals (and their stale caption textboxes in the replaced zone) ONCE before inserting new media
+                if is_reuse and not clear_visuals and media_slots:
+                    _, _, fy_clr = eff_frame
+                    for _mk, _ in media_slots:
+                        _mreg = reg_map.get(_mk)
+                        if _mreg:
+                            _ml, _mt, _mw, _mh = visual_box(_mreg, content_top, frame=eff_frame, split_y=media_split_y)
+                            _clr_h = max(_mh, int(min(fy_clr - Inches(0.02), _mt + _mh + Inches(0.42)) - _mt))
+                            clear_overlapping_visuals(
+                                slide, (_ml, _mt, _mw, _clr_h),
+                                keep_shapes=[t, b, claim_bar],
+                                clear_orig_els=orig_shape_els,
+                                only_orig_els=orig_shape_els,
+                            )
+                if figs_list:
+                    add_dual_figures(slide, figs_list, dual_reg, s.get("evidence"), content_top, clear_old=False, frame=eff_frame, split_y=media_split_y)
+                elif fig:
+                    add_figure(slide, fig, fig_reg, s.get("evidence"), content_top, clear_old=False, frame=eff_frame, split_y=media_split_y)
                 if tbl:
-                    add_table(slide, tbl, tbl_reg, s.get("evidence"), content_top, clear_old=(is_reuse and (clear_visuals or True)), frame=frame)
+                    add_table(slide, tbl, tbl_reg, s.get("evidence"), content_top, clear_old=False, frame=eff_frame, split_y=media_split_y)
                 if ch_spec:
-                    add_chart(slide, ch_spec, ch_reg, s.get("evidence"), content_top, clear_old=(is_reuse and (clear_visuals or True)), frame=frame)
+                    add_chart(slide, ch_spec, ch_reg, s.get("evidence"), content_top, clear_old=False, frame=eff_frame, split_y=media_split_y)
 
             if not is_reuse:
                 cleanup_unused_placeholders(slide, [t, b])
@@ -1988,7 +2648,11 @@ def main():
             set_notes(slide, raw_notes, claim, time_s)
 
         vis_tags = []
-        if fig:
+        if figs_list:
+            for fl_i in figs_list[:2]:
+                if isinstance(fl_i, dict):
+                    vis_tags.append(f"figure:{fl_i.get('caption') or Path(str(fl_i.get('path',''))).name}")
+        elif fig:
             vis_tags.append(f"figure:{fig.get('caption') or Path(str(fig.get('path',''))).name}")
         if tbl:
             vis_tags.append(f"table:{tbl.get('caption') or 'table'}")
@@ -2000,14 +2664,18 @@ def main():
             vis_tags.append(f"kpis:{len(kpis)}")
         if two_col:
             vis_tags.append("two_col")
+        if callout:
+            vis_tags.append("callout")
 
         log["slide_plan"].append({
             "_sld_id": id(sld_id_el),
             "pptx_slide": i, "role": role, "title": s.get("title", ""), "claim": claim,
             "orig_slide": (reuse["slide_index"] + 1 if is_reuse else None),
             "edit_action": (reuse_action if is_reuse else "new"),
-            "bullets": s.get("bullets", []), "figure": (fig or {}).get("path"),
-            "figure_label": (fig or {}).get("caption"), "has_table": bool(tbl),
+            "bullets": s.get("bullets", []),
+            "figure": (fig or (figs_list[0] if figs_list else {}) or {}).get("path"),
+            "figures": [fl_i.get("path") for fl_i in (figs_list or [])[:2] if isinstance(fl_i, dict) and fl_i.get("path")],
+            "figure_label": (fig or (figs_list[0] if figs_list else {}) or {}).get("caption"), "has_table": bool(tbl),
             "visuals": vis_tags,
             "evidence": s.get("evidence", []),
             "time_s": time_s, "notes_chars": len(raw_notes),

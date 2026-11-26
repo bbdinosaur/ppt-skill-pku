@@ -23,7 +23,7 @@ YEAR_RE = re.compile(r"^(19|20)\d{2}$")
 DATECTX_RE = re.compile(r"\d{4}[-/.]\d{1,2}([-/.]\d{1,2})?|[01]?\d月\d{1,2}[日号]?")
 SUP_MAP = str.maketrans("⁰¹²³⁴⁵⁶⁷⁸⁹⁺⁻", "0123456789+-")
 SCI_PAT_RE = re.compile(
-    r"(?:(\d+(?:\.\d+)?)\s*[×xX*]\s*)?10(?:\s*\^\s*\{?\s*([+−-]?\d+)\s*\}?|\s*([⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)|\s*([−-]\s*\d+))"
+    r"(?:(\d+(?:\.\d+)?)\s*(?:\\times|\\cdot|[×xX*])\s*)?10(?:\s*\^\s*\{?\s*([+−-]?\d+)\s*\}?|\s*([⁺⁻]?[⁰¹²³⁴⁵⁶⁷⁸⁹]+)|\s*([−-]\s*\d+))"
 )
 
 
@@ -89,10 +89,10 @@ def main():
     UNIT_MULT = {"k": 1e3, "K": 1e3, "m": 1e6, "M": 1e6, "b": 1e9, "B": 1e9, "万": 1e4, "亿": 1e8}
     for m in NUM_RE.finditer(text):
         tok = m.group(0).replace(",", "")
-        src_tokens.add(tok)
-        # Do not let letter-glued hardware/model identifiers (e.g. A100, H100, FP16, L2) pollute numeric tolerance matching
+        # Do not let letter-glued hardware/model identifiers (e.g. A100, H100, FP16, L2) pollute src_tokens or src_nums
         if m.start() > 0 and text[m.start() - 1].isascii() and text[m.start() - 1].isalpha():
             continue
+        src_tokens.add(tok)
         try:
             val = float(tok)
             src_nums.add(val)
@@ -142,6 +142,15 @@ def main():
                 src_nums.add(val * 100.0)
             elif 1 < val <= 100 and (nxt.startswith("%")):
                 src_nums.add(val / 100.0)
+        except ValueError:
+            pass
+    # Also register simple fractional shorthands in source text (e.g. 1/4 -> 25%, 1/3 -> 33.3%)
+    for fm in re.finditer(r"(?<![\d/])([1-9])\s*/\s*([2-9]|10)(?![\d/])", text):
+        try:
+            a_f, b_f = float(fm.group(1)), float(fm.group(2))
+            if 0 < a_f < b_f:
+                src_nums.add(a_f / b_f)
+                src_nums.add((a_f / b_f) * 100.0)
         except ValueError:
             pass
     # Also register 10^k / a×10^k / Unicode superscript & minus scientific notation from source text
@@ -227,6 +236,8 @@ def main():
 
         def _try_diff():
             for av, bv in pairs:
+                if av > 0 and bv / av >= 50.0:
+                    continue
                 diff = abs(bv - av)
                 if abs(diff - val) <= tol:
                     return f"auto-verified delta |{bv:g} - {av:g}| = {diff:.3g}"
@@ -290,7 +301,7 @@ def main():
     slide_verified_tokens = {}  # slide_num -> list of distinct verified raw tokens
     pending_cross_slide = []
     CITE_SLIDE_BEFORE_RE = re.compile(r"(?:Fig(?:ure)?\.?|Tab(?:le)?\.?|Sec(?:tion)?\.?|Eq(?:uation)?\.?|Alg(?:orithm)?\.?|Slide|Slides|p\.|pp\.|§|P|图|表|第|公式|算法|原P)\s*\(?$", re.I)
-    MODEL_ID_BEFORE_RE = re.compile(r"(?:ResNet|VGG|ViT[-A-Za-z/]*|GPT|Llama|Qwen|BERT|RoBERTa|T5|CIFAR|ImageNet|FP|BF|INT|NF|MXFP|W\d+A|RTX\s*|L|Top|Stage|Phase|Step|Layer|Block|Rank|Head|Seed|Part|Task|Case|Exp|Run|Fold|Bit|v|V)[-_/: ]?$|(?<![A-Za-z])[AHV]$", re.I)
+    MODEL_ID_BEFORE_RE = re.compile(r"(?:ResNet|VGG|ViT[-A-Za-z/]*|GPT|Llama|Qwen|BERT|RoBERTa|T5|CIFAR|ImageNet|FP|BF|INT|NF|MXFP|W\d+A|RTX\s*|L|Top|Stage|Phase|Step|Layer|Block|Rank|Head|Seed|Part|Task|Case|Exp|Run|Fold|Bit|v|V)[-_/: ]?$|(?:(?<![A-Za-z])|\d\s*[x×])[AHV]$", re.I)
     meta_dur = None
     try:
         if (spec.get("meta") or {}).get("duration_minutes") is not None:
@@ -305,6 +316,9 @@ def main():
         fig = s.get("figure") or {}
         if isinstance(fig, dict) and fig.get("caption"):
             texts.append(fig["caption"])
+        for f_it in (s.get("figures") or [])[:2]:
+            if isinstance(f_it, dict) and f_it.get("caption"):
+                texts.append(str(f_it["caption"]))
         tbl = s.get("table") or {}
         if isinstance(tbl, dict) and tbl:
             if tbl.get("caption"):
@@ -345,6 +359,13 @@ def main():
             for col_k in ("left_bullets", "right_bullets"):
                 for b in tc.get(col_k) or []:
                     texts.append(b.get("text", "") if isinstance(b, dict) else str(b))
+        co = s.get("callout")
+        if isinstance(co, str) and co.strip():
+            texts.append(co)
+        elif isinstance(co, dict):
+            for fld in ("title", "label", "text", "body", "detail"):
+                if co.get(fld):
+                    texts.append(str(co[fld]))
 
         # Two-pass per slide: collect traceable source values on this slide first, then verify derived deltas/ratios
         slide_traced = []
@@ -365,13 +386,10 @@ def main():
                 before_w = field_txt[max(0, m.start() - 16): m.start()]
                 has_metric_unit = bool(re.match(r"^\s*(%|pt\b|pts\b|pp\b|percentage\s+points?|百分点|ms\b|s\b|min\b|mins\b|minutes?\b|h\b|hr\b|hrs\b|×|x\b|GB\b|MB\b|TB\b|KB\b|k\b|K\b|M\b|B\b|thousand\b|million\b|billion\b|万|亿|倍|次)", after, re.I))
                 has_signed = bool(re.search(r"[+±−-]\s*$", before))
-                # Skip citation locators/ranges (Fig.2, Table 1, §3.2, p.3-5, Slide 4) and standard model/format/bitwidth identifiers (ResNet-50, FP16, INT8, 8-bit, 3D)
-                if not has_metric_unit and CITE_SLIDE_BEFORE_RE.search(before_w):
+                # Skip citation locators/ranges (Fig.2, Table 1, §3.2, p.3-5, Slide 4) and standard model/format/bitwidth identifiers (ResNet-50, Qwen2.5, Llama-3.1, FP16, INT8, 8-bit, 3D)
+                if not has_metric_unit and (CITE_SLIDE_BEFORE_RE.search(before_w) or MODEL_ID_BEFORE_RE.search(before_w)):
                     continue
-                if "." not in tok and not has_metric_unit and (
-                    re.match(r"^\s*[- ]?(?:bit|bits|D\b|dim\b|way\b|shot\b|hop\b|fold\b|stage\b|step\b|layer\b|head\b|node\b|GPU\b|GPUs\b|slides?\b|页)", after, re.I)
-                    or MODEL_ID_BEFORE_RE.search(before_w)
-                ):
+                if "." not in tok and not has_metric_unit and re.match(r"^\s*[- ]?(?:bit|bits|D\b|dim\b|way\b|shot\b|hop\b|fold\b|stage\b|step\b|layer\b|head\b|node\b|GPU\b|GPUs\b|slides?\b|页)", after, re.I):
                     continue
                 # Skip talk duration metadata (e.g. "6 min" / "10 分钟") on cover/roadmap/thanks slides
                 if role_s in ("title", "thanks", "roadmap") and meta_dur is not None and re.match(r"^\s*(?:min|mins|minute|minutes|分钟)\b", after, re.I):
@@ -471,10 +489,11 @@ def main():
             after = ans[m.end(): m.end() + 14]
             before_w = ans[max(0, m.start() - 14): m.start()]
             before = ans[max(0, m.start() - 3): m.start()]
-            if CITE_BEFORE_RE.search(before_w):
+            if CITE_BEFORE_RE.search(before_w) or MODEL_ID_BEFORE_RE.search(before_w):
                 continue
             has_unit = bool(re.match(r"^\s*(%|pt\b|pts\b|pp\b|百分点|ms\b|s\b|min\b|mins\b|×|x\b|GB\b|MB\b|KB\b|TB\b|k\b|K\b|M\b|B\b|thousand\b|million\b|billion\b|万|亿|倍)", after, re.I))
             has_sign = bool(re.search(r"[+±−-]\s*$", before))
+            is_q_approx = bool(re.search(r"(?:[~≈]|约|about|approx\.?|roughly|nearly)\s*$", before_w, re.I))
             if "." not in tok and "e" not in tok.lower() and not has_unit and not has_sign:
                 try:
                     if 0 <= int(tok) <= 20:
@@ -486,7 +505,7 @@ def main():
             except ValueError:
                 continue
             qcands = expand_units(qv, after)
-            if tok in src_tokens or tok.lower() in src_tokens or tok in allow or tok in deck_verified_derived or any(close(cv) for cv in qcands):
+            if tok in src_tokens or tok.lower() in src_tokens or tok in allow or tok in deck_verified_derived or any(close(cv, is_approx=is_q_approx) for cv in qcands):
                 qtid = ("q", qi, len(qa_traced))
                 qukind = "pct" if re.match(r"^\s*%", after) else ("ratio" if re.match(r"^\s*(?:×|x\b|倍)", after) else "plain")
                 for cv in qcands:

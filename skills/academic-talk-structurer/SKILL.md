@@ -19,14 +19,14 @@ description: "Organize a paper, multi-file material, or draft deck into an audie
 ```bash
 python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/ingest.py --case /input/case.json --work /app/work
 ```
-单命令执行：`inspect_case`（`case.json`+完整 `task.md`）+ `extract_figs`（单图/混合图、上/下标矢量裁剪、`paper_tables.json`、`paper.txt`、大纲）+ 补充文件与旧稿图表/原图合并 + 标签冲突检测 + `plan_pages` + 4 维 `qa_draft` → 输出 `reading_map.md`（`task.md`、行号 `Lstart–Lend`、长文定量/局限锚点、表图与策略）与 `starting_deck_dump.json`。
+单命令执行：`inspect_case`（`case.json`+完整 `task.md`）+ `extract_figs`（单图/混合图、上/下标矢量裁剪、`paper_tables.json`、`paper.txt`、大纲）+ 补充文件、独立输入图与旧稿图表合并 + 标签冲突检测 + `plan_pages` + 4 维 `qa_draft` → 输出 `reading_map.md`（`task.md`、行号、定量/局限锚点、表图、策略与本案 `deck_spec` 清单）与 `starting_deck_dump.json`。
 **无脚本兜底**：读 `case.json`/`task.md` + `pdftotext` + `pdftoppm -r 100` + python-pptx 列母版/旧页。
 
 ### Step 2 精读原文并写 `deck_spec.json`（1–2 req）
 读 `/app/work/reading_map.md` 与 `/app/work/paper.txt`（≤22 KB 通读；更长按节页码直读缺口、方法、主结果、Limitations 与表；旧稿并读 `starting_deck_dump.json`），直接写 `/app/work/deck_spec.json`（顶层可内嵌 `qa_prep`/`result_fill`/`number_allow`/`budget_justify`；按需查 `references/deck-spec.template.json`）：
 1. **受众导向叙事（禁按目录搬运）**：按“缺口 → 机制洞见 → 最强对照证据 → 机理分析 → 诚实边界 → 结论”编排；`meta` 填 `duration_minutes`/`goal`/`audience`/`language`/`tradeoffs[]`（**≥2 条可复核取舍**）；内容页填 `time_s`（45–120s/页，`qa_backup` 为 `null`）。
 2. **一页一主张与强度对齐**：标题写 takeaway（非“3. Experiments”，不与 `claim` 雷同）；`claim` ≤30 字/18 英文词；`bullets ≤ 4`（≤2 行/条，`标签：` 自动加粗）；`evidence[]` 写物理定位（`Fig.2, p.4`/`Table 1`/`§3.2`/`Slide 4`/补充文件名）+ `strength`（S1/S2/S3/NA），动词强度须匹配档位（S1 才用“优于/显著”，S3 仅用“提示/待验证”）。
-3. **视觉多样化（拒文字墙，禁贴未裁 `page_p*.png`）**：继承模板字体、安全框、Logo/横幅避让与深浅底：`steps`（`[{title,detail}]`）、`kpis`（`[{value,label,delta}]`）、`two_col`（`{left_title,left_bullets,right_title,right_bullets}`）、`table`（`{headers,rows,highlight_row,caption}`，booktabs）、`chart`（`{type,categories,series:[{name,values}],y_label,caption}`）、`figure`（`{path,region:"right|full",caption}`）。
+3. **视觉多样化（拒文字墙，禁贴未裁 `page_p*.png`）**：继承模板字体、安全框、Logo/横幅避让与深浅底：`steps`（`[{title,detail}]`）、`kpis`（`[{value,label,delta}]`）、`two_col`（`{left_title,left_bullets,right_title,right_bullets}`）、`table`（`{headers,rows,highlight_row,caption}`，booktabs）、`chart`（`{type,categories,series:[{name,values}],y_label,caption}`）、`figure`（`{path,region:"right|full",caption}`）、`figures`（双图并排`[{path,caption},...]`）、`callout`（`{title,text}`）。
 4. **起始 deck 适配**：`reuse:{"slide_index":0,"action":"keep"|"edit","clear_visuals":false}`；保原图设 `false`（三向自动避让），全页替换设 `true`，拆页复用同索引；重组自动裁废页并出 `starting_deck_diff`（局部修补设 `keep_only_spec_slides:false`）。
 5. **口语讲稿与四维问答**：`notes` 写中文 120–180 字 / 英文 90–140 词，**禁照抄 bullets**，讲动机、读图法与尾句过渡；`qa_prep` ≥4 条（`mechanism`/`data`/`baseline`/`limitation`，同口径 `answer_key`/`cite_slide`/`backup_slide`）+ 1 页 `qa_backup`（缺省自动合成双栏板）。
 
@@ -34,11 +34,11 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/ingest.py --case /input/case.
 ```bash
 python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/deliver.py --case /input/case.json --work /app/work --out-dir /app/output
 ```
-自动完成：①安全框/字体/Logo 避让构建 PPTX；②四合一硬门（越界/重叠/溢出/未裁整页、悬空定位、不可溯源数、缺图、页数冲突，出 `== NEXT FIX ==`）；③渲染 `<deck>.pdf` + `preview-*.png` + `contact_sheet_*.png`（100 DPI）；④`audit_talk.py`（像素+语义审计，出 `== POLISH OPPORTUNITIES ==`）与真实 `changes.json`；⑤导出证据总表 `speaker_notes.md` 与 `result.json`（含 `verified_numbers`/`tradeoffs`/`quality_audit`）。
+自动完成：①安全框/字体/Logo 避让构建 PPTX；②四合一硬门（越界/重叠/溢出/未裁整页、悬空定位、不可溯源数、缺图、页数冲突，出 `== NEXT FIX ==`）；③渲染 `<deck>.pdf` + `preview-*.png` + `contact_sheet_*.png`（100 DPI）；④`audit_talk.py`（像素+语义 10 项核验，出 `== POLISH SCOREBOARD ==`）与真实 `changes.json`；⑤导出 `speaker_notes.md`、独立 `evidence_map.md` 与 `result.json`。
 **无脚本兜底**：python-pptx → `soffice --headless --convert-to pdf` + `pdftoppm -r 100` → 核数写 `result.json`。
 
-### Step 4 目检、审计反馈与定点精修（1–2 req）
-多模态环境读 `/app/work/contact_sheet_*.png`（异常页读 `preview-*.png`）；纯文本环境亦可据 `== NEXT FIX ==` 与 `== POLISH OPPORTUNITIES ==`（像素空白/截断、文字墙、漏用清晰图/表、短讲稿、缺 Q&A 维度），对 `deck_spec.json` 做 **1 轮精修**并重跑 `deliver.py`（≤2 轮）。
+### Step 4 目检、10 项记分板与定点精修（1–2 req）
+多模态环境读 `/app/work/contact_sheet_*.png`（异常页读 `preview-*.png`）；纯文本环境亦须核对 `== NEXT FIX ==` 与 `== POLISH SCOREBOARD ==`。**即使 `gates_failed=0`，只要记分板 `< 9/10` 或 `ACTIONABLE POLISH PLAN` 非空，务必对 `deck_spec.json` 做 1 轮定点精修并重跑 `deliver.py`**（最多 2 轮）。
 **收尾核验**：JSON 合法、`STILL NULL` 为空、`deliverables` 全存在、`gates_failed=0`（残留写 `limits`）。
 
 ## 异常处置

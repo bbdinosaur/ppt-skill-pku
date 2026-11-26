@@ -1,4 +1,4 @@
-# academic-talk-structurer — 学术汇报内容组织 Skill (`v29`)
+# academic-talk-structurer — 学术汇报内容组织 Skill (`v33`)
 
 把一篇论文、多文件科研材料（PDF/DOCX/MD/CSV/TSV/JSON/XLSX）或已有草稿 PPT 组织成可直接上台的学术汇报：受众与时长感知的叙事蓝图与页级规划、每页唯一主张绑定源材料证据定位、严格模板兼容的可编辑 PPTX（自动继承模板字体、安全框、Logo 避让与深浅底板，内置 booktabs 学术三线表、单/多系列 `Ours` 高亮对比图、KPI 指标卡、流程步骤卡、双栏对比卡、深底透明图衬垫、旧稿原图保留/提取与裁剪重排差分）、含页级证据与章节覆盖总表的口语讲稿讲义、4 维问答预演、渲染预览自检与契约对齐的 `result.json`。
 
@@ -17,8 +17,8 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/deliver.py --case /input/case
 ```
 
 ### 独立可复用脚本与资源资产
-- **盘点与多源抽取**：`scripts/inspect_case.py`（契约/完整 `task.md` 约束/模板/起始 deck 盘点）、`scripts/extract_figs.py`（单图原生高清提取、混合栅格+矢量复合图与上/下标矢量裁剪、IEEE/Nature 分节识别、含表题页快速抽取 `paper_tables.json`、全文与大纲）、`scripts/ingest.py`（一键串联并自动合并 `.csv/.tsv/.md/.txt/.docx/.json/.xlsx/.tex` 补充文件、起始 deck 组合形状/原生图表数据与嵌入原图 `deck_s*_p*.png`，自动检测 `case.json` 标签与源文冲突，输出含完整 `task.md`、精确行号、长文定量/局限锚点与受众策略的 `reading_map.md`）、`scripts/qa_draft.py`（追问钩子扫描）、`scripts/plan_pages.py`（受众加权分类、支持 `task.md` 约束兜底、受众叙事策略 `audience_strategy` 与页型配比校核）。
-- **构建、审计与导出**：`scripts/build_deck.py`（可编辑 PPTX 构建、模板字体与 Logo/横幅避让、booktabs 学术表、科学计数法安全 `Ours` 高亮图表/卡片、自适应零溢出 KPI/步骤/双栏与图注、数学上下标排版、旧稿右/左/底保留原图自动避让与裁剪重排）、`scripts/render_preview.sh`（LibreOffice 双 profile 容错导出 PDF + `pdftoppm -r 100` + `pdffonts` 嵌入检查）、`scripts/audit_talk.py`（确定性渲染像素+语义质量审计，兼顾视觉与纯文本 Agent 的空白页/截断/文字墙/漏用图表/短讲稿/问答完整度检查并输出 Top-3 精修建议）、`scripts/export_notes.py`（含页级证据与节奏总表、源图表与章节覆盖、取舍复核与 `starting_deck_diff` 的讲义导出）、`scripts/build_result.py`（`result.json` 语义同义词对齐装配、标签冲突/默认模板自动诚实落盘、真实多轮 `changes.json` 修订轨迹与 `quality_audit` 诊断摘要）。
+- **盘点与多源抽取**：`scripts/inspect_case.py`（契约/完整 `task.md` 约束/模板/起始 deck 盘点）、`scripts/extract_figs.py`（2 栏 X-感知图题配对、单图原生高清提取、混合栅格+矢量复合图与上/下标矢量裁剪、20 页矢量覆盖、IEEE/Nature 分节识别、含表题页快速抽取 `paper_tables.json`、全文与大纲）、`scripts/ingest.py`（一键串联并自动合并 `.csv/.tsv/.md/.txt/.docx/.json/.xlsx/.tex` 补充文件、独立输入图片资产 `input_image` 与起始 deck 组合形状/原生图表数据/嵌入原图，自动检测 `case.json` 标签与源文冲突，输出含完整 `task.md`、精确行号、长文定量/局限锚点、受众策略与本案 `deck_spec` 快速核对清单的 `reading_map.md`）、`scripts/qa_draft.py`（追问钩子扫描）、`scripts/plan_pages.py`（受众加权分类、支持 `task.md` 约束兜底、受众叙事策略 `audience_strategy` 与页型配比校核）。
+- **构建、审计与导出**：`scripts/build_deck.py`（可编辑 PPTX 构建、模板字体与 Logo/横幅避让、按真实 Z 序 `slide→layout→master` 的全幅底图 PIL 亮度采样/`<a:blipFill>`/`<a:gradFill>` 多色标均值/`<a:schemeClr>` `shade/lumMod/lumOff` 修饰的深浅底自适应对比度、单页多媒共存无重叠象限分格与 `is_reuse` 单次原稿视觉清理、完整 LaTeX/上下标/比较符→Unicode 排版与防孤立单位换行、分栏要点光学居中、语义色 KPI 卡、独立要点自动左强调卡片化、booktabs 学术表自适应舒展行高、图表数据标签顶部留白与单/多系列 `Ours` 高亮、原生双图并排 `figures[]`、`callout` 底部高亮框、步骤/双栏与图注、旧稿原图避让与裁剪重排）、`scripts/render_preview.sh`（LibreOffice 双 profile 容错导出 PDF + `pdftoppm -r 100` + `pdffonts` 嵌入检查）、`scripts/audit_talk.py`（确定性渲染像素+语义 10 项就绪记分板，兼顾视觉与纯文本 Agent 的空白页/截断/文字墙/漏嵌已引图/标题-主张雷同/非目录叙事/短讲稿/读图引导/问答完整度检查并输出 1 轮精修计划）、`scripts/export_notes.py`（导出含就绪核验分的 `speaker_notes.md` 与独立可复核的页级证据映射 `evidence_map.md`，含溯源数字、图表/章节覆盖、取舍复核、4 维问答矩阵与 `starting_deck_diff`）、`scripts/build_result.py`（70+ 语义同义词契约零漏缺装配、标签冲突/默认模板自动诚实落盘、真实多轮 `changes.json` 修订轨迹与 `quality_audit` 诊断摘要）。
 - **方法论与可复用规范**（`references/`）：`narrative-patterns.md`（受众×时长配比与 4 档结论强度阶梯）、`audience-blueprints.md`（四类受众可复用汇报蓝图与上台前 10 项自审清单）、`worked-example.md`（虚构论文完整端到端组织与取舍示意案例）、`deck-spec.template.json`（完整 JSON 骨架）、`qa-playbook.md`（4 维追问预演手册）、`evidence-mapping.md`（定位符与反编造规则）、`template-and-export.md`（母版/字体/Logo/深浅底与导出排错）、`checks.md`（四合一门分级策略、像素+语义审计与 schema）。
 
 ## 依赖、安装与无脚本/缺包降级
@@ -38,7 +38,7 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/deliver.py --case /input/case
 ```bash
 python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/selftest.py
 ```
-端到端验证 11 个核心组件（python-pptx / PIL / 原生卡片+图+表 / `edit_deck` 裁剪重排 / 双语 lint / 矢量 PDF 抽取 / `ingest+deliver+chart+notes_matrix` / 科学计数法+单位换算+Q&A 数值核验 / `audit_talk` 像素与语义审计 / `build_result` / `soffice`），11/11 PASS 即可稳定运行。
+端到端验证 14 个核心组件（python-pptx / PIL / 原生卡片+图+表 / `edit_deck` 裁剪重排 / 双语 lint / 矢量 PDF 抽取 / `ingest+deliver+chart+evmap` / 双图并排+数学排版 / 单页多媒共存+复用清理 / 深底全幅图+渐变+修饰+lint 豁免 / 科学计数法+单位换算+Q&A 数值核验 / `audit_talk` 像素与语义审计 / `build_result` / `soffice`），14/14 PASS 即可稳定运行。
 
 ## 最小调用示例（Schematic Example，非真实评测案例）
 - 示例输入 `/input/case.json`：
@@ -53,4 +53,4 @@ python3 ${SKILL_DIR:-/skills/weekly-skill}/scripts/selftest.py
 ## 适用边界、异常处置与维护
 - **边界**：聚焦“已有研究材料/草稿 PPT → 可直接上台的学术汇报与可复核证据链”；不负责论文精读批注、学术论文写作润色或科研绘图素材生产。实际输入文件与原论文为唯一事实依据，不依据错误领域标签补造数据。
 - **异常**：标签冲突、缺失模板、纯起始 deck（无 PDF）、多文件补充数据、扫描 PDF、公式/缺字、导出超时等处置见 `SKILL.md` 与 `references/checks.md`。
-- **版本与洁净声明**：当前版本见 `VERSION.txt`（`v29`）；包内仅含纯 UTF-8 文本脚本与方法论文档，无预制答案、无测试集或虚构跑分。
+- **版本与洁净声明**：当前版本见 `VERSION.txt`（`v33`）；包内仅含纯 UTF-8 文本脚本与方法论文档，无预制答案、无测试集或虚构跑分。

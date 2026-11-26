@@ -92,9 +92,11 @@ def resolve_pptx_roles(case: dict, inspect: dict, case_dir: Path):
 
 
 def resolve_output_names(case: dict, task_md_path: Path = None):
-    """Infer target deck filename and result filename from case.json / output_contract / task.md."""
+    """Infer target deck filename, result filename, and any extra explicitly requested companion outputs from case.json / task.md."""
     deck_name = None
     result_name = None
+    extra_outputs = []
+    seen_extra = set()
     for path_k, k, v in walk_kv(case):
         if not isinstance(v, str):
             continue
@@ -104,18 +106,36 @@ def resolve_output_names(case: dict, task_md_path: Path = None):
         if is_out_ctx and vl.endswith(".pptx"):
             deck_name = deck_name or Path(v).name
         elif is_out_ctx and vl.endswith(".json") and "case" not in Path(v).name.lower():
-            result_name = result_name or Path(v).name
-    if (not deck_name or not result_name) and task_md_path and task_md_path.exists():
+            bn = Path(v).name
+            if not result_name and any(x in bn.lower() for x in ("result", "output", "report", "summary")):
+                result_name = bn
+            elif not result_name and not any(x in bn.lower() for x in ("evidence", "qa", "plan", "slide")):
+                result_name = bn
+            elif bn not in seen_extra:
+                seen_extra.add(bn)
+                extra_outputs.append(bn)
+        elif is_out_ctx and vl.endswith(".md"):
+            bn = Path(v).name
+            if bn not in seen_extra and bn.lower() not in ("task.md", "skill.md", "readme.md"):
+                seen_extra.add(bn)
+                extra_outputs.append(bn)
+    if task_md_path and task_md_path.exists():
         t_txt = task_md_path.read_text(encoding="utf-8", errors="ignore")
         if not deck_name:
             mp = re.search(r"(?:/app/output/|output/)([A-Za-z0-9_.\-]+\.pptx)", t_txt)
             if mp:
                 deck_name = mp.group(1)
-        if not result_name:
-            mj = re.search(r"(?:/app/output/|output/)([A-Za-z0-9_.\-]+\.json)", t_txt)
-            if mj and "case" not in mj.group(1).lower():
-                result_name = mj.group(1)
-    return deck_name or "talk.pptx", result_name or "result.json"
+        for mj in re.finditer(r"(?:/app/output/|output/)([A-Za-z0-9_.\-]+\.(?:json|md))", t_txt):
+            bn = mj.group(1)
+            bl = bn.lower()
+            if "case" in bl or bl in ("task.md", "skill.md", "readme.md"):
+                continue
+            if bl.endswith(".json") and not result_name and not any(x in bl for x in ("evidence", "qa", "plan", "slide")):
+                result_name = bn
+            elif bn != result_name and bn not in seen_extra:
+                seen_extra.add(bn)
+                extra_outputs.append(bn)
+    return deck_name or "talk.pptx", result_name or "result.json", extra_outputs
 
 
 def extract_extra_pdf_text(pdf_path: Path) -> str:
@@ -455,7 +475,24 @@ def write_reading_map(work: Path, ptxt: Path, outline: dict, paper_tables: list,
         if cm.get("contract"):
             lines.append(f"- **Output Contract**: `{json.dumps(cm['contract'], ensure_ascii=False)[:320]}`")
         if cm.get("template"):
-            lines.append(f"- **Template**: `{cm['template']}`")
+            tpl_line = f"- **Template**: `{cm['template']}`"
+            if inspect:
+                try:
+                    t_res = str(Path(cm["template"]).resolve())
+                    for pf in inspect.get("pptx_files") or []:
+                        if pf.get("path") and str(Path(pf["path"]).resolve()) == t_res:
+                            sz = pf.get("slide_size")
+                            sz_s = f"{sz[0]/914400:.2f}x{sz[1]/914400:.2f}in" if sz and len(sz) == 2 else "?"
+                            fnt = pf.get("fonts") or {}
+                            f_s = f"{fnt.get('major') or '-'}/{fnt.get('minor') or '-'}"
+                            los = [l["name"] for l in (pf.get("layouts") or [])][:8]
+                            tpl_line += f" | canvas=`{sz_s}` | fonts=`{f_s}` | layouts=`{', '.join(los)}`"
+                            break
+                except Exception:
+                    pass
+            lines.append(tpl_line)
+        if cm.get("extra_requested_outputs"):
+            lines.append(f"- **Extra Requested Outputs (auto-fulfilled by `deliver.py`)**: `{', '.join(cm['extra_requested_outputs'])}`")
         if cm.get("non_pdf_sources"):
             lines.append(f"- **Supplementary Files (merged into `paper.txt`)**: `{', '.join(Path(x).name for x in cm['non_pdf_sources'])}`")
         if cm.get("case_labels"):
@@ -493,9 +530,12 @@ def write_reading_map(work: Path, ptxt: Path, outline: dict, paper_tables: list,
         if sd_dump:
             lines.append(f"## 0. Starting Deck Inventory ({Path(starting_deck).name}, {len(sd_dump)} slides — use 0-based `reuse.slide_index`)")
             for sl_i in sd_dump[:24]:
+                g_tag = f" grps={sl_i.get('n_groups', 0)}" if sl_i.get("n_groups") else ""
+                ch_n = len(sl_i.get("charts") or [])
+                ch_tag = f" charts={ch_n}" if ch_n else ""
                 lines.append(
                     f"- **`[idx={sl_i.get('index')}]` (Slide {sl_i.get('slide_num')}) {str(sl_i.get('title') or '(untitled)')[:75]}** "
-                    f"| layout={sl_i.get('layout')} | pics={sl_i.get('n_pictures', 0)} tbls={len(sl_i.get('tables') or [])} notes={bool(sl_i.get('notes'))}"
+                    f"| layout={sl_i.get('layout')} | pics={sl_i.get('n_pictures', 0)} tbls={len(sl_i.get('tables') or [])}{ch_tag}{g_tag} notes={bool(sl_i.get('notes'))}"
                 )
                 for b_txt in (sl_i.get("bullets") or [])[:5]:
                     lines.append(f"  - {str(b_txt)[:120]}")
@@ -503,6 +543,8 @@ def write_reading_map(work: Path, ptxt: Path, outline: dict, paper_tables: list,
                     hdr = tb_i.get("headers") or []
                     if hdr:
                         lines.append("  - [Table] " + " | ".join(str(x)[:18] for x in hdr[:6]) + f" ({len(tb_i.get('rows') or [])} rows)")
+                for ch_i in (sl_i.get("charts") or [])[:1]:
+                    lines.append(f"  - [Chart] {str(ch_i)[:120]}")
                 if sl_i.get("notes"):
                     lines.append(f"  - [Notes] {str(sl_i['notes'])[:120]}")
             lines.append("")
@@ -610,6 +652,24 @@ def write_reading_map(work: Path, ptxt: Path, outline: dict, paper_tables: list,
             lines.append(f"- [QA/{h.get('type')} @ p.{h.get('page')}] {h.get('snippet')}")
         lines.append("")
 
+    # 4) Case-Specific deck_spec.json Quick Checklist (tailored runtime guide for 1-shot accuracy)
+    lines.append("## 4. Case-Specific `deck_spec.json` Quick Checklist")
+    cm = case_meta or {}
+    mode_s = cm.get("mode") or "default_theme"
+    if page_budget:
+        lines.append(
+            f"- Target: `{cm.get('deck_name', 'talk.pptx')}` (`mode={mode_s}`), "
+            f"`{page_budget.get('total_pages')}` slides, `{page_budget.get('duration_minutes')}` min "
+            f"(~{page_budget.get('seconds_per_content_slide')}s/content slide), audience=`{page_budget.get('audience_class')}`."
+        )
+    if mode_s == "edit_deck":
+        lines.append("- `edit_deck` rule: bind kept/edited slides via 0-based `reuse:{\"slide_index\":N,\"action\":\"keep\"|\"edit\",\"clear_visuals\":false}` (`false` preserves old diagrams; `true` replaces them; unlisted slides are pruned automatically).")
+    lines.append("- `meta`: set verifiable `goal`, `audience`, `duration_minutes`, `language`, and **>=2 explicit `tradeoffs[]`** (what was prioritized, compressed, cut, or reordered).")
+    lines.append("- Every content slide: takeaway `title` (non-generic, distinct from `claim`), 1-sentence `claim` (<=30 CJK / <=18 EN words, verb calibrated to S1/S2/S3), `time_s`, `evidence:[{\"type\",\"locator\",\"strength\"}]`, and non-verbatim oral `notes` (120-180 zh / 90-140 en with on-page visual cue + bridge sentence).")
+    lines.append("- Visual mix (>=60% content slides, no 2+ bullet-only streak): `figure:{\"path\",\"region\":\"right|full\",\"caption\"}`, `figures:[{path,caption},{path,caption}]` (side-by-side pair), `table:{\"headers\",\"rows\",\"highlight_row\",\"caption\"}`, `chart:{\"type\":\"bar|barh|line\",\"categories\",\"series\":[{\"name\",\"values\"}],\"y_label\",\"caption\"}`, `steps:[{\"title\",\"detail\"}]`, `kpis:[{\"value\",\"label\",\"delta\"}]`, `two_col:{...}`, `callout:{\"title\",\"text\"}`.")
+    lines.append("- Top-level `qa_prep`: >=4 items covering all 4 categories (`mechanism`, `data`, `baseline`, `limitation`) with source-verified `answer_key`, `cite_slide`, `backup_slide` + 1 `qa_backup` slide (`time_s: null`).")
+    lines.append("")
+
     out_p = work / "reading_map.md"
     out_p.write_text("\n".join(lines), encoding="utf-8")
     return str(out_p)
@@ -634,7 +694,7 @@ def main():
     case = json.loads(cpath.read_text(encoding="utf-8"))
     inspect = json.loads((work / "inspect.json").read_text(encoding="utf-8"))
     mode, starting_deck, template = resolve_pptx_roles(case, inspect, cpath.parent)
-    deck_name, result_name = resolve_output_names(case, cpath.parent / "task.md")
+    deck_name, result_name, extra_outputs = resolve_output_names(case, cpath.parent / "task.md")
 
     # 2) S1 extract_figs on primary PDF (+ append secondary PDFs if any) or non-PDF fallback
     src_pdf = (inspect.get("source_pdf") or {}).get("path")
@@ -682,12 +742,14 @@ def main():
             sd_figs = []
             figs_dir = work / "figs"
             figs_dir.mkdir(parents=True, exist_ok=True)
-            def _iter_shapes(shapes_col):
+            def _iter_shapes(shapes_col, parent_top=None, parent_h=None):
                 for _sh in shapes_col:
-                    yield _sh
+                    yield _sh, parent_top, parent_h
                     if getattr(_sh, "shape_type", None) == 6:  # MSO_SHAPE_TYPE.GROUP
                         try:
-                            yield from _iter_shapes(_sh.shapes)
+                            pt = _sh.top if _sh.top is not None else parent_top
+                            ph = _sh.height if _sh.height is not None else parent_h
+                            yield from _iter_shapes(_sh.shapes, pt, ph)
                         except Exception:
                             pass
 
@@ -698,13 +760,15 @@ def main():
                 charts_s = []
                 bits = []
                 n_pics = 0
-                for sh in _iter_shapes(sl.shapes):
+                n_groups = sum(1 for _s in sl.shapes if getattr(_s, "shape_type", None) == 6)
+                for sh, p_top, p_h in _iter_shapes(sl.shapes):
                     if sh.shape_type == 13:
                         n_pics += 1
                         # Export genuine content figures from starting deck (skip small icons, logos, header/footer strips)
                         try:
-                            sh_top = sh.top if sh.top is not None else 0
-                            sh_h = sh.height if sh.height is not None else 0
+                            # Use parent group bounds when picture is nested inside a GROUP (child coords are group-local!)
+                            sh_top = p_top if p_top is not None else (sh.top if sh.top is not None else 0)
+                            sh_h = p_h if p_h is not None else (sh.height if sh.height is not None else 0)
                             in_chrome = (sh_top < int(0.90 * 914400) and sh_h < int(0.95 * 914400)) or (sh_top > int(prs.slide_height - 0.85 * 914400))
                             im_blob = sh.image.blob
                             im_ext = (sh.image.ext or "png").lower()
@@ -810,6 +874,7 @@ def main():
                     "tables": tbls_s,
                     "charts": charts_s,
                     "n_pictures": n_pics,
+                    "n_groups": n_groups,
                     "notes": nt[:400],
                 })
                 if title_t:
@@ -941,6 +1006,50 @@ def main():
         x["path"] for x in inspect.get("assets", [])
         if x.get("class") == "image" and Path(x["path"]).exists()
     ]
+    # Register standalone input images (non-icon, non-banner) into figs/manifest.json so they are first-class embeddable assets
+    if loose_imgs:
+        mf_p = work / "figs" / "manifest.json"
+        mf_p.parent.mkdir(parents=True, exist_ok=True)
+        existing_files = {str(Path(m.get("file", "")).resolve()) for m in fig_manifest if isinstance(m, dict) and m.get("file") and Path(m["file"]).exists()}
+        added_loose = []
+        for img_str in loose_imgs[:12]:
+            ip = Path(img_str)
+            try:
+                if str(ip.resolve()) in existing_files:
+                    continue
+            except Exception:
+                continue
+            if re.search(r"(?:logo|icon|badge|avatar|banner|watermark|header|footer)", ip.stem, re.I):
+                continue
+            px_info = [0, 0]
+            keep_img = True
+            try:
+                from PIL import Image as _PILIm
+                with _PILIm.open(str(ip)) as _im:
+                    w_px, h_px = _im.size
+                    ar = max(w_px, h_px) / max(1, min(w_px, h_px))
+                    if min(w_px, h_px) < 120 or max(w_px, h_px) < 220 or ar > 5.0:
+                        keep_img = False
+                    else:
+                        px_info = [w_px, h_px]
+            except Exception:
+                if ip.stat().st_size < 4096:
+                    keep_img = False
+            if not keep_img:
+                continue
+            mf_n = re.search(r"(?:fig(?:ure)?|图)[_\-\s]*(S?\d+)", ip.stem, re.I)
+            lbl_i = f"Fig.{mf_n.group(1)} ({ip.name})" if mf_n else f"Image ({ip.name})"
+            added_loose.append({
+                "file": str(ip),
+                "label": lbl_i,
+                "page": 1,
+                "method": "input_image",
+                "px": px_info,
+                "caption": f"Standalone input figure: {ip.name}",
+            })
+        if added_loose:
+            fig_manifest = list(fig_manifest) + added_loose
+            mf_p.write_text(json.dumps(fig_manifest, ensure_ascii=False, indent=1), encoding="utf-8")
 
     case_labels = {}
     for _pk, _k, _v in walk_kv(case):
@@ -958,6 +1067,7 @@ def main():
             "deck_name": deck_name,
             "result_name": result_name,
             "template": template,
+            "extra_requested_outputs": extra_outputs,
             "non_pdf_sources": non_pdf_sources,
             "case_labels": case_labels,
             "label_mismatch_warning": label_mismatch_warning,
@@ -974,6 +1084,7 @@ def main():
         "template": template,
         "recommended_deck_name": deck_name,
         "recommended_result_name": result_name,
+        "extra_requested_outputs": extra_outputs,
         "source_pdf": src_pdf,
         "extra_pdfs": extra_pdf_paths,
         "non_pdf_sources": non_pdf_sources,

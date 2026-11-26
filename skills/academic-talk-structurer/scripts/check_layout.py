@@ -92,30 +92,49 @@ def main():
 
     for si, slide in enumerate(prs.slides, 1):
         boxes = []
-        for sh in slide.shapes:
+        slide_shapes = list(slide.shapes)
+        slide_area = float(SW * SH) if (SW and SH) else 0.0
+        for sh_idx, sh in enumerate(slide_shapes):
             l, t, w, h = sh.left, sh.top, sh.width, sh.height
             if None in (l, t, w, h):
                 continue
             st = str(sh.shape_type)
+            txt = sh.text_frame.text.strip() if sh.has_text_frame else ""
+            is_table = bool(getattr(sh, "has_table", False))
+            is_chart = bool(getattr(sh, "has_chart", False))
+            is_pic = (sh.shape_type == MSO_SHAPE_TYPE.PICTURE)
+            is_grp = (sh.shape_type == MSO_SHAPE_TYPE.GROUP)
+            area_ratio = (float(w) * float(h)) / slide_area if slide_area > 0 else 0.0
+            # Full-bleed underlying background picture (>=65% slide area sitting beneath foreground content) is exempt from overlap/OOB
+            is_underlying_bg_pic = False
+            if is_pic and area_ratio >= 0.65:
+                has_content_above = any(
+                    (
+                        (o.has_text_frame and o.text_frame.text.strip())
+                        or getattr(o, "has_table", False)
+                        or getattr(o, "has_chart", False)
+                        or (o.shape_type == MSO_SHAPE_TYPE.PICTURE and None not in (o.width, o.height) and (float(o.width) * float(o.height)) < 0.65 * slide_area)
+                    )
+                    for o in slide_shapes[sh_idx + 1:]
+                )
+                has_text_below = any((o.has_text_frame and o.text_frame.text.strip()) for o in slide_shapes[:sh_idx])
+                is_underlying_bg_pic = has_content_above or (not has_text_below)
             is_bg_like = (
                 (w > SW * 0.88 and h > SH * 0.80)
+                or is_underlying_bg_pic
                 or (t <= int(0.35 * EMU_IN) and w >= SW * 0.80 and h <= int(1.35 * EMU_IN))
                 or (t >= SH - int(0.85 * EMU_IN) and w >= SW * 0.80 and h <= int(0.90 * EMU_IN))
                 or ((l <= int(0.35 * EMU_IN) or l + w >= SW - int(0.35 * EMU_IN)) and w <= int(0.70 * EMU_IN) and h >= SH * 0.65)
             )
             is_tiny_chrome = (w < int(0.25 * EMU_IN) or h < int(0.20 * EMU_IN))
-            txt = sh.text_frame.text.strip() if sh.has_text_frame else ""
-            is_table = bool(getattr(sh, "has_table", False))
-            is_chart = bool(getattr(sh, "has_chart", False))
-            is_pic = (sh.shape_type == MSO_SHAPE_TYPE.PICTURE)
-            is_content = bool(txt or is_table or is_chart or (is_pic and not is_bg_like and not is_tiny_chrome))
+            is_content = bool(txt or is_table or is_chart or ((is_pic or is_grp) and not is_bg_like and not is_tiny_chrome))
             # Only flag genuine out-of-bounds (>0.10in) on content shapes, ignoring full-bleed template chrome
             edge_tol = int(0.10 * EMU_IN)
             if is_content and (l < -edge_tol or t < -edge_tol or l + w > SW + edge_tol or t + h > SH + edge_tol):
                 issues.append({"slide": si, "type": "out_of_bounds", "shape": st,
                                "detail": f"L{l/EMU_IN:.2f} T{t/EMU_IN:.2f} W{w/EMU_IN:.2f} H{h/EMU_IN:.2f} slide {SW/EMU_IN:.2f}x{SH/EMU_IN:.2f}"})
             if is_content:
-                label = txt if txt else ("table" if is_table else ("chart" if is_chart else "pic"))
+                label = txt if txt else ("table" if is_table else ("chart" if is_chart else ("group" if is_grp else "pic")))
                 boxes.append((l, t, w, h, label, st))
             if txt:
                 if any(ch == "\ufffd" or "\ue000" <= ch <= "\uf8ff" for ch in txt):
