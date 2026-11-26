@@ -148,6 +148,9 @@ def check(deck_path: Path, margin_in: float, paper_text_path: Path = None, task_
         paper_nums = _build_paper_num_index(paper_text_path.read_text(encoding="utf-8", errors="ignore"))
         if task_text_path and task_text_path.exists():
             paper_nums |= _build_paper_num_index(task_text_path.read_text(encoding="utf-8", errors="ignore"))
+        deck_inv = paper_text_path.parent / "deck_inventory.json"
+        if deck_inv.exists():
+            paper_nums |= _build_paper_num_index(deck_inv.read_text(encoding="utf-8", errors="ignore"))
 
     slides_with_title_ph = 0
     slides_with_body_ph = 0
@@ -418,7 +421,15 @@ def main():
         print(f"FATAL: {p} not found", file=sys.stderr)
         return 2
     ptxt = Path(a.paper_text) if a.paper_text else None
+    if ptxt is None:
+        cand_pt = Path(a.json).resolve().parent / "paper_text.txt"
+        if cand_pt.exists():
+            ptxt = cand_pt
     ttxt = Path(a.task_text) if a.task_text else None
+    if ttxt is None:
+        cand_bt = Path(a.json).resolve().parent / "brief.txt"
+        if cand_bt.exists():
+            ttxt = cand_bt
     rep = check(p, a.margin, paper_text_path=ptxt, task_text_path=ttxt)
     Path(a.json).parent.mkdir(parents=True, exist_ok=True)
     Path(a.json).write_text(json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -428,6 +439,9 @@ def main():
           f"title_inherit={rep['inheritance_summary']['title_inheritance_rate']}{ng_str} -> {a.json}")
     for x in rep["issues"][:20]:
         print(f"  [{x['severity']}] s{x['slide']} {x['kind']}: {x['detail']}")
+    if ng and ng.get("unverified"):
+        sample = ", ".join(f"s{u.get('slide', '?')}:{u.get('token', '?')}" for u in ng["unverified"][:8])
+        print(f"  [advisory] unverified numbers vs source: {sample}")
     return 1 if rep["critical"] else 0
 
 

@@ -30,19 +30,68 @@ try:
 except ImportError:
     Image = None
 
-TPL_NAME_RE = re.compile(r"(template|tpl|theme|master|blank|brand|style|model)", re.I)
-DECK_NAME_RE = re.compile(r"(start|draft|old|legacy|existing|current|original|source_ppt|input_deck|base_deck|v0)", re.I)
+TPL_NAME_RE = re.compile(
+    r"(?:(?<![a-z0-9])(?:template|templates|tpl|theme|master|blank|brand|style|model)(?![a-z0-9])|模板|母版|主题)",
+    re.I,
+)
+DECK_NAME_RE = re.compile(
+    r"(?:(?<![a-z0-9])(?:start|starting|draft|old|legacy|existing|current|original|"
+    r"source[_-]?ppt|input[_-]?deck|base[_-]?deck|initial[_-]?deck|v0)(?![a-z0-9])|旧版|初稿|原稿|已有)",
+    re.I,
+)
+TPL_KEY_RE = re.compile(r"(?<![a-z0-9])(?:template|templates|tpl|theme|master)(?![a-z0-9])", re.I)
+DECK_KEY_RE = re.compile(
+    r"(?<![a-z0-9])(?:start|starting|deck|draft|source|old|existing|legacy|input|base|initial)(?![a-z0-9])",
+    re.I,
+)
+PAPER_KEY_RE = re.compile(
+    r"(?<![a-z0-9])(?:paper|pdf|source|manuscript|article|material|materials|document|doc)(?![a-z0-9])",
+    re.I,
+)
+BOILERPLATE_PHRASE_RE = re.compile(
+    r"(?:"
+    r"(?<![a-z0-9])(?:click\s+(?:icon\s+)?to\s+(?:add|edit|insert)|lorem\s+ipsum|dolor\s+sit\s+amet|"
+    r"consectetur\s+adipiscing|your\s+(?:title|subtitle|text|content|name|logo)\s+here|"
+    r"insert\s+(?:title|subtitle|text|picture|image|chart|table)|"
+    r"add\s+(?:a\s+)?(?:title|subtitle|text|content|caption)|"
+    r"sample\s+(?:text|slide|title|content|chart|table|layout|subtitle)|"
+    r"example\s+(?:text|slide|title|content|layout)|"
+    r"placeholder\s+(?:text|title|content|image)|"
+    r"presentation\s+title|slide\s+title|section\s+(?:title|header)|"
+    r"(?:first|second|third|fourth|fifth)\s+level|bullet\s+point\s*\d*|"
+    r"template\s+(?:guide|usage|instructions?|notes?|example|sample))(?![a-z0-9])"
+    r"|单击此处(?:添加|输入|编辑)|点击此处(?:添加|输入|编辑)|单击(?:添加|输入)|点击(?:添加|输入)"
+    r"|在此(?:输入|添加)|请输入|添加(?:主?标题|副标题|文本|内容|图片)"
+    r"|输入(?:主?标题|副标题|文本|内容)|示例(?:文本|内容|页|标题|图表)|样张|模板(?:说明|示例|样式)|占位符"
+    r")",
+    re.I,
+)
+BOILERPLATE_LABEL_RE = re.compile(
+    r"^\s*(?:"
+    r"(?<![a-z0-9])(?:title|subtitle|sub-title|heading|header|footer|date|author|presenter|speaker|name|"
+    r"institution|department|organization|affiliation|company|logo|agenda|outline|contents|"
+    r"table\s+of\s+contents|overview|section|chapter|part|topic|content|text|body|caption|"
+    r"sample|example|placeholder|template|layout|blank|thank\s+you|thanks|q\s*&\s*a|questions?)(?![a-z0-9])"
+    r"(?:\s*(?:here|\d+|[ivx]+))?"
+    r"|主?标题|副标题|章节标题|目录|大纲|正文(?:内容)?|内容(?:区域)?|汇报人|演讲人|报告人|姓名|单位|学院|日期|时间|示例|样例|模板|谢谢(?:观看|聆听)?|感谢聆听|敬请指正|致谢"
+    r")\s*[:：\-—.\d]*\s*$",
+    re.I,
+)
+DUMMY_CHART_RE = re.compile(r"^\s*(?:category|series|类别|系列)\s*\d+\s*$", re.I)
+PURE_PLACEHOLDER_TOKEN_RE = re.compile(r"^[\s\d\-/.:：xX*#_•·~—–()\[\]]+$")
 TIER3_SEC_RE = re.compile(
-    r"(experiment|result|evaluat|ablat|bench|compar|perform|finding|discuss|limit|threat|conclu|future|takeaway|"
+    r"(?:(?<![a-z0-9])(?:experiment|experiments|experimental|result|results|evaluat\w*|ablat\w*|bench\w*|"
+    r"compar\w*|perform\w*|finding|findings|discuss\w*|limit\w*|threat|threats|conclu\w*|future|takeaway|takeaways)(?![a-z0-9])|"
     r"实验|结果|评估|消融|对比|讨论|局限|结论)", re.I)
 TIER1_SEC_RE = re.compile(
-    r"(related\s+work|prior\s+work|acknowledg|ethic|broader\s+impact|reference|bibliograph|appendix|supplement|"
+    r"(?:(?<![a-z0-9])(?:related\s+work|prior\s+work|acknowledg\w*|ethic\w*|broader\s+impact|"
+    r"reference|references|bibliograph\w*|appendix|appendices|supplement\w*)(?![a-z0-9])|"
     r"相关工作|致谢|参考文献|附录)", re.I)
 REF_STOP_RE = re.compile(r"^\s*(\d+\.?\s+)?(references|bibliography|acknowledg(e)?ments?|参考文献|致谢)\s*$", re.I)
 SIGNAL_SENT_RE = re.compile(
     r"(\d+(?:\.\d+)?\s*(?:%|x|×|ms|s|gb|mb|kb|hz|khz|mhz|ghz|mm|cm|nm|ev|k\b|m\b|b\b|db|pt|fps)|"
-    r"±|\bp\s*[<≤=]\s*0\.\d|f1|auc|bleu|rouge|rmse|mae|top-\d|table\s+\w+|fig(?:ure)?\.?\s+\w+|"
-    r"outperform|improv|reduc|faster|lower|higher|gain|achieve|limitation|bottleneck|however|fail|trade-?off|"
+    r"±|\bp\s*[<≤=]\s*0\.\d|\b(?:f1|auc|bleu|rouge|rmse|mae|top-\d)\b|\btable\s+\w+|\bfig(?:ure)?\.?\s+\w+|"
+    r"\b(?:outperform\w*|improv\w*|reduc\w*|faster|lower|higher|gain\w*|achiev\w*|limitation\w*|bottleneck\w*|however|fail\w*|trade-?off\w*)\b|"
     r"提升|降低|优于|局限|不足|误差)", re.I)
 
 
@@ -63,21 +112,144 @@ def _clean_ws(s: str) -> str:
 def _collect_case_hints(obj, tpl_hints, deck_hints, paper_hints, key_ctx=""):
     if isinstance(obj, dict):
         for k, v in obj.items():
-            _collect_case_hints(v, tpl_hints, deck_hints, paper_hints, f"{key_ctx}.{k}".lower())
+            kl = str(k).lower()
+            if kl in ("output_contract", "output_fields"):
+                continue
+            _collect_case_hints(v, tpl_hints, deck_hints, paper_hints, f"{key_ctx}.{kl}")
     elif isinstance(obj, list):
         for v in obj:
             _collect_case_hints(v, tpl_hints, deck_hints, paper_hints, key_ctx)
     elif isinstance(obj, str) and len(obj) < 300:
         low = obj.lower()
         base = Path(obj).name.lower()
-        if any(ext in low for ext in (".pptx", ".potx")):
-            if any(t in key_ctx for t in ("template", "tpl", "theme", "master")):
+        if any(low.endswith(ext) for ext in (".pptx", ".potx")):
+            if TPL_KEY_RE.search(key_ctx):
                 tpl_hints.add(base)
-            elif any(t in key_ctx for t in ("start", "deck", "draft", "source", "old", "existing", "input")):
+            elif DECK_KEY_RE.search(key_ctx):
                 deck_hints.add(base)
-        elif any(ext in low for ext in (".pdf", ".docx", ".md", ".txt", ".csv")):
-            if any(t in key_ctx for t in ("paper", "pdf", "source", "manuscript", "article", "material")):
+        elif any(low.endswith(ext) for ext in (".pdf", ".docx", ".md", ".txt", ".csv")):
+            if PAPER_KEY_RE.search(key_ctx):
                 paper_hints.add(base)
+
+
+def _is_boilerplate_text(txt: str) -> bool:
+    t = _clean_ws(txt)
+    if not t or len(t) < 3 or PURE_PLACEHOLDER_TOKEN_RE.match(t):
+        return True
+    if BOILERPLATE_PHRASE_RE.search(t) or BOILERPLATE_LABEL_RE.match(t):
+        return True
+    return False
+
+
+def _iter_leaf_shapes(shapes):
+    for sh in shapes:
+        if sh.shape_type is not None and "GROUP" in str(sh.shape_type):
+            try:
+                yield from _iter_leaf_shapes(sh.shapes)
+                continue
+            except Exception:
+                pass
+        yield sh
+
+
+def _has_substantive_deck_content(pptx_path: Path, min_slides: int = 1) -> bool:
+    """Return True iff pptx_path contains genuine presentation body content rather than
+    empty/sample template placeholder slides (click to add, lorem ipsum, sample/标题, etc.)."""
+    if pptx_path.suffix.lower() != ".pptx":
+        return False
+    try:
+        from pptx import Presentation
+        prs = Presentation(str(pptx_path))
+    except Exception:
+        return False
+    slides = list(prs.slides)
+    if len(slides) < min_slides:
+        return False
+
+    substantive_slides = 0
+    total_sub_chars = 0
+    any_real_data = False
+
+    for slide in slides:
+        sub_chunks, boil_chunks = [], []
+        has_real_table = False
+        has_real_chart = False
+
+        for sh in _iter_leaf_shapes(slide.shapes):
+            if getattr(sh, "is_placeholder", False):
+                try:
+                    pt = str(sh.placeholder_format.type)
+                    if any(k in pt for k in ("FOOTER", "SLIDE_NUMBER", "DATE", "HEADER")):
+                        continue
+                except Exception:
+                    pass
+
+            if getattr(sh, "has_table", False):
+                try:
+                    tbl = sh.table
+                    real_cells = []
+                    for row in tbl.rows:
+                        for cell in row.cells:
+                            ct = _clean_ws(cell.text)
+                            if ct and not _is_boilerplate_text(ct):
+                                real_cells.append(ct)
+                    if len(tbl.rows) >= 2 and len(real_cells) >= 4:
+                        has_real_table = True
+                        sub_chunks.extend(real_cells[:12])
+                except Exception:
+                    pass
+
+            if getattr(sh, "has_chart", False):
+                try:
+                    ch = sh.chart
+                    labels = []
+                    for plot in ch.plots:
+                        for cat in getattr(plot, "categories", []) or []:
+                            labels.append(str(cat))
+                    for ser in ch.series:
+                        if getattr(ser, "name", None):
+                            labels.append(str(ser.name))
+                    real_labels = [lb for lb in labels if lb.strip() and not DUMMY_CHART_RE.match(lb) and not _is_boilerplate_text(lb)]
+                    if real_labels:
+                        has_real_chart = True
+                except Exception:
+                    pass
+
+            if getattr(sh, "has_text_frame", False):
+                for para in sh.text_frame.paragraphs:
+                    t = _clean_ws(para.text)
+                    if not t:
+                        continue
+                    if _is_boilerplate_text(t):
+                        boil_chunks.append(t)
+                    else:
+                        sub_chunks.append(t)
+
+        notes_sub_chars = 0
+        try:
+            if slide.has_notes_slide and slide.notes_slide.notes_text_frame:
+                nt = _clean_ws(slide.notes_slide.notes_text_frame.text)
+                if nt and not _is_boilerplate_text(nt):
+                    notes_sub_chars = len(nt)
+        except Exception:
+            pass
+
+        sub_chars = sum(len(x) for x in sub_chunks)
+        total_sub_chars += sub_chars
+        if has_real_table or has_real_chart:
+            any_real_data = True
+            substantive_slides += 1
+            continue
+        if len(boil_chunks) > 0 and len(sub_chunks) == 0 and notes_sub_chars < 30:
+            continue
+        if len(boil_chunks) >= max(2, len(sub_chunks) * 2) and sub_chars < 100 and notes_sub_chars < 30:
+            continue
+        if sub_chars >= 60 or (len(sub_chunks) >= 2 and sub_chars >= 35) or notes_sub_chars >= 30:
+            substantive_slides += 1
+
+    if len(slides) == 1:
+        return substantive_slides >= 1 and (total_sub_chars >= 120 or any_real_data)
+    return substantive_slides >= 2 or (substantive_slides >= 1 and (total_sub_chars >= 120 or any_real_data))
 
 
 def _scan_input(input_dir: Path):
@@ -116,48 +288,78 @@ def _classify_inputs(files, case_data, a):
 
     tpl_p = Path(a.template) if a.template else None
     deck_p = Path(a.deck) if a.deck else None
+    extra_templates = []
 
-    if tpl_p is None and deck_p is None and ppt_files:
-        if len(ppt_files) == 1:
-            p0 = ppt_files[0]
-            tpl_p = p0
-            # Check if the single .pptx also contains multiple slides (could be a starting deck + template)
-            if p0.suffix.lower() == ".pptx":
-                try:
-                    inv0 = inspect_template.inspect(p0)
-                    if inv0.get("existing_slides", 0) >= 2 or p0.name.lower() in deck_hints or DECK_NAME_RE.search(p0.name):
-                        deck_p = p0
-                except Exception:
-                    pass
+    def _score_ppt(p: Path):
+        nm = p.name.lower()
+        stem = p.stem.lower()
+        is_potx = p.suffix.lower() == ".potx"
+        in_tpl_hint = nm in tpl_hints
+        in_deck_hint = nm in deck_hints
+        is_tpl_named = bool(TPL_NAME_RE.search(stem))
+        is_deck_named = bool(DECK_NAME_RE.search(stem))
+        t_score = (10 if is_potx else 0) + (8 if in_tpl_hint else 0) + (4 if is_tpl_named else 0)
+        d_score = (8 if in_deck_hint else 0) + (4 if is_deck_named else 0)
+        n_slides = 0
+        try:
+            n_slides = inspect_template.inspect(p).get("existing_slides", 0)
+        except Exception:
+            pass
+        return dict(
+            path=p, is_potx=is_potx, in_tpl_hint=in_tpl_hint, in_deck_hint=in_deck_hint,
+            is_tpl_named=is_tpl_named, is_deck_named=is_deck_named,
+            t_score=t_score, d_score=d_score, n_slides=n_slides,
+        )
+
+    def _is_eligible_starting_deck(info: dict, single_file: bool = False) -> bool:
+        if info["in_deck_hint"]:
+            return True
+        if info["is_potx"]:
+            return False
+        if info["is_deck_named"]:
+            # If also template-named (e.g. old_template.pptx), require real body content
+            if info["is_tpl_named"] or info["in_tpl_hint"]:
+                return _has_substantive_deck_content(info["path"], min_slides=1)
+            return True
+        # Never treat template-named or template-hinted files as starting decks without explicit deck signal
+        if info["t_score"] > 0:
+            return False
+        min_s = 2 if single_file else 1
+        if info["n_slides"] < min_s:
+            return False
+        return _has_substantive_deck_content(info["path"], min_slides=min_s)
+
+    scored_all = [_score_ppt(p) for p in ppt_files]
+
+    if tpl_p is None and deck_p is None and scored_all:
+        if len(scored_all) == 1:
+            info0 = scored_all[0]
+            tpl_p = info0["path"]
+            if _is_eligible_starting_deck(info0, single_file=True):
+                deck_p = info0["path"]
         else:
-            scored = []
-            for p in ppt_files:
-                nm = p.name.lower()
-                is_potx = p.suffix.lower() == ".potx"
-                t_score = (10 if is_potx else 0) + (6 if nm in tpl_hints else 0) + (4 if TPL_NAME_RE.search(nm) else 0)
-                d_score = (6 if nm in deck_hints else 0) + (4 if DECK_NAME_RE.search(nm) else 0)
-                n_slides = 0
-                try:
-                    n_slides = inspect_template.inspect(p).get("existing_slides", 0)
-                except Exception:
-                    pass
-                scored.append((p, t_score, d_score, n_slides))
-            # Pick best template (prefer high t_score, fewer existing slides)
-            scored_tpl = sorted(scored, key=lambda x: (-x[1], x[2], x[3], x[0].name))
-            tpl_p = scored_tpl[0][0]
-            rem = [x for x in scored if x[0] != tpl_p]
-            if rem:
-                scored_deck = sorted(rem, key=lambda x: (-x[2], -x[3], x[0].name))
-                if scored_deck[0][2] > 0 or scored_deck[0][3] >= 1:
-                    deck_p = scored_deck[0][0]
-    elif tpl_p is None and ppt_files:
-        rem = [p for p in ppt_files if p != deck_p]
+            # Pick best template (prefer high t_score, low d_score, fewer existing slides)
+            scored_tpl = sorted(scored_all, key=lambda x: (-x["t_score"], x["d_score"], x["n_slides"], x["path"].name))
+            tpl_p = scored_tpl[0]["path"]
+            rem = [x for x in scored_all if x["path"] != tpl_p]
+            deck_cands = [x for x in rem if _is_eligible_starting_deck(x, single_file=False)]
+            if deck_cands:
+                deck_cands.sort(key=lambda x: (-x["d_score"], x["t_score"], -x["n_slides"], x["path"].name))
+                deck_p = deck_cands[0]["path"]
+            extra_templates = [x["path"] for x in rem if x["path"] != deck_p and x["t_score"] > 0]
+    elif tpl_p is None and scored_all:
+        rem = [x for x in scored_all if x["path"] != deck_p]
         if rem:
-            tpl_p = rem[0]
-    elif deck_p is None and ppt_files:
-        rem = [p for p in ppt_files if p != tpl_p]
-        if rem:
-            deck_p = rem[0]
+            rem.sort(key=lambda x: (-x["t_score"], x["d_score"], x["n_slides"], x["path"].name))
+            tpl_p = rem[0]["path"]
+            extra_templates = [x["path"] for x in rem[1:] if x["t_score"] > 0]
+    elif deck_p is None and scored_all:
+        rem = [x for x in scored_all if x["path"] != tpl_p]
+        deck_cands = [x for x in rem if _is_eligible_starting_deck(x, single_file=False)]
+        if deck_cands:
+            deck_cands.sort(key=lambda x: (-x["d_score"], x["t_score"], -x["n_slides"], x["path"].name))
+            deck_p = deck_cands[0]["path"]
+        extra_templates = [x["path"] for x in rem if x["path"] != deck_p and x["t_score"] > 0]
 
     paper_p = Path(a.paper) if a.paper else None
     extra_pdfs = []
@@ -183,7 +385,7 @@ def _classify_inputs(files, case_data, a):
         doc_files = [d for d in doc_files if d.resolve() != paper_p.resolve()]
 
     return dict(
-        case=case_p, task=task_p, template=tpl_p, deck=deck_p,
+        case=case_p, task=task_p, template=tpl_p, extra_templates=extra_templates, deck=deck_p,
         paper=paper_p, extra_pdfs=extra_pdfs, extra_docs=doc_files, images=img_files,
     )
 
@@ -520,6 +722,8 @@ def main():
             tag.append("TASK")
         if roles["template"] and f == roles["template"]:
             tag.append("TEMPLATE")
+        if f in (roles.get("extra_templates") or []):
+            tag.append("TEMPLATE_ALT")
         if roles["deck"] and f == roles["deck"]:
             tag.append("STARTING_DECK")
         if roles["paper"] and f == roles["paper"]:

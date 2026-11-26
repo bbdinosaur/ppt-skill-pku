@@ -134,6 +134,84 @@ def _trim_white(out_path: Path):
         return None
 
 
+def _extract_table_rows_clean(page, tb, pymupdf_mod, max_rows=20):
+    """Extract table cell text by clipping each cell bbox via page.get_text('text'),
+    avoiding PyMuPDF Table.extract() baseline-splitting of decimals ('.') and hyphens ('-')."""
+    rows_out = []
+    tb_rows = getattr(tb, "rows", None)
+    if tb_rows:
+        for row in tb_rows[:max_rows]:
+            cells = getattr(row, "cells", None) or []
+            r_vals = []
+            for cell in cells:
+                if cell is None:
+                    r_vals.append("")
+                    continue
+                try:
+                    rect = pymupdf_mod.Rect(cell)
+                    if rect.width <= 0.5 or rect.height <= 0.5:
+                        r_vals.append("")
+                        continue
+                    txt = page.get_text("text", clip=rect)
+                    r_vals.append(re.sub(r"\s+", " ", txt or "").strip())
+                except Exception:
+                    r_vals.append("")
+            if any(r_vals):
+                rows_out.append(r_vals)
+        if rows_out:
+            return rows_out
+    try:
+        raw_rows = tb.extract() or []
+        return [[re.sub(r"\s+", " ", (c or "")).strip() for c in row] for row in raw_rows[:max_rows]]
+    except Exception:
+        return []
+
+
+def _extract_booktabs_rows(page, clip, pymupdf_mod, max_rows=20):
+    """Extract structured rows from a borderless LaTeX booktabs table clip."""
+    try:
+        found = page.find_tables(clip=clip, vertical_strategy="text", horizontal_strategy="text")
+        if found and found.tables:
+            best = max(found.tables, key=lambda tb: len(getattr(tb, "rows", []) or []))
+            rows = _extract_table_rows_clean(page, best, pymupdf_mod, max_rows=max_rows)
+            if len(rows) >= 2 and max(len(r) for r in rows) >= 2:
+                return rows
+    except Exception:
+        pass
+    # Word-band fallback: group words by Y-center and split cells on wide X gaps (>=14pt)
+    try:
+        words = page.get_text("words", clip=clip) or []
+        if not words:
+            return []
+        words.sort(key=lambda w: ((w[1] + w[3]) * 0.5, w[0]))
+        bands = []
+        for w in words:
+            yc = (w[1] + w[3]) * 0.5
+            if not bands or abs(yc - bands[-1]["yc"]) > 4.5:
+                bands.append(dict(yc=yc, words=[w]))
+            else:
+                bands[-1]["words"].append(w)
+        rows = []
+        for b in bands[:max_rows]:
+            ws = sorted(b["words"], key=lambda w: w[0])
+            cells = []
+            cur = [ws[0][4]]
+            prev_x1 = ws[0][2]
+            for w in ws[1:]:
+                if w[0] - prev_x1 >= 14.0:
+                    cells.append(" ".join(cur).strip())
+                    cur = [w[4]]
+                else:
+                    cur.append(w[4])
+                prev_x1 = max(prev_x1, w[2])
+            cells.append(" ".join(cur).strip())
+            if any(cells):
+                rows.append(cells)
+        return rows if len(rows) >= 2 else []
+    except Exception:
+        return []
+
+
 def _merge_caption(page_lines, start_idx, page_w):
     """Merge continuation lines directly below a figure/table caption in the same column."""
     base = page_lines[start_idx]
@@ -323,24 +401,24 @@ def extract(pdf_path: Path, figdir: Path, dpi: int, text_out: Path = None):
             pix.save(str(out))
             t["image"] = str(out)
             t["image_w"], t["image_h"] = pix.width, pix.height
-            try:
-                raw_rows = cand.extract() or []
-                t["rows"] = [[re.sub(r"\s+", " ", (c or "")).strip() for c in row] for row in raw_rows[:20]]
-            except Exception:
-                t["rows"] = []
+            t["rows"] = _extract_table_rows_clean(page, cand, pymupdf, max_rows=20)
         else:
             # Booktabs horizontal-rule band fallback for LaTeX tables without vertical borders
-            h_rules = []
+            h_below, h_above = [], []
             try:
                 for d in page.get_drawings():
                     r = d.get("rect")
                     if r is None:
                         continue
                     bw, bh = r.x1 - r.x0, r.y1 - r.y0
-                    if bw >= 60 and bh <= 3.0 and r.y0 >= cy1 - 4 and r.y0 <= min(ph, cy1 + 360):
-                        h_rules.append((r.x0, r.y0, r.x1, r.y1))
+                    if bw >= 60 and bh <= 3.0 and _overlap_x((r.x0, r.y0, r.x1, r.y1), (col_l, 0, col_r, 0), pad=24):
+                        if r.y0 >= cy1 - 4 and r.y0 <= min(ph, cy1 + 360):
+                            h_below.append((r.x0, r.y0, r.x1, r.y1))
+                        elif r.y1 <= cy0 + 4 and r.y1 >= max(0, cy0 - 360):
+                            h_above.append((r.x0, r.y0, r.x1, r.y1))
             except Exception:
-                h_rules = []
+                h_below, h_above = [], []
+            h_rules = h_below if len(h_below) >= 2 else (h_above if len(h_above) >= 2 else [])
             if len(h_rules) >= 2:
                 rx0 = min(b[0] for b in h_rules)
                 ry0 = min(b[1] for b in h_rules)
@@ -354,7 +432,7 @@ def extract(pdf_path: Path, figdir: Path, dpi: int, text_out: Path = None):
                     pix.save(str(out))
                     t["image"] = str(out)
                     t["image_w"], t["image_h"] = pix.width, pix.height
-                    t["rows"] = []
+                    t["rows"] = _extract_booktabs_rows(page, clip, pymupdf, max_rows=20)
                 else:
                     t["image"], t["rows"] = None, []
             else:

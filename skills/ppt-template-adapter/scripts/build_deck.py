@@ -124,43 +124,91 @@ def _slide_clr_map(slide):
     return cmap
 
 
-def _bg_hex_readonly(obj, theme_colors=None, clr_map=None):
-    """Read solid background hex from XML WITHOUT calling obj.background.fill (which mutates XML!)."""
+def _extract_fill_hex(container, theme_colors=None, alias_map=None):
+    """Extract 6-hex RGB from an XML container's solidFill, gradFill (mean stop), or direct color node."""
+    if container is None:
+        return None
+    amap = alias_map or {"bg1": "lt1", "bg2": "lt2", "tx1": "dk1", "tx2": "dk2"}
+
+    def _node_hex(node):
+        if node is None:
+            return None
+        srgb = node.find(qn("a:srgbClr"))
+        if srgb is not None and srgb.get("val"):
+            return srgb.get("val").lstrip("#")
+        sch = node.find(qn("a:schemeClr"))
+        if sch is not None and sch.get("val") and theme_colors:
+            k = sch.get("val")
+            hx = theme_colors.get(amap.get(k, k)) or theme_colors.get(k)
+            if hx:
+                return hx.lstrip("#")
+        return None
+
+    sf = container.find(qn("a:solidFill"))
+    hx = _node_hex(sf)
+    if hx and len(hx) == 6:
+        return hx
+    gf = container.find(qn("a:gradFill"))
+    if gf is not None:
+        gs_lst = gf.find(qn("a:gsLst"))
+        if gs_lst is not None:
+            stops = []
+            for gs in gs_lst.findall(qn("a:gs")):
+                shx = _node_hex(gs)
+                if shx and len(shx) == 6:
+                    stops.append((int(shx[0:2], 16), int(shx[2:4], 16), int(shx[4:6], 16)))
+            if stops:
+                r = sum(c[0] for c in stops) // len(stops)
+                g = sum(c[1] for c in stops) // len(stops)
+                b = sum(c[2] for c in stops) // len(stops)
+                return f"{r:02X}{g:02X}{b:02X}"
+    return _node_hex(container)
+
+
+def _bg_hex_readonly(obj, theme_colors=None, clr_map=None, slide_w=None, slide_h=None):
+    """Read solid/gradient background or full-slide backdrop shape hex from XML WITHOUT mutating XML."""
     try:
         csld = obj._element.find(qn("p:cSld"))
         if csld is None:
             return None
-        bg = csld.find(qn("p:bg"))
-        if bg is None:
-            return None
         alias_map = clr_map or {"bg1": "lt1", "bg2": "lt2", "tx1": "dk1", "tx2": "dk2"}
-        for container_tag in ("p:bgPr", "p:bgRef"):
-            cont = bg.find(qn(container_tag))
-            if cont is None:
-                continue
-            sf = cont.find(qn("a:solidFill")) if container_tag == "p:bgPr" else cont
-            if sf is None:
-                continue
-            srgb = sf.find(qn("a:srgbClr"))
-            if srgb is not None and srgb.get("val"):
-                return srgb.get("val")
-            sch = sf.find(qn("a:schemeClr"))
-            if sch is not None and sch.get("val") and theme_colors:
-                k = sch.get("val")
-                mapped = alias_map.get(k, k)
-                hx = theme_colors.get(mapped) or theme_colors.get(k)
-                if hx:
-                    return hx.lstrip("#")
+        bg = csld.find(qn("p:bg"))
+        if bg is not None:
+            for container_tag in ("p:bgPr", "p:bgRef"):
+                cont = bg.find(qn(container_tag))
+                hx = _extract_fill_hex(cont, theme_colors, alias_map)
+                if hx and len(hx) == 6:
+                    return hx
+        # Also detect full-slide decorative backdrop rectangle (<p:sp> covering >=75% slide area)
+        if slide_w and slide_h:
+            slide_area = max(slide_w * slide_h, 1.0)
+            for sh in getattr(obj, "shapes", ()):
+                if getattr(sh, "is_placeholder", False) or getattr(sh, "has_table", False):
+                    continue
+                if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip():
+                    continue
+                bw, bh = as_in(sh.width, 0.0), as_in(sh.height, 0.0)
+                if bw * bh >= 0.75 * slide_area:
+                    spPr = sh._element.find(qn("p:spPr"))
+                    hx = _extract_fill_hex(spPr, theme_colors, alias_map)
+                    if hx and len(hx) == 6:
+                        return hx
     except Exception:
         pass
     return None
 
 
 def is_dark_slide(slide, theme_colors=None):
-    """Detect whether a slide, its layout, or its master has a dark solid background (read-only)."""
+    """Detect whether a slide, its layout, or its master has a dark solid/gradient/backdrop background (read-only)."""
     cmap = _slide_clr_map(slide)
+    sw = sh = None
+    try:
+        prs_el = slide.part.package.presentation_part.presentation
+        sw, sh = Emu(prs_el.slide_width).inches, Emu(prs_el.slide_height).inches
+    except Exception:
+        pass
     for obj in (slide, slide.slide_layout, slide.slide_layout.slide_master):
-        hx = _bg_hex_readonly(obj, theme_colors, clr_map=cmap)
+        hx = _bg_hex_readonly(obj, theme_colors, clr_map=cmap, slide_w=sw, slide_h=sh)
         if hx and len(hx) == 6:
             r, g, b = int(hx[0:2], 16), int(hx[2:4], 16), int(hx[4:6], 16)
             return (0.299 * r + 0.587 * g + 0.114 * b) < 128
@@ -688,6 +736,23 @@ def _theme_palette(theme_colors):
     return pal
 
 
+def _parse_chart_num(v):
+    """Parse numeric chart value robustly (handles %, commas, units, unicode minus, None/N/A)."""
+    if v is None:
+        return None
+    if isinstance(v, (int, float)):
+        return None if (isinstance(v, float) and (math.isnan(v) or math.isinf(v))) else float(v)
+    s = str(v).strip().replace("−", "-").replace("–", "-")
+    if not s or s.lower() in ("-", "—", "n/a", "na", "none", "null", "nan"):
+        return None
+    s_clean = s.replace(",", "")
+    try:
+        return float(s_clean)
+    except ValueError:
+        m = re.search(r"[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?", s_clean)
+        return float(m.group(0)) if m else None
+
+
 def place_chart(slide, chart_spec, box, ladder, theme_colors, dark_bg, report_slide):
     """Render an editable native OOXML chart (column/bar/line) styled with template accents."""
     cats = [str(c) for c in (chart_spec.get("categories") or [])]
@@ -719,11 +784,8 @@ def place_chart(slide, chart_spec, box, ladder, theme_colors, dark_bg, report_sl
         raw_vals = ser.get("values") or []
         vals = []
         for idx in range(len(cats)):
-            v = raw_vals[idx] if idx < len(raw_vals) else 0
-            try:
-                vals.append(float(v))
-            except (TypeError, ValueError):
-                vals.append(0.0)
+            v = raw_vals[idx] if idx < len(raw_vals) else None
+            vals.append(_parse_chart_num(v))
         cdata.add_series(name, vals)
         clean_series.append((name, vals))
 

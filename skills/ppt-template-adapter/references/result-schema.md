@@ -4,7 +4,7 @@
 | 字段 | 类型 | 口径 |
 |---|---|---|
 | `case_id` | str | **逐字复制 case.json 的 case_id** |
-| *(output_contract 每个字段)* | — | 逐字并入顶层；优先级：`--fills` 实填 > 自动交付物/标准段映射 > `null` + `uncertainty`（禁编造） |
+| *(output_contract 每个字段)* | — | 逐字并入顶层；优先级：`--fills` 实填 > 自动交付物/标准段映射（含 `template_path`/`template_file`、`sources`/`source_files`/`provenance`、`uncertainties`、`theme_mapping`/`layout_mapping`/`normalizations`） > 保留已有 `result.json` 非空手写字段 > `null` + `uncertainty`（禁编造）；重跑时对已存在 `result.json` 执行非覆盖合并，去重合并 `sources`/`uncertainty`/`limits`/`change_log` |
 | `status` | str | `complete`（`deck.pptx` 非空有效且 `slide_count>0`、`deck.pdf` 有效导出且 `pages_match==true`；启发式几何告警与疑似空白页不误降级，而是如实记入 `checks`/`limits`/`uncertainty`）/ `partial`（`deck.pptx` 有效但 PDF 缺失损坏或页数不一致）/ `failed`（`deck.pptx` 缺失损坏或 0 页） |
 | `deliverables` | obj | `pptx`、`/app/output/deck.pdf`、`previews_dir`、`previews[]`、`build_report`、`plan`、`render_log`（全部绝对路径） |
 | `deck_summary` | obj | `slide_count`、`title`、`layouts_used[]`、`template`、`slide_size`、`audience`、`duration_min`、`language`、**`placeholder_chain[]`**（逐页 layout + title_ph/body_ph idx+type，自动由 `build_report` 生成） |

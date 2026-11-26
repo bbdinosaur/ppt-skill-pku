@@ -74,32 +74,68 @@ def _layout_clr_map(lo):
     return cmap
 
 
-def _bg_hex(obj, theme_colors=None, clr_map=None):
-    """Read solid background hex from XML without mutating obj.background.fill."""
+def _fill_hex_from_el(cont, theme_colors, alias_map, qn):
+    if cont is None:
+        return None
+
+    def _node_hex(node):
+        if node is None:
+            return None
+        srgb = node.find(qn("a:srgbClr"))
+        if srgb is not None and srgb.get("val"):
+            return "#" + srgb.get("val").lstrip("#")
+        sch = node.find(qn("a:schemeClr"))
+        if sch is not None and sch.get("val") and theme_colors:
+            k = sch.get("val")
+            return theme_colors.get(alias_map.get(k, k)) or theme_colors.get(k)
+        return None
+
+    hx = _node_hex(cont.find(qn("a:solidFill")))
+    if hx and len(hx) == 7:
+        return hx
+    gf = cont.find(qn("a:gradFill"))
+    if gf is not None:
+        gs_lst = gf.find(qn("a:gsLst"))
+        if gs_lst is not None:
+            stops = []
+            for gs in gs_lst.findall(qn("a:gs")):
+                shx = _node_hex(gs)
+                if shx and len(shx) == 7:
+                    stops.append((int(shx[1:3], 16), int(shx[3:5], 16), int(shx[5:7], 16)))
+            if stops:
+                r = sum(c[0] for c in stops) // len(stops)
+                g = sum(c[1] for c in stops) // len(stops)
+                b = sum(c[2] for c in stops) // len(stops)
+                return f"#{r:02X}{g:02X}{b:02X}"
+    return _node_hex(cont)
+
+
+def _bg_hex(obj, theme_colors=None, clr_map=None, slide_w=None, slide_h=None):
+    """Read solid/gradient background or full-slide backdrop hex from XML without mutating XML."""
     try:
         from pptx.oxml.ns import qn
         csld = obj._element.find(qn("p:cSld"))
         if csld is None:
             return None
-        bg = csld.find(qn("p:bg"))
-        if bg is None:
-            return None
         alias_map = clr_map or {"bg1": "lt1", "bg2": "lt2", "tx1": "dk1", "tx2": "dk2"}
-        for container_tag in ("p:bgPr", "p:bgRef"):
-            cont = bg.find(qn(container_tag))
-            if cont is None:
-                continue
-            sf = cont.find(qn("a:solidFill")) if container_tag == "p:bgPr" else cont
-            if sf is None:
-                continue
-            srgb = sf.find(qn("a:srgbClr"))
-            if srgb is not None and srgb.get("val"):
-                return "#" + srgb.get("val")
-            sch = sf.find(qn("a:schemeClr"))
-            if sch is not None and sch.get("val") and theme_colors:
-                k = sch.get("val")
-                mapped = alias_map.get(k, k)
-                return theme_colors.get(mapped) or theme_colors.get(k)
+        bg = csld.find(qn("p:bg"))
+        if bg is not None:
+            for container_tag in ("p:bgPr", "p:bgRef"):
+                hx = _fill_hex_from_el(bg.find(qn(container_tag)), theme_colors, alias_map, qn)
+                if hx and len(hx) == 7:
+                    return hx
+        if slide_w and slide_h:
+            slide_area = max(slide_w * slide_h, 1.0)
+            for sh in getattr(obj, "shapes", ()):
+                if getattr(sh, "is_placeholder", False) or getattr(sh, "has_table", False):
+                    continue
+                if getattr(sh, "has_text_frame", False) and sh.text_frame.text.strip():
+                    continue
+                bw, bh = inches(sh.width) or 0.0, inches(sh.height) or 0.0
+                if bw * bh >= 0.75 * slide_area:
+                    hx = _fill_hex_from_el(sh._element.find(qn("p:spPr")), theme_colors, alias_map, qn)
+                    if hx and len(hx) == 7:
+                        return hx
     except Exception:
         pass
     return None
@@ -178,12 +214,16 @@ def inspect(path: Path):
         sw, sh = inches(prs.slide_width), inches(prs.slide_height)
         masters = []
         for master in prs.slide_masters:
-            m_bg = _bg_hex(master, t_colors)
+            m_bg = _bg_hex(master, t_colors, slide_w=sw, slide_h=sh)
             m_decor = _edge_decor_margins(master, sw, sh)
             layouts = []
             for lo in master.slide_layouts:
                 cmap = _layout_clr_map(lo)
-                lo_bg = _bg_hex(lo, t_colors, cmap) or _bg_hex(master, t_colors, cmap) or t_colors.get(cmap.get("bg1", "lt1"))
+                lo_bg = (
+                    _bg_hex(lo, t_colors, cmap, slide_w=sw, slide_h=sh)
+                    or _bg_hex(master, t_colors, cmap, slide_w=sw, slide_h=sh)
+                    or t_colors.get(cmap.get("bg1", "lt1"))
+                )
                 lo_decor = _edge_decor_margins(lo, sw, sh)
                 decor = {k: max(m_decor[k], lo_decor[k]) for k in ("top", "bottom", "left", "right")}
                 phs = []
