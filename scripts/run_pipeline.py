@@ -140,11 +140,11 @@ def cmd_prepare(args) -> int:
             sec_per = max(20, int(round(dur_min * 60.0 / sc_est)))
             is_en_p = str(wo_d.get("language") or "zh").lower().startswith("en")
             if is_en_p:
-                w_target = max(35, min(190, int(round(sec_per * 2.2))))
-                tgt_str = f"~{w_target} words/slide (~{sec_per}s/slide, 2-4 spoken sentences)"
+                w_target = max(40, min(125, int(round(sec_per * 1.5))))
+                tgt_str = f"~{w_target} words/slide (~{sec_per}s/slide incl. figure pauses, 2-4 spoken sentences)"
             else:
-                c_target = max(65, min(320, int(round(sec_per * 3.8))))
-                tgt_str = f"~{c_target} 字/页 (~{sec_per}s/页, 2-4句自然口语)"
+                c_target = max(70, min(200, int(round(sec_per * 2.5))))
+                tgt_str = f"~{c_target} 字/页 (~{sec_per}s/页含图表停顿, 2-4句自然口语)"
             notes_pacing = {"duration_min": dur_min, "target_slides": sc_est, "sec_per_slide": sec_per, "target": tgt_str}
     except Exception:
         pass
@@ -301,13 +301,26 @@ def _auto_repair_plan(plan: dict, fails: list[dict], work: Path, pass_idx: int) 
             for m in re.findall(r"slide\s+(\d+)", fail_map[cid]):
                 tighten_ids.add(int(m))
     if tighten_ids and is_create:
+        tbl_fail_ids = {int(m) for m in re.findall(r"slide\s+(\d+)", fail_map.get("table_fit", ""))}
         for si in sorted(tighten_ids):
             if 1 <= si <= len(slides) and isinstance(slides[si - 1], dict):
                 cur_t = int(slides[si - 1].get("_tighten", 0) or 0)
                 if cur_t < pass_idx:
                     slides[si - 1]["_tighten"] = pass_idx
                     actions.append(f"tighten_slide_{si}_lvl{pass_idx}")
+                if si in tbl_fail_ids:
+                    for t_obj in ([slides[si - 1].get("table")] + list(slides[si - 1].get("tables") or [])):
+                        if isinstance(t_obj, dict) and t_obj.get("font_pt") is not None:
+                            try:
+                                cur_fp = float(t_obj["font_pt"])
+                                new_fp = max(10.0, round(min(cur_fp - 1.5, 11.5 if pass_idx == 1 else 10.5), 1))
+                                if new_fp < cur_fp:
+                                    t_obj["font_pt"] = new_fp
+                                    actions.append(f"shrink_tbl_font_s{si}_{new_fp}pt")
+                            except Exception:
+                                pass
     elif tighten_ids and edits:
+        tbl_fail_e = "table_fit" in fail_map
         for idx_e, e in enumerate(edits, 1):
             if not isinstance(e, dict):
                 continue
@@ -318,6 +331,17 @@ def _auto_repair_plan(plan: dict, fails: list[dict], work: Path, pass_idx: int) 
                 if cur_t < pass_idx:
                     target_spec["_tighten"] = pass_idx
                     actions.append(f"tighten_edit_{idx_e}_lvl{pass_idx}")
+                if tbl_fail_e:
+                    t_obj = target_spec.get("table") if isinstance(target_spec.get("table"), dict) else (target_spec if eop == "set_table" else None)
+                    if isinstance(t_obj, dict) and t_obj.get("font_pt") is not None:
+                        try:
+                            cur_fp = float(t_obj["font_pt"])
+                            new_fp = max(10.0, round(min(cur_fp - 1.5, 11.5 if pass_idx == 1 else 10.5), 1))
+                            if new_fp < cur_fp:
+                                t_obj["font_pt"] = new_fp
+                                actions.append(f"shrink_tbl_font_e{idx_e}_{new_fp}pt")
+                        except Exception:
+                            pass
 
     # 1b. Clamp any explicit sub-floor font sizes (size < 10.5 or table font_pt < 10.0)
     if "min_font" in fail_map:

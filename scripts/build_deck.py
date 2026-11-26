@@ -232,12 +232,34 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
             # Widen 4:3-stuck-on-16:9 narrow title placeholders (e.g. 9.0" on 13.33" canvas)
             # so titles align cleanly across the 16:9 slide & avoid off-center / 1-word orphan wraps
             tl0, tt0, tw0, th0 = du.ph_geom(prs, slide, tph)
-            if du.ph_ok(tw0) and du.ph_ok(th0) and int(tw0) < int(SW * 0.72) and (int(tl0 or 0) < int(SW * 0.15)):
+            SH = int(prs.slide_height)
+            is_bare_qa = (
+                role in ("qa", "closing", "thanks")
+                and not (spec.get("bullets") or spec.get("table") or spec.get("chart")
+                         or spec.get("image") or spec.get("images") or spec.get("two_col"))
+            )
+            if is_bare_qa and du.ph_ok(tt0) and du.ph_ok(th0) and int(tt0) > int(SH * 0.50):
+                du.set_ph_rect(prs, slide, tph, left=int(SW * 0.08), top=int(SH * 0.36),
+                               width=int(SW * 0.84), height=max(int(th0), int(Inches(1.1))))
+                try:
+                    from pptx.enum.text import PP_ALIGN as _PPA_QA
+                    for p_q in tph.text_frame.paragraphs:
+                        p_q.alignment = _PPA_QA.CENTER
+                except Exception:
+                    pass
+            elif du.ph_ok(tw0) and du.ph_ok(th0) and int(tw0) < int(SW * 0.72) and (int(tl0 or 0) < int(SW * 0.15)):
                 if role in ("title", "section", "qa"):
                     du.set_ph_rect(prs, slide, tph, left=int(SW * 0.08), top=tt0, width=int(SW * 0.84), height=th0)
                 else:
                     du.set_ph_rect(prs, slide, tph, left=int(SW * 0.065), top=tt0, width=int(SW * 0.87), height=th0)
             tph.text_frame.text = du.glue_num_units(title)
+            if is_bare_qa and du.ph_ok(tt0) and int(tt0) > int(SH * 0.50):
+                try:
+                    from pptx.enum.text import PP_ALIGN as _PPA_QA
+                    for p_q in tph.text_frame.paragraphs:
+                        p_q.alignment = _PPA_QA.CENTER
+                except Exception:
+                    pass
             shrink_title(prs, slide, tph, min_pt=t_min_pt, is_cover=(role in ("title", "section", "qa")))
             if needs_light_ink:
                 du.ensure_readable_tf_color(tph.text_frame)
@@ -255,10 +277,27 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
             if du.ph_ok(sw0) and du.ph_ok(sh0) and int(sw0) < int(SW * 0.72) and (int(sl0 or 0) < int(SW * 0.22)):
                 du.set_ph_rect(prs, slide, sub_ph0, left=int(SW * 0.10), top=st0, width=int(SW * 0.80), height=sh0)
     du.fill_subtitle(slide, subtitle_txt, prs)
-    if needs_light_ink and subtitle_txt.strip():
+    if subtitle_txt.strip() and role in ("title", "section", "qa"):
         sub_ph = du.get_ph(slide, du.SUBTITLE_TYPES)
         if sub_ph is not None and sub_ph.has_text_frame:
-            du.ensure_readable_tf_color(sub_ph.text_frame, (0xCB, 0xD5, 0xE1))
+            # Prefer a clean single line for cover/closing subtitles when a 1-4pt nudge eliminates a short orphan wrap
+            try:
+                _, _, sw_s, _ = du.ph_geom(prs, slide, sub_ph)
+                if du.ph_ok(sw_s) and "\n" not in subtitle_txt:
+                    avail_sub = max(sw_s.pt - 14.0, 120.0)
+                    cur_sub_pt = du.effective_pt(sub_ph, 24.0)
+                    if du.est_lines(subtitle_txt, cur_sub_pt, avail_sub * 0.92) == 2:
+                        need_pt = (avail_sub * 0.89) / max(du.em_width(subtitle_txt), 1.0)
+                        if need_pt >= max(16.0, cur_sub_pt - 9.0):
+                            tgt_sub = round(max(16.0, min(cur_sub_pt - 1.0, need_pt)), 1)
+                            for p_s in sub_ph.text_frame.paragraphs:
+                                p_s.font.size = Pt(tgt_sub)
+                                for r_s in p_s.runs:
+                                    r_s.font.size = Pt(tgt_sub)
+            except Exception:
+                pass
+            if needs_light_ink:
+                du.ensure_readable_tf_color(sub_ph.text_frame, (0xCB, 0xD5, 0xE1))
 
     if role not in ("title", "qa") and accent:
         du.accent_bar(slide, prs, accent)
@@ -658,8 +697,9 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
         t_h = min(t_box_h, max(base_h, est_h))
         # Gently vertically center compact tables so they don't float tiny at top of empty void
         if t_h < int(t_box_h * 0.65):
-            vc_cap = int(Inches(0.68 if dual_visual else 0.42))
-            vc_div = 3 if dual_visual else 4
+            is_open_tbl = (not highlights and not steps and not takeaway and t_h < int(t_box_h * 0.58))
+            vc_cap = int(Inches(0.80 if is_open_tbl else (0.68 if dual_visual else 0.42)))
+            vc_div = 3 if (dual_visual or is_open_tbl) else 4
             t_t = t_t + min(vc_cap, (t_box_h - t_h) // vc_div)
         gf_tbl = du.add_table(
             slide, (t_l, t_t, t_w, t_h), rows,
@@ -1164,9 +1204,10 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                                     )
                                     dl = existing_ch.chart.plots[0].data_labels
                                     if is_pie_ch and (any_pct or any_frac_ch):
-                                        dl.number_format = "0.0%"
+                                        pf_pie = du.chart_pct_fmt(sers, is_pie=True)
+                                        dl.number_format = pf_pie if pf_pie != "0%" else "0.0%"
                                     elif any_pct and not is_pie_ch:
-                                        dl.number_format = '0.0"%"'
+                                        dl.number_format = du.chart_pct_fmt(sers, is_pie=False)
                                 except Exception:
                                     pass
                         except Exception:
@@ -1191,7 +1232,12 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                                            ch_cap, cap_pt=11.0, color=ccol)
             eid = id(slide._element)
             sp_cur = dict(specs_by_eid.get(eid) or {})
-            sp_cur["chart"] = dict(ch_spec)
+            sp_ch = dict(ch_spec)
+            if not sp_ch.get("ref") and e.get("ref"):
+                sp_ch["ref"] = e.get("ref")
+            if not sp_ch.get("caption") and e.get("caption"):
+                sp_ch["caption"] = e.get("caption")
+            sp_cur["chart"] = sp_ch
             specs_by_eid[eid] = sp_cur
             _rec_src(eid, e.get("sources"))
             cm_changes.append({"op": "set_chart", "slide": sidx + 1,

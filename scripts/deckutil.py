@@ -1210,6 +1210,26 @@ def parse_chart_num(v) -> tuple[float, bool]:
     return float(s), has_pct
 
 
+def chart_pct_fmt(series_list, is_pie: bool = False) -> str:
+    """Return exact-precision percent format ('0%', '0.0%', or '0.00%') matching source values
+    so native PowerPoint charts NEVER silently round 2-decimal metrics like 94.23% -> 94.2%."""
+    max_dec = 0
+    for sr in (series_list or []):
+        for rv in (sr.get("values") or []):
+            try:
+                fv, _ = parse_chart_num(rv)
+            except Exception:
+                continue
+            if abs(fv - round(fv)) <= 1e-6:
+                continue
+            s_clean = f"{fv:.4f}".rstrip("0").rstrip(".")
+            if "." in s_clean:
+                max_dec = max(max_dec, min(2, len(s_clean.split(".")[1])))
+    if is_pie:
+        return "0.00%" if max_dec >= 2 else ("0.0%" if max_dec == 1 else "0%")
+    return '0.00"%"' if max_dec >= 2 else ('0.0"%"' if max_dec == 1 else '0"%"')
+
+
 def add_native_chart(slide, rect, chart_spec, palette=None):
     """Add a fully-editable native PPT chart bound to plan data (创新点：图表数据绑定).
     chart_spec: {type: bar|hbar|line|pie, categories: [...], series: [{name, values}],
@@ -1275,6 +1295,14 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                 if abs(fv - round(fv)) > 1e-6:
                     any_frac = True
                     break
+        pct_fmt_bar = chart_pct_fmt(series_list, is_pie=False)
+        pct_fmt_pie = chart_pct_fmt(series_list, is_pie=True)
+        if chart.plots:
+            try:
+                if ctype in (XL_CHART_TYPE.COLUMN_CLUSTERED, XL_CHART_TYPE.BAR_CLUSTERED):
+                    chart.plots[0].gap_width = 85
+            except Exception:
+                pass
         if show_labels and chart.plots:
             plot = chart.plots[0]
             plot.has_data_labels = True
@@ -1293,14 +1321,14 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                     dl.show_category_name = True
                     dl.show_value = bool(chart_spec.get("show_value", False))
                     dl.position = XL_LABEL_POSITION.BEST_FIT
-                    # Prevent PowerPoint/LibreOffice default '0%' integer rounding on fractional shares
+                    # Match source precision (0% / 0.0% / 0.00%) so fractional shares are never rounded
                     if any_pct or any_frac:
-                        dl.number_format = "0.0%"
+                        dl.number_format = pct_fmt_pie if pct_fmt_pie != "0%" else "0.0%"
             except Exception:
                 pass
             if any_pct and ctype != XL_CHART_TYPE.PIE:
                 try:
-                    dl.number_format = '0.0"%"'
+                    dl.number_format = pct_fmt_bar
                 except Exception:
                     pass
             if dark_bg and ctype not in (XL_CHART_TYPE.COLUMN_STACKED, XL_CHART_TYPE.BAR_STACKED):
@@ -1355,7 +1383,7 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                                 sdl.font.size = Pt(10.5 if n_series > 1 else 11.0)
                                 sdl.font.bold = True
                                 if any_pct:
-                                    sdl.number_format = '0.0"%"'
+                                    sdl.number_format = pct_fmt_bar
                                 sdl.font.color.rgb = (
                                     RGBColor(0xFF, 0xFF, 0xFF) if _rel_luminance(rgb_t) < 0.42
                                     else RGBColor(0x1A, 0x20, 0x2C)
@@ -1382,6 +1410,10 @@ def add_native_chart(slide, rect, chart_spec, palette=None):
                     ax.tick_labels.font.size = Pt(11.5)
                     if dark_bg:
                         ax.tick_labels.font.color.rgb = RGBColor(0xD8, 0xE2, 0xEC)
+                    try:
+                        ax.format.line.color.rgb = RGBColor(0x47, 0x55, 0x69) if dark_bg else RGBColor(0xCB, 0xD5, 0xE1)
+                    except Exception:
+                        pass
                     if chart_spec.get(title_key):
                         ax.has_title = True
                         ax.axis_title.text_frame.text = strip_md(str(chart_spec[title_key]))
@@ -1563,10 +1595,37 @@ def compute_table_col_widths(rows, total_w: int) -> list[int]:
     return col_widths
 
 
+def _set_cell_booktabs_borders(cell, top_hex: str | None = None, top_pt: float = 0.0,
+                               bot_hex: str | None = None, bot_pt: float = 0.0) -> None:
+    """Apply clean publication-grade horizontal booktabs rules (zero vertical gridlines)."""
+    try:
+        from lxml import etree
+        from pptx.oxml.ns import qn
+        tcPr = cell._tc.get_or_add_tcPr()
+        for tag in ("a:lnL", "a:lnR", "a:lnT", "a:lnB"):
+            for old in tcPr.findall(qn(tag)):
+                tcPr.remove(old)
+        # No vertical borders
+        for tag in ("a:lnL", "a:lnR"):
+            ln = etree.SubElement(tcPr, qn(tag), w="0")
+            etree.SubElement(ln, qn("a:noFill"))
+        # Optional horizontal rules
+        for tag, hx, pt_w in (("a:lnT", top_hex, top_pt), ("a:lnB", bot_hex, bot_pt)):
+            if hx and pt_w > 0:
+                ln = etree.SubElement(tcPr, qn(tag), w=str(int(round(pt_w * 12700))))
+                sf = etree.SubElement(ln, qn("a:solidFill"))
+                etree.SubElement(sf, qn("a:srgbClr"), val=hx.lstrip("#").upper())
+            else:
+                ln = etree.SubElement(tcPr, qn(tag), w="0")
+                etree.SubElement(ln, qn("a:noFill"))
+    except Exception:
+        pass
+
+
 def add_table(slide, rect, rows, header=True, font_pt=12.0, accent=None,
               highlight_row=None, max_h=None):
-    """Add an academic-styled table with content-weighted column widths, contrast-safe
-    theme header, zebra rows, optional emphasized row, and clamped height."""
+    """Add an academic booktabs-styled table with content-weighted column widths, contrast-safe
+    theme header, light/dark canvas adaptation, zebra rows, emphasized row, and clamped height."""
     from pptx.dml.color import RGBColor
     from pptx.enum.text import MSO_ANCHOR, PP_ALIGN
     from pptx.util import Emu, Pt as _Pt
@@ -1593,14 +1652,30 @@ def add_table(slide, rect, rows, header=True, font_pt=12.0, accent=None,
     for c in range(ncols):
         tbl.columns[c].width = Emu(col_widths[c])
 
-    hdr_t = _parse_hex(accent)
-    hdr_rgb = RGBColor(*hdr_t)
-    hdr_text_rgb = RGBColor(0x1A, 0x1A, 0x1A) if _rel_luminance(hdr_t) > 0.52 else RGBColor(0xFF, 0xFF, 0xFF)
-    acc_safe = _safe_accent_for_light_bg(accent)
-    hi_bg_rgb = RGBColor(*_tint_rgb(acc_safe, 0.14))
-    zebra_rgb = RGBColor(0xF4, 0xF6, 0xF9)
-    white_rgb = RGBColor(0xFF, 0xFF, 0xFF)
-    dark_rgb = RGBColor(0x22, 0x22, 0x22)
+    dark = slide_is_dark(slide)
+    if dark:
+        hdr_t = _safe_accent_for_dark_bg(accent)
+        hdr_rgb = RGBColor(*hdr_t)
+        hdr_text_rgb = RGBColor(0x0F, 0x17, 0x2A) if _rel_luminance(hdr_t) > 0.48 else RGBColor(0xFF, 0xFF, 0xFF)
+        hi_ink_rgb = RGBColor(*hdr_t)
+        hi_bg_rgb = RGBColor(0x23, 0x38, 0x56)
+        zebra_rgb = RGBColor(0x1E, 0x29, 0x3B)
+        base_rgb = RGBColor(0x16, 0x20, 0x33)
+        body_rgb = RGBColor(0xE2, 0xE8, 0xF0)
+        rule_hex = "334155"
+        edge_hex = f"{hdr_t[0]:02X}{hdr_t[1]:02X}{hdr_t[2]:02X}"
+    else:
+        hdr_t = _parse_hex(accent)
+        hdr_rgb = RGBColor(*hdr_t)
+        hdr_text_rgb = RGBColor(0x1A, 0x1A, 0x1A) if _rel_luminance(hdr_t) > 0.52 else RGBColor(0xFF, 0xFF, 0xFF)
+        acc_safe = _safe_accent_for_light_bg(accent)
+        hi_ink_rgb = RGBColor(*acc_safe)
+        hi_bg_rgb = RGBColor(*_tint_rgb(acc_safe, 0.14))
+        zebra_rgb = RGBColor(0xF8, 0xFA, 0xFC)
+        base_rgb = RGBColor(0xFF, 0xFF, 0xFF)
+        body_rgb = RGBColor(0x22, 0x22, 0x22)
+        rule_hex = "CBD5E1"
+        edge_hex = f"{acc_safe[0]:02X}{acc_safe[1]:02X}{acc_safe[2]:02X}"
 
     hi_idx = None
     if highlight_row is not None:
@@ -1616,6 +1691,7 @@ def add_table(slide, rect, rows, header=True, font_pt=12.0, accent=None,
     for ri, row in enumerate(rows):
         is_hdr = header and ri == 0
         is_hi = (hi_idx is not None and ri == hi_idx)
+        is_last = (ri == nrows - 1)
         for ci in range(ncols):
             cell = tbl.cell(ri, ci)
             txt = str(row[ci]) if ci < len(row) else ""
@@ -1631,7 +1707,14 @@ def add_table(slide, rect, rows, header=True, font_pt=12.0, accent=None,
                 elif is_hi:
                     cell.fill.fore_color.rgb = hi_bg_rgb
                 else:
-                    cell.fill.fore_color.rgb = zebra_rgb if (ri % 2 == 0) else white_rgb
+                    cell.fill.fore_color.rgb = zebra_rgb if (ri % 2 == 0) else base_rgb
+                _set_cell_booktabs_borders(
+                    cell,
+                    top_hex=(edge_hex if ri == 0 else None),
+                    top_pt=(1.25 if ri == 0 else 0.0),
+                    bot_hex=(edge_hex if (is_hdr or is_last) else rule_hex),
+                    bot_pt=(1.25 if (is_hdr or is_last) else 0.5),
+                )
             except Exception:
                 pass
             tf = cell.text_frame
@@ -1643,7 +1726,7 @@ def add_table(slide, rect, rows, header=True, font_pt=12.0, accent=None,
                 p.alignment = PP_ALIGN.CENTER if ci > 0 else PP_ALIGN.LEFT
             elif ci > 0 and _is_numeric_cell(plain_txt):
                 p.alignment = PP_ALIGN.CENTER
-            cell_color = hdr_text_rgb if is_hdr else (RGBColor(*acc_safe) if is_hi else dark_rgb)
+            cell_color = hdr_text_rgb if is_hdr else (hi_ink_rgb if is_hi else body_rgb)
             add_rich_runs(p, txt, base_bold=(is_hdr or is_hi), size_pt=font_pt, color_rgb=cell_color)
     return gf
 

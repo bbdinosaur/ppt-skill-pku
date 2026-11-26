@@ -26,7 +26,7 @@ CONTRACT_FIELDS = ["case_id", "status", "editable_source", "export_artifact",
 def read_json(p: Path, default=None):
     if p.is_file():
         try:
-            return json.loads(p.read_text(encoding="utf-8"))
+            return json.loads(p.read_text(encoding="utf-8-sig"))
         except Exception:
             return default
     return default
@@ -122,10 +122,12 @@ def main() -> int:
             "images": (
                 [{"path": (s.get("image") or {}).get("path"),
                   "ref": (s.get("image") or {}).get("ref"),
-                  "caption": (s.get("image") or {}).get("caption")}]
+                  "caption": (s.get("image") or {}).get("caption"),
+                  **({"missing": True} if (s.get("image") or {}).get("missing") else {})}]
                 if s.get("image") else []
             ) + [
-                {"path": im.get("path"), "ref": im.get("ref"), "caption": im.get("caption")}
+                {"path": im.get("path"), "ref": im.get("ref"), "caption": im.get("caption"),
+                 **({"missing": True} if im.get("missing") else {})}
                 for im in (s.get("images") or []) if isinstance(im, dict)
             ],
             "tables": (
@@ -204,7 +206,8 @@ def main() -> int:
                 cl_entries.append(json.loads(ln))
             except Exception:
                 pass
-    first_ts = cl_entries[0].get("ts") if cl_entries else None
+    inspect_entries = [e for e in cl_entries if e.get("action") == "inspect" and e.get("ts")]
+    first_ts = (inspect_entries[-1].get("ts") if inspect_entries else (cl_entries[0].get("ts") if cl_entries else None))
     now_ts = du.now_iso()
     elapsed_sec = None
     if first_ts:
@@ -317,9 +320,12 @@ def main() -> int:
                 "policy": "redrawn as native editable PowerPoint chart from verified source table",
             })
         for tb in (s.get("tables") or []):
+            r_cnt = tb.get("rows") if isinstance(tb.get("rows"), int) else (
+                tb.get("rows_count") or len(tb.get("all_rows") or tb.get("rows_preview") or [])
+            )
             fig_decisions.append({
                 "slide": sno, "kind": "native_table",
-                "rows": tb.get("rows_count") or len(tb.get("all_rows") or tb.get("rows_preview") or []),
+                "rows": r_cnt,
                 "ref": tb.get("ref") or "", "caption": tb.get("caption") or "",
                 "policy": "native editable table preserving exact source values",
             })

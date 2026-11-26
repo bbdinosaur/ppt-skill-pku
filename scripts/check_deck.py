@@ -49,10 +49,10 @@ def corpus_from_material(inv, work: Path | None = None):
     p = inv.get("material_json_path")
     if p and Path(p).is_file():
         try:
-            walk(_json.loads(Path(p).read_text(encoding="utf-8")))
+            walk(_json.loads(Path(p).read_text(encoding="utf-8-sig")))
         except Exception:
             try:
-                buf.append(Path(p).read_text(encoding="utf-8", errors="replace"))
+                buf.append(Path(p).read_text(encoding="utf-8-sig", errors="replace"))
             except Exception:
                 pass
     if inv.get("workorder_raw"):
@@ -61,7 +61,7 @@ def corpus_from_material(inv, work: Path | None = None):
     tmd = inv.get("task_md")
     if tmd and Path(tmd).is_file():
         try:
-            buf.append(Path(tmd).read_text(encoding="utf-8", errors="replace"))
+            buf.append(Path(tmd).read_text(encoding="utf-8-sig", errors="replace"))
         except Exception:
             pass
     cdir = inv.get("case_dir")
@@ -69,27 +69,27 @@ def corpus_from_material(inv, work: Path | None = None):
         cj = Path(cdir) / "case.json"
         if cj.is_file():
             try:
-                walk(_json.loads(cj.read_text(encoding="utf-8")))
+                walk(_json.loads(cj.read_text(encoding="utf-8-sig")))
             except Exception:
                 pass
     sdd = inv.get("start_deck_dump")
     if sdd and Path(sdd).is_file():
         try:
-            buf.append(Path(sdd).read_text(encoding="utf-8", errors="replace"))
+            buf.append(Path(sdd).read_text(encoding="utf-8-sig", errors="replace"))
         except Exception:
             pass
     if work is not None:
         sdd2 = work / "start_deck_dump.md"
         if sdd2.is_file() and str(sdd2) != str(sdd):
             try:
-                buf.append(sdd2.read_text(encoding="utf-8", errors="replace"))
+                buf.append(sdd2.read_text(encoding="utf-8-sig", errors="replace"))
             except Exception:
                 pass
     for ef in (inv.get("extra_text_files") or []):
         ep = Path(ef)
         if ep.is_file():
             try:
-                buf.append(ep.read_text(encoding="utf-8", errors="replace"))
+                buf.append(ep.read_text(encoding="utf-8-sig", errors="replace"))
             except Exception:
                 pass
     return "\n".join(buf)
@@ -382,6 +382,18 @@ def _nearest_quote_line(quote: str, raw_lines: list[str]) -> str:
 _THOUSANDS_RE = re.compile(r"(?<![\d.])(\d{1,3}(?:,\d{3})+)(?!\d)")
 _STANDALONE_NUM_RE = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)(?![\d.])")
 _INT_PCT_RE = re.compile(r"(?<![A-Za-z0-9.])(\d{1,2})\s*%(?!\d)")
+_INT_UNIT_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(\d{1,2})[\s\u00a0]+("
+    r"ms|us|μs|µs|ns|ps|GB|MB|KB|TB|PB|Hz|kHz|MHz|GHz|THz|"
+    r"mW|kW|MW|W|fps|dB|nm|μm|µm|mm|cm|km|mA|mV|kV|eV|keV|MeV|GeV|mK|Pa|kPa|MPa|GPa|mg|kg|mL"
+    r")(?![A-Za-z0-9])"
+)
+_DEC_UNIT_RE = re.compile(
+    r"(?<![A-Za-z0-9.])(\d+\.\d+)[\s\u00a0]*("
+    r"ms|us|μs|µs|ns|ps|GB|MB|KB|TB|PB|Hz|kHz|MHz|GHz|THz|"
+    r"mW|kW|MW|W|fps|dB|nm|μm|µm|mm|cm|km|mA|mV|kV|eV|keV|MeV|GeV|mK|Pa|kPa|MPa|GPa|mg|kg|mL"
+    r")(?![A-Za-z0-9])"
+)
 
 
 def _strip_thousands(s: str) -> str:
@@ -516,6 +528,15 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                     dec_pct_vals.add(round(fv * 100.0, 6))
             elif 0 < fv < 1:
                 exact_pct_vals.add(round(fv * 100.0, 6))
+        except Exception:
+            pass
+    # Also index unit-bearing decimals (e.g. '18.5 ms', '16.2 GB') so impression-rounded
+    # physical quantities (e.g. '19 ms', '16 GB') are caught with zero false positives.
+    dec_by_unit: dict[str, set[float]] = {}
+    for um in _DEC_UNIT_RE.finditer(raw_nc):
+        try:
+            u_norm = um.group(2).replace("µ", "μ").replace("us", "μs")
+            dec_by_unit.setdefault(u_norm, set()).add(float(um.group(1)))
         except Exception:
             pass
     # Also collect leading-dot decimals like .854 in APA/stats tables
@@ -676,6 +697,25 @@ def check_numbers(content_map, material_text_file, fallback_corpus="", skip_slid
                         f"slide {s.get('slide')}: rounded percentage '{tok_p}' loses precision "
                         f"(exact in material: {near_dec[0][1]:g})"
                     )
+            # 3c) Catch impression-rounded physical quantities (e.g. paper 18.5 ms -> slide 19 ms)
+            for um in _INT_UNIT_RE.finditer(t_clean):
+                iv = int(um.group(1))
+                u_raw = um.group(2)
+                u_norm = u_raw.replace("µ", "μ").replace("us", "μs")
+                tok_u = f"{iv} {u_raw}"
+                if iv == 0 or tok_u in seen:
+                    continue
+                seen.add(tok_u)
+                if any(abs(iv - ev) <= 1e-6 for ev in exact_pct_vals):
+                    continue
+                u_decs = dec_by_unit.get(u_norm) or set()
+                near_u = sorted((abs(dv - iv), dv) for dv in u_decs if 1e-6 < abs(dv - iv) <= 0.5)
+                if near_u:
+                    checked += 1
+                    issues.append(
+                        f"slide {s.get('slide')}: rounded quantity '{tok_u}' loses precision "
+                        f"(exact in material: {near_u[0][1]:g} {u_raw})"
+                    )
             # 4) Standard decimals and 3+ digit integers
             for m in NUM_RE.findall(t_clean):
                 if m in seen:
@@ -819,7 +859,7 @@ def main() -> int:
     cmf = work / "content_map.json"
     if cmf.is_file():
         try:
-            content_map = json.loads(cmf.read_text(encoding="utf-8"))
+            content_map = json.loads(cmf.read_text(encoding="utf-8-sig"))
         except Exception:
             pass
 
@@ -850,7 +890,7 @@ def main() -> int:
     sdf = work / "slide_diff.json"
     if content_map.get("mode") == "edit" and sdf.is_file():
         try:
-            sd = json.loads(sdf.read_text(encoding="utf-8"))
+            sd = json.loads(sdf.read_text(encoding="utf-8-sig"))
             zero_hit_edits = list(sd.get("zero_hit_edits") or [])
             for row in (sd.get("slides") or []):
                 si = row.get("slide")
