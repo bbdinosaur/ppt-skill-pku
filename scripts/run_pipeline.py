@@ -116,11 +116,61 @@ def cmd_prepare(args) -> int:
     if start_deck_truncated and sdd_file:
         read_more_hints.append(f"start_deck_dump ({len(s_txt)} chars > 6.5k): read {sdd_file}")
 
+    # Compute duration-aware per-slide speaker-notes pacing target + bitmap-vs-chart visual policy
+    wo_d = inv.get("workorder") or {}
+    notes_pacing = None
+    try:
+        dur_raw = str(wo_d.get("duration") or "").strip()
+        dm = re.findall(r"\d+(?:\.\d+)?", dur_raw)
+        if dm:
+            dur_val = (float(dm[0]) + float(dm[1])) / 2.0 if len(dm) >= 2 else float(dm[0])
+            if re.search(r"(?:sec|秒|\bs\b)", dur_raw.lower()) and not re.search(r"(?:min|分)", dur_raw.lower()):
+                dur_min = round(dur_val / 60.0, 2)
+            else:
+                dur_min = round(dur_val, 2)
+            sc_est = (
+                wo_d.get("slide_count")
+                or (int((wo_d["min_slides"] + wo_d["max_slides"]) // 2)
+                    if wo_d.get("min_slides") and wo_d.get("max_slides") else None)
+                or wo_d.get("max_slides") or wo_d.get("min_slides")
+                or (len((inv.get("start_deck") or {}).get("slides", [])) if inv.get("start_deck") else None)
+                or 8
+            )
+            sc_est = max(1, int(sc_est))
+            sec_per = max(20, int(round(dur_min * 60.0 / sc_est)))
+            is_en_p = str(wo_d.get("language") or "zh").lower().startswith("en")
+            if is_en_p:
+                w_target = max(35, min(190, int(round(sec_per * 2.2))))
+                tgt_str = f"~{w_target} words/slide (~{sec_per}s/slide, 2-4 spoken sentences)"
+            else:
+                c_target = max(65, min(320, int(round(sec_per * 3.8))))
+                tgt_str = f"~{c_target} 字/页 (~{sec_per}s/页, 2-4句自然口语)"
+            notes_pacing = {"duration_min": dur_min, "target_slides": sc_est, "sec_per_slide": sec_per, "target": tgt_str}
+    except Exception:
+        pass
+
+    n_pdf_tbls = len(pdf_ex.get("tables_extracted") or [])
+    mat_d = inv.get("material") or {}
+    n_mat_tbls = len(mat_d.get("tables") or []) if isinstance(mat_d.get("tables"), list) else (1 if mat_d.get("tables") else 0)
+    n_data_files = sum(1 for ef in (inv.get("extra_text_files") or []) if str(ef).lower().endswith((".csv", ".tsv", ".xlsx")))
+    visual_policy = {
+        "embed_original_only": len(figs),
+        "data_bound_table_sources": n_pdf_tbls + n_mat_tbls + n_data_files,
+        "rule": (
+            "Bitmaps/paper figures -> embed original verbatim + ref/caption (do NOT redraw curves); "
+            + ("structured numeric tables available -> redraw >=1 comparison as native data-bound chart with exact values & units."
+               if (n_pdf_tbls + n_mat_tbls + n_data_files) > 0
+               else "no structured numeric tables extracted -> cite exact text metrics only, do NOT fabricate charts.")
+        ),
+    }
+
     # Keep line 1 strictly compact single-line JSON, then print readable Markdown sections below
     brief = {
         "rp_path": str(SCRIPTS / "run_pipeline.py"),
         "case_id": inv.get("case_id"),
         "workorder": inv.get("workorder"),
+        "notes_pacing_target": notes_pacing,
+        "visual_policy": visual_policy,
         "task_md": task_info,
         "template": {
             "path": tmpl.get("path"),
@@ -652,6 +702,10 @@ def cmd_deliver(args) -> int:
     # Snapshot this iteration into work/history/vN/ and write version_history.md for rollback
     version_meta = None
     try:
+        import hashlib as _hl
+        def _sha12(fp: Path) -> str:
+            return _hl.sha256(fp.read_bytes()).hexdigest()[:12] if fp.is_file() else ""
+
         vdir = hroot / f"v{ver_num}"
         vdir.mkdir(parents=True, exist_ok=True)
         if deck.is_file():
@@ -660,6 +714,33 @@ def cmd_deliver(args) -> int:
             shutil.copy2(str(active_plan), str(vdir / "slides_plan.json"))
         if (work / "checks.json").is_file():
             shutil.copy2(str(work / "checks.json"), str(vdir / "checks.json"))
+        # Cross-version plan diff vs v{ver_num-1} (for multi-iteration create & edit auditability)
+        iter_diffs: list[str] = []
+        if ver_num >= 2:
+            prev_p = _read_json(hroot / f"v{ver_num - 1}" / "slides_plan.json", {}) or {}
+            cur_p = _read_json(vdir / "slides_plan.json", {}) or {}
+            psl = prev_p.get("slides") or []
+            csl = cur_p.get("slides") or []
+            if psl or csl:
+                for si_d in range(max(len(psl), len(csl))):
+                    a_s = psl[si_d] if si_d < len(psl) else None
+                    b_s = csl[si_d] if si_d < len(csl) else None
+                    if a_s is None:
+                        iter_diffs.append(f"S{si_d + 1}: added ({(b_s or {}).get('title', '')[:32]})")
+                    elif b_s is None:
+                        iter_diffs.append(f"S{si_d + 1}: removed")
+                    elif a_s != b_s:
+                        ch_keys = sorted(k for k in set(a_s.keys()) | set(b_s.keys()) if a_s.get(k) != b_s.get(k))
+                        iter_diffs.append(f"S{si_d + 1}: modified [{', '.join(ch_keys[:6])}]")
+            elif (prev_p.get("edits") or []) != (cur_p.get("edits") or []):
+                iter_diffs.append(f"edits: {len(prev_p.get('edits') or [])} -> {len(cur_p.get('edits') or [])} ops updated")
+        reason_tags = []
+        if patched:
+            reason_tags.append("patch:" + ",".join(str(x) for x in patched))
+        if auto_repaired:
+            reason_tags.append("auto_repair:" + ",".join(auto_repaired[:4]))
+        reason_str = "; ".join(reason_tags) or ("initial build" if ver_num == 1 else "re-deliver")
+
         idx_path = hroot / "versions.json"
         records = _read_json(idx_path, []) or []
         records.append({
@@ -668,31 +749,48 @@ def cmd_deliver(args) -> int:
             "slides": checks.get("slide_count"),
             "passed": f"{len(chk_list) - len(fails)}/{len(chk_list)}",
             "status": res.get("status"),
+            "pptx_sha256": _sha12(deck),
+            "plan_sha256": _sha12(active_plan),
+            "reason": reason_str,
+            "diff_vs_prev": iter_diffs[:12],
             "snapshot_dir": str(vdir),
         })
         idx_path.write_text(json.dumps(records, ensure_ascii=False, indent=1), encoding="utf-8")
         vh_lines = [
             "# 版本历史与回退说明 / Version History & Rollback",
             "",
-            f"- Active delivery version: **`v{ver_num}`** (`{deck.name}`)",
-            f"- Rollback example: `cp {hroot}/v1/presentation.pptx {deck}` (or re-run `deliver --plan {hroot}/v1/slides_plan.json`)",
+            f"- Active delivery version: **`v{ver_num}`** (`{deck.name}`, sha256=`{_sha12(deck)}`)",
+            f"- Rollback to `v1` (instant copy): `cp {hroot}/v1/presentation.pptx {deck}`",
+            f"- Rollback to `v1` (full rebuild): `python3 {SCRIPTS / 'run_pipeline.py'} deliver --case-dir {args.case_dir} --work {work} --out {out} --plan {hroot}/v1/slides_plan.json`",
             "",
-            "| version | timestamp | slides | checks | status |",
-            "|---|---|---|---|---|",
+            "| version | timestamp | slides | checks | status | pptx_sha256 | reason / changes |",
+            "|---|---|---|---|---|---|---|",
         ]
         for rec in records:
+            rs_cell = str(rec.get("reason") or "—").replace("|", "\\|")
+            if rec.get("diff_vs_prev"):
+                rs_cell += " (" + "; ".join(rec["diff_vs_prev"][:4]).replace("|", "\\|") + ")"
             vh_lines.append(
-                f"| {rec['version']} | {rec['ts']} | {rec.get('slides')} | {rec.get('passed')} | {rec.get('status')} |"
+                f"| {rec['version']} | {rec['ts']} | {rec.get('slides')} | {rec.get('passed')} | "
+                f"{rec.get('status')} | `{rec.get('pptx_sha256') or '—'}` | {rs_cell[:120]} |"
             )
+        if iter_diffs:
+            vh_lines.extend(["", f"## Latest Iteration Diff (`v{ver_num - 1}` → `v{ver_num}`)", ""])
+            for dl_i in iter_diffs[:16]:
+                vh_lines.append(f"- {dl_i}")
         (out / "version_history.md").write_text("\n".join(vh_lines) + "\n", encoding="utf-8")
         version_meta = {
             "active_version": f"v{ver_num}",
             "total_versions": len(records),
+            "active_pptx_sha256": _sha12(deck),
             "history_file": "version_history.md",
+            "latest_diff": iter_diffs[:12],
             "rollback_cmd": f"python3 {SCRIPTS / 'run_pipeline.py'} deliver --case-dir {args.case_dir} --work {work} --out {out} --plan {hroot}/v1/slides_plan.json",
         }
         if (out / "result.json").is_file() and isinstance(res, dict):
             res["version_history"] = version_meta
+            if "rollback" in res and not res.get("rollback"):
+                res["rollback"] = version_meta
             if auto_repaired:
                 res["auto_repairs"] = auto_repaired
             (out / "result.json").write_text(json.dumps(res, ensure_ascii=False, indent=1), encoding="utf-8")

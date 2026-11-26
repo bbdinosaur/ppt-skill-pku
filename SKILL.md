@@ -18,7 +18,7 @@ RP=/skills/weekly-skill/scripts/run_pipeline.py
 [ -f "$RP" ] || RP=$(find /skills /app /root /workspace -maxdepth 5 -name run_pipeline.py 2>/dev/null | head -n1)
 python3 "$RP" prepare --case-dir /input --work /app/work --out /app/output
 ```
-单命令解析全量输入、落盘保底 `partial` 版 `result.json`，并输出 `≤28 KB` 简报：`PREPARE_OK`（约束/版式/图路径+图注/`read_more_hints`）+ `TASK.MD`（≤7.5 KB）+ `MATERIAL DIGEST`（导航/首页摘要/图表原注/PDF 与 CSV 表/`material.json`/全篇关键句，≤13.5 KB）+ `START DECK DUMP`（≤6.5 KB）。
+单命令解析全量输入、落盘保底 `partial` 版 `result.json`，并输出 `≤28 KB` 简报：`PREPARE_OK`（约束/`notes_pacing_target`/`visual_policy`/版式/图注/`read_more_hints`）+ `TASK.MD`（≤7.5 KB）+ `MATERIAL DIGEST`（导航/摘要/图注/PDF 与 CSV 表/`material.json`/关键句，≤13.5 KB）+ `START DECK DUMP`（≤6.5 KB）。
 - **按需补读（0–2 步）**：`read_more_hints` 为空直进 Step 2；非空按 `<!-- PDF page N -->` 补读关键段。
 
 ### Step 2 一次性编写 `/app/work/slides_plan.json`（1 步）

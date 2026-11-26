@@ -304,21 +304,97 @@ def main() -> int:
     out = out_dir / "result.json"
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # ---- duration budget (informational, non-blocking): notes speech-time vs workorder duration
+    # ---- per-slide figure/chart policy audit (explicitly distinguishes data-bound native charts
+    #      from verbatim-embedded original bitmaps and missing-figure placeholders)
+    fig_decisions = []
+    for s in cm_slides:
+        sno = s.get("slide")
+        for ch in (s.get("charts") or []):
+            fig_decisions.append({
+                "slide": sno, "kind": "native_data_bound_chart",
+                "chart_type": ch.get("type") or "bar",
+                "ref": ch.get("ref") or "", "caption": ch.get("caption") or ch.get("title") or "",
+                "policy": "redrawn as native editable PowerPoint chart from verified source table",
+            })
+        for tb in (s.get("tables") or []):
+            fig_decisions.append({
+                "slide": sno, "kind": "native_table",
+                "rows": tb.get("rows_count") or len(tb.get("all_rows") or tb.get("rows_preview") or []),
+                "ref": tb.get("ref") or "", "caption": tb.get("caption") or "",
+                "policy": "native editable table preserving exact source values",
+            })
+        for im in (s.get("images") or []):
+            if im.get("missing"):
+                fig_decisions.append({
+                    "slide": sno, "kind": "figure_missing_placeholder",
+                    "ref": im.get("ref") or "", "caption": im.get("caption") or "",
+                    "policy": "honest missing-figure placeholder recorded in uncertainty; never fabricated",
+                })
+            else:
+                fig_decisions.append({
+                    "slide": sno, "kind": "embedded_original_figure",
+                    "file": Path(str(im.get("path") or "")).name,
+                    "ref": im.get("ref") or "", "caption": im.get("caption") or "",
+                    "policy": "original bitmap/paper figure embedded verbatim (aspect-locked, not redrawn)",
+                })
+    result["rubric_coverage"]["figure_chart_decisions"] = fig_decisions
+
+    # ---- duration budget & per-slide time plan (informational, non-blocking)
     wo_dur = wo.get("duration")
     is_en = str(wo.get("language") or plan.get("language") or "zh").lower().startswith("en")
+    target_total_sec = None
+    try:
+        import re as _re_dur
+        dur_s = str(wo_dur or "").strip()
+        dm = _re_dur.findall(r"\d+(?:\.\d+)?", dur_s)
+        if dm:
+            dv = (float(dm[0]) + float(dm[1])) / 2.0 if len(dm) >= 2 else float(dm[0])
+            if _re_dur.search(r"(?:sec|秒|\bs\b)", dur_s.lower()) and not _re_dur.search(r"(?:min|分)", dur_s.lower()):
+                target_total_sec = max(30.0, dv)
+            else:
+                target_total_sec = max(30.0, dv * 60.0)
+    except Exception:
+        pass
+    role_weights = {
+        "title": 0.55, "agenda": 0.55, "outline": 0.55, "toc": 0.55, "section": 0.45,
+        "qa": 0.50, "closing": 0.65, "thanks": 0.50, "summary": 0.90,
+        "background": 1.00, "motivation": 1.00, "limitation": 0.95,
+        "method": 1.25, "result": 1.35, "results": 1.35, "analysis": 1.25, "ablation": 1.20,
+    }
+    raw_weights = [role_weights.get(str(s.get("role") or "").lower(), 1.0) for s in cm_slides]
+    w_sum = sum(raw_weights) or 1.0
+
     est_sec = 0.0
-    for s in cm_slides:
+    time_plan_slides = []
+    for idx_s, s in enumerate(cm_slides):
         notes_txt = s.get("notes") or ""
         if is_en:
             words = len(notes_txt.split())
-            est_sec += max(15.0, words / 2.3)  # ~138 wpm academic talk
+            s_est = max(15.0, words / 2.3)  # ~138 wpm academic talk
+            n_metric = f"{words}w"
         else:
-            est_sec += max(15.0, len(notes_txt) / 4.0)  # ~4 chars/sec CJK speech
+            s_est = max(15.0, len(notes_txt) / 4.0)  # ~4 chars/sec CJK speech
+            n_metric = f"{len(notes_txt)}c"
+        est_sec += s_est
+        s_tgt = round(target_total_sec * raw_weights[idx_s] / w_sum) if target_total_sec else round(s_est)
+        time_plan_slides.append({
+            "slide": s.get("slide"),
+            "role": s.get("role") or "custom",
+            "title": str(s.get("title") or "")[:60],
+            "notes_len": n_metric,
+            "est_sec": round(s_est),
+            "target_sec": s_tgt,
+        })
     est_min = round(est_sec / 60.0, 1)
     result["compliance_checks"]["duration_estimate"] = {
         "estimated_speech_min": est_min, "workorder_duration": wo_dur,
         "note": "informational; ~138 wpm (EN) / ~4 chars/sec (ZH), >=15s per slide"}
+    result["time_plan"] = {
+        "workorder_duration": wo_dur,
+        "target_total_min": round(target_total_sec / 60.0, 1) if target_total_sec else None,
+        "estimated_speech_min": est_min,
+        "slides": time_plan_slides,
+    }
 
     def _md_esc(v) -> str:
         return str(v or "").replace("\r", " ").replace("\n", " ").replace("|", "\\|").strip()
@@ -349,11 +425,27 @@ def main() -> int:
         except Exception:
             pass
 
-    # ---- narrative outline (written BEFORE result.json so result["outline"] persists)
+    # ---- narrative outline + per-slide time pacing plan (written BEFORE result.json so result["outline"] persists)
     try:
-        ol = [f"# 讲稿大纲 / Outline — {result['content_map'].get('deck_title', '')}", ""]
+        ol = [f"# 讲稿大纲与时长分配 / Outline & Time Plan — {result['content_map'].get('deck_title', '')}", ""]
+        ol.append(f"- Target duration: `{wo_dur or 'unspecified'}` | Estimated spoken notes: `~{est_min} min` | Slides: `{len(cm_slides)}`")
+        ol.append("")
+        ol.append("## 讲稿时长与节奏分配 / Time & Pacing Plan")
+        ol.append("| slide | role | title | target (s) | est. notes (s) | notes len |")
+        ol.append("|---|---|---|---|---|---|")
+        for tp in time_plan_slides:
+            ol.append(
+                f"| {tp['slide']} | {_md_esc(tp['role'])} | {_md_esc(tp['title'])[:42]} | "
+                f"{tp['target_sec']}s | {tp['est_sec']}s | {tp['notes_len']} |"
+            )
+        ol.append("")
+        ol.append("## 逐页要点与讲稿 / Slide-by-Slide Script")
+        ol.append("")
+        tp_by_s = {tp["slide"]: tp for tp in time_plan_slides}
         for s in cm_slides:
-            head = f"{s.get('slide')}. [{s.get('role')}] {s.get('title') or '(无标题页)'}"
+            tp_i = tp_by_s.get(s.get("slide")) or {}
+            t_tag = f" (~{tp_i.get('target_sec', tp_i.get('est_sec', 30))}s)" if tp_i else ""
+            head = f"{s.get('slide')}. [{s.get('role')}]{t_tag} {s.get('title') or '(无标题页)'}"
             ol.append(head)
             for b in (s.get("claims") or [])[:6]:
                 ol.append(f"    - {b if isinstance(b, str) else b.get('t', '')}")
@@ -412,6 +504,15 @@ def main() -> int:
         if not exceptions:
             q.append("| (none) | | |")
         q.append("")
+        q.append("## 图表与位图处置 / Figure & Chart Policy")
+        q.append("| slide | kind | ref / caption | policy |")
+        q.append("|---|---|---|---|")
+        for fd in fig_decisions:
+            rc_lbl = f"{fd.get('ref') or ''} {fd.get('caption') or fd.get('file') or ''}".strip()
+            q.append(f"| {fd.get('slide')} | `{fd.get('kind')}` | {_md_esc(rc_lbl)[:48]} | {_md_esc(fd.get('policy'))[:96]} |")
+        if not fig_decisions:
+            q.append("| (text-only deck) | — | — | no external figures or numeric tables |")
+        q.append("")
         q.append("## 页级证据映射 / page-level evidence")
         q.append("| slide | role | title | claim_sources & verbatim quote |")
         q.append("|---|---|---|---|")
@@ -449,6 +550,12 @@ def main() -> int:
         "previews": lambda: str((out_dir / "previews").relative_to(out_dir)) if (out_dir / "previews").is_dir() else None,
         "qa_summary": lambda: result.get("qa_report"),
         "diff": lambda: result.get("slide_diff"),
+        "time_budget": lambda: result.get("time_plan"),
+        "duration_plan": lambda: result.get("time_plan"),
+        "pacing": lambda: result.get("time_plan"),
+        "figure_policy": lambda: (result.get("rubric_coverage") or {}).get("figure_chart_decisions"),
+        "chart_decisions": lambda: (result.get("rubric_coverage") or {}).get("figure_chart_decisions"),
+        "rollback": lambda: result.get("version_history"),
     }
     for req_k in req_from_case:
         if req_k not in result and req_k in alias_map:

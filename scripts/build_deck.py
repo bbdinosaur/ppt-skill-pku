@@ -154,14 +154,29 @@ def _split_body_for_new_visual(prs, slide, rl: int, rt: int, rw: int, rh: int):
             else:
                 bl, bt, bw, bh = int(bsh.left or rl), int(bsh.top or rt), int(bsh.width or rw), int(bsh.height or vis_h)
             if bl + bw > right_l - int(Inches(0.12)):
-                nl = min(bl, rl) if bl < rl + int(Inches(0.35)) else rl
+                nl = rl if (bl < rl - int(Inches(0.12)) or bl > rl + int(Inches(0.35))) else bl
                 nw = max(int(Inches(2.2)), min(left_w, right_l - int(Inches(0.18)) - nl))
                 if bsh.is_placeholder:
                     du.set_ph_rect(prs, slide, bsh, left=nl, top=bt, width=nw, height=bh)
+                    # Cap oversized inherited 24-28pt body text in narrowed split column so body stays
+                    # subordinate to the slide title while preserving template font family/color.
+                    try:
+                        inh_b = du.ph_inherited_pt(bsh, du.DEFAULT_BODY_PT, getattr(prs, "_master_styles", None))
+                        if inh_b > 18.5:
+                            for p_b in bsh.text_frame.paragraphs:
+                                lvl_b = getattr(p_b, "level", 0) or 0
+                                cap_b = max(12.0, 18.0 - lvl_b * 1.5)
+                                if p_b.font.size is None or p_b.font.size.pt > cap_b:
+                                    p_b.font.size = Pt(cap_b)
+                                for r_b in p_b.runs:
+                                    if r_b.font.size is None or r_b.font.size.pt > cap_b:
+                                        r_b.font.size = Pt(cap_b)
+                    except Exception:
+                        pass
                     shrink_ph(prs, slide, bsh, min_pt=10.5)
                 else:
                     bsh.left, bsh.width = Emu(nl), Emu(nw)
-                    shrink_shape(bsh, du.effective_pt(bsh, du.DEFAULT_BODY_PT), min_pt=10.5)
+                    shrink_shape(bsh, min(18.0, du.effective_pt(bsh, du.DEFAULT_BODY_PT)), min_pt=10.5)
         except Exception:
             pass
     return (right_l, rt, right_w, vis_h)
@@ -397,11 +412,11 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                 if needs_light_ink:
                     du.ensure_readable_tf_color(ph.text_frame)
             # Subtle vertical center divider hairline (<0.08" wide -> pure decorative shape)
-            if not highlights and not steps:
+            if not steps and ch_avail >= int(Inches(2.0)):
                 try:
                     from pptx.enum.shapes import MSO_SHAPE
                     div_x = rl + col_w + (col_gap // 2)
-                    div_h = max(int(Inches(1.6)), ch_avail - int(Inches(0.35)))
+                    div_h = max(int(Inches(1.5)), ch_avail - int(Inches(0.35)))
                     vdiv = slide.shapes.add_shape(
                         MSO_SHAPE.RECTANGLE, Emu(div_x), Emu(ct + int(Inches(0.06))),
                         Emu(int(Inches(0.014))), Emu(div_h),
@@ -422,7 +437,7 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
                 shrink_ph(prs, slide, ph, min_pt=b_min_pt, compact_spacing_pt=c_space)
                 if needs_light_ink:
                     du.ensure_readable_tf_color(ph.text_frame)
-            colw = int(rw * 0.50)
+            colw = int(rw * 0.48)
             tx = du.fit_textbox(slide, (rl + rw - colw, ct, colw, ch_avail), "")
             du.fill_bullets_tf(tx.text_frame, right_b, accent_rgb=col_hdr_rgb)
             cap_r = 20.0 if is_sparse_tc else min(17.0, tc_cap)
@@ -435,6 +450,21 @@ def build_create_slide(prs, spec, images_base: Path, work: Path | None = None,
             shrink_shape(tx, pt_left, min_pt=b_min_pt, compact_spacing_pt=c_space)
             if needs_light_ink:
                 du.ensure_readable_tf_color(tx.text_frame)
+            if not steps and not has_visual and ch_avail >= int(Inches(2.0)):
+                try:
+                    from pptx.enum.shapes import MSO_SHAPE
+                    div_x = rl + int(rw * 0.49)
+                    div_h = max(int(Inches(1.5)), ch_avail - int(Inches(0.35)))
+                    vdiv = slide.shapes.add_shape(
+                        MSO_SHAPE.RECTANGLE, Emu(div_x), Emu(ct + int(Inches(0.06))),
+                        Emu(int(Inches(0.014))), Emu(div_h),
+                    )
+                    vdiv.fill.solid()
+                    vdiv.fill.fore_color.rgb = _RGBColor(0x33, 0x4E, 0x73) if du.slide_is_dark(slide) else _RGBColor(0xD8, 0xE1, 0xEC)
+                    vdiv.line.fill.background()
+                    du._flat_shape(vdiv)
+                except Exception:
+                    pass
     elif bullets:
         rendered_cards = False
         # Preserve native template BODY placeholder slot filling on regular content slides;
@@ -736,9 +766,11 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
             new_title = du.glue_num_units(du.strip_md(str(e.get("text") if e.get("text") is not None else (e.get("title") or ""))))
             tsh = du.find_slide_title_shape(slide, prs)
             if tsh is not None and tsh.has_text_frame:
+                lname_e = (getattr(getattr(slide, "slide_layout", None), "name", "") or "").lower()
+                is_cover_e = (sidx == 0) or ("title" in lname_e and "content" not in lname_e and "only" not in lname_e)
                 du.set_text_preserving_style(tsh.text_frame, new_title)
                 if tsh.is_placeholder:
-                    shrink_title(prs, slide, tsh)
+                    shrink_title(prs, slide, tsh, is_cover=is_cover_e)
                 else:
                     shrink_shape(tsh, du.effective_pt(tsh, du.DEFAULT_TITLE_PT), min_pt=16.0)
                 if du.dark_slide_needs_light_ink(prs, slide):
@@ -1031,7 +1063,11 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
                     cap_res = (cap_box_h + int(Inches(0.08))) if t_cap_text else 0
                     tbl_max_h = max(int(Inches(1.0)), max_th - cap_res)
                     req_tpt = float(tbl_spec.get("font_pt") or (10.5 if e_tig >= 2 else (11.5 if e_tig == 1 else 12.5)))
-                    slot = (tl, tt, tw, min(tbl_max_h, int(Inches(0.42) * nrows)))
+                    est_th = min(tbl_max_h, int(Inches(0.42) * nrows))
+                    # Vertically center compact new tables in right split slot for balanced visual weight
+                    if existing_tbl is None and nrows <= 5 and est_th + cap_res < max_th - int(Inches(0.6)):
+                        tt = tt + min(int(Inches(0.75)), (max_th - est_th - cap_res) // 3)
+                    slot = (tl, tt, tw, est_th)
                     gf_t = du.add_table(slide, slot, rows, header=tbl_spec.get("header", True),
                                         font_pt=req_tpt, accent=accent,
                                         highlight_row=tbl_spec.get("highlight_row"), max_h=tbl_max_h)
@@ -1042,7 +1078,9 @@ def apply_edit_ops(prs, edits, images_base: Path, work: Path, cm_changes,
             eid = id(slide._element)
             sp_cur = dict(specs_by_eid.get(eid) or {})
             sp_cur["table"] = {
-                "ref": tbl_spec.get("ref"), "caption": tbl_spec.get("caption"), "rows": rows,
+                "ref": tbl_spec.get("ref") or e.get("ref"),
+                "caption": tbl_spec.get("caption") or e.get("caption"),
+                "rows": rows,
             }
             specs_by_eid[eid] = sp_cur
             _rec_src(eid, e.get("sources"))
